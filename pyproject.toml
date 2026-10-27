@@ -1,0 +1,58 @@
+[build-system]
+requires = ["hatchling==1.32.4"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cloud-stress"
+version = "0.1.0"
+description = "Stress testing for Prodstack network, storage, and compute infrastructure"
+readme = "README.md"
+license = "BSD-3-Clause"
+license-files = ["LICENSE"]
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "click>=8.1,<9",
+    "pydantic>=2.14.1,<3",
+    "PyYAML>=6.0.3,<7",
+]
+
+[project.scripts]
+cloud-stress = "cloud_stress:app"
+
+[dependency-groups]
+format = ["ruff==0.17.3"]
+lint = ["ruff==0.17.3"]
+unit = ["pytest==9.1.1"]
+func = ["pytest==9.1.1"]
+typecheck = ["mypy==2.4.0"]
+tooling = ["tox==4.67.2", "tox-uv==1.37.1", "uv==0.13.6"]
+build = ["hatchling==1.32.4"]
+
+[tool.uv]
+required-version = ">=0.13,<0.14"
+default-groups = []
+
+[tool.hatch.build.targets.wheel]
+only-include = ["src/cloud_stress.py"]
+sources = ["src"]
+
+[tool.hatch.build.targets.sdist]
+include = ["/src", "/snap", "/docs", "/README.md", "/LICENSE", "/CONTRIBUTING.md", "/SECURITY.md", "/pyproject.toml", "/tox.ini", "/uv.lock"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "D"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests/unit", "tests/func"]
+addopts = "--strict-config --strict-markers"

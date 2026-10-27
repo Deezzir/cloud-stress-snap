@@ -1,0 +1,68 @@
+name: cloud-stress
+base: core24
+version: '0.1.0'
+license: BSD-3-Clause
+summary: Prodstack stress testing tool
+description: |
+  Stress test Prodstack infrastructure with coordinated network, storage, and
+  compute workloads. Measure performance under load, identify shared-resource
+  bottlenecks, and evaluate isolation and QoS before production. Collect metrics
+  and generate a report of achieved load and degradation for each run.
+grade: devel
+confinement: strict
+
+platforms:
+  amd64:
+  arm64:
+
+plugs:
+  openstack-user-config:
+    interface: personal-files
+    read:
+      - $HOME/.config/openstack
+  maas-user-config:
+    interface: personal-files
+    read:
+      - $HOME/.maas.db
+  openstack-system-config:
+    interface: system-files
+    read:
+      - /etc/openstack
+
+apps:
+  cloud-stress:
+    command: bin/cloud-stress
+    plugs:
+      - network
+      - ssh-keys
+      - juju-client-observe
+      - openstack-user-config
+      - maas-user-config
+      - openstack-system-config
+
+parts:
+  remote-access:
+    plugin: nil
+    stage-packages:
+      - ca-certificates
+      - openssh-client
+
+  cloud-stress:
+    after:
+      - remote-access
+    plugin: uv
+    source: .
+    build-packages:
+      - python3-dev
+      - python3-venv
+    build-environment:
+      - PATH: $CRAFT_PART_SRC/.build-uv/bin:$PATH
+    override-pull: |
+      craftctl default
+      python3 -m venv "$CRAFT_PART_SRC/.build-uv"
+      UV_REQUIREMENT="$(python3 -c 'import tomllib; p = tomllib.load(open("pyproject.toml", "rb")); print(next(d for d in p["dependency-groups"]["tooling"] if d.startswith("uv==")))')"
+      "$CRAFT_PART_SRC/.build-uv/bin/python" -m pip install "$UV_REQUIREMENT"
+    override-build: |
+      # Frozen sync alone does not check whether declarations match the lock.
+      UV_FROZEN=false uv lock --check
+      craftctl default
