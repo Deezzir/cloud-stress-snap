@@ -12,6 +12,8 @@ license-files = ["LICENSE"]
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "click>=8.1,<9",
+    "jubilant>=1.14,<2",
+    "openstacksdk>=4.0,<5",
     "pydantic>=2.14.1,<3",
     "PyYAML>=6.0.3,<7",
 ]
@@ -25,15 +27,15 @@ lint = ["ruff==0.17.3"]
 unit = ["pytest==9.1.1"]
 func = ["pytest==9.1.1"]
 typecheck = ["mypy==2.4.0"]
-tooling = ["tox==4.67.2", "tox-uv==1.37.1", "uv==0.13.6"]
+tooling = ["tox==4.67.2", "tox-uv==1.37.1", "uv==0.12.21"]
 build = ["hatchling==1.32.4"]
 
 [tool.uv]
-required-version = ">=0.13,<0.14"
+required-version = ">=0.12,<0.14"
 default-groups = []
 
 [tool.hatch.build.targets.wheel]
-only-include = ["src/cloud_stress.py"]
+only-include = ["src/cloud_stress.py", "src/helpers.py", "src/probe"]
 sources = ["src"]
 
 [tool.hatch.build.targets.sdist]

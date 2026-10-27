@@ -35,6 +35,18 @@ Before you can begin, you will need to:
 
 ## Contributing Code
 
+### Local checks
+
+Run the development targets directly with tox:
+
+```sh
+tox -e format
+tox -e lint
+tox -e unit
+tox -e func
+tox -e typecheck
+```
+
 ### Workflow
 
 1. **Choose/Create an Issue**: Before starting work on an enhancement, create an issue that explains your use case. This helps track progress and keeps the discussion organized. The issue will be tracked on the GitHub issue page.

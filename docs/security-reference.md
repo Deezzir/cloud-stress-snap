@@ -1,48 +1,70 @@
-# Snap security
+# Security and permissions
 
-cloud-stress generates deliberate infrastructure load. Restrict its use to
-authorized operators, approved target scopes, and agreed measurement windows.
-Stress traffic can affect other tenants when hardware or backend paths are
-shared; confinement does not isolate the cloud from the workloads it authorizes.
+cloud-stress connects to your deployment using the credentials of the user
+running it. Run it on a machine you trust with those credentials.
 
-## Controller and access
+## Snap permissions
 
-Install the snap on a protected bastion or infra-management node. Strict
-confinement limits the controller's local access; it does not replace API or SSH
-authorization. Use narrowly scoped credentials where the required operations
-permit, preserve CA and known-host verification, and grant only needed snap
-interfaces.
+The snap uses strict confinement to limit access to local files. This does not
+restrict what your credentials allow on a remote API. Use accounts
+with only the permissions needed for discovery.
 
-| Interface | Purpose |
+The snap declares the following connections. Some require manual approval;
+check which are connected on your machine:
+
+```sh
+snap connections cloud-stress
+```
+
+| Connection | What it allows |
 | --- | --- |
-| `network` | Outbound API and SSH access to the selected deployment. |
-| `ssh-keys` | Optional read access to the invoking identity's SSH material. |
-| `juju-client-observe` | Optional read access to Juju client configuration. |
-| `openstack-user-config` | Optional read access to `$HOME/.config/openstack`. |
-| `maas-user-config` | Optional read access to `$HOME/.maas.db`. |
-| `openstack-system-config` | Optional read access to `/etc/openstack`. |
+| `network` | Connections to deployment APIs. |
+| `shared-memory` | Shared memory isolated to this snap. |
+| `home` | Reading and writing non-hidden files in your home directory, including CA certificate files. |
+| `dot-local-share-juju` | Reading and writing your Juju client configuration and authentication data in `~/.local/share/juju`. |
+| `dot-config-openstack` | Reading OpenStack configuration in `~/.config/openstack`. |
+| `etc-openstack` | Reading system OpenStack configuration in `/etc/openstack`. |
 
-The installation identity is root, so same-identity file grants refer to root's
-configuration. They do not grant arbitrary access to another user's home.
-Personal/system file interfaces require the applicable Store declarations and
-operator grants; do not assume auto-connection.
+Connect only what you need. To enable Juju discovery:
 
-## Credentials and evidence
+```sh
+sudo snap connect cloud-stress:dot-local-share-juju
+```
 
-Keep imported credentials in restricted installation storage, separate from
-exportable evidence. Preserve encrypted keys at rest. Never include passphrases,
-decrypted keys, or raw authentication configuration in logs, reports, or bundles.
-Review retained evidence for sensitive infrastructure identifiers before sharing.
+Run the tool as the user whose client configuration you intend to use. Installing the snap with `sudo` does not make later invocations run as root
+or give them access to another user's files.
 
-## Campaign safeguards
+## Credentials and connection checks
 
-Discovery must remain read-only. Before a campaign, review its targets, resource
-budgets, delivered-load requirements, and cleanup scope. Workloads need locally
-enforced lifetimes even when the controller becomes unreachable. Cancellation
-and recovery must affect only run-owned resources and retain unresolved cleanup
-items explicitly.
+cloud-stress uses your existing client configuration; snap connections can
+expose files containing passwords, tokens, cookies, or private keys. Do not
+include those files in bug reports or support attachments.
 
-Do not bypass unsupported offload or QoS behavior by changing production device
-configuration. Local control sockets must be restricted to the execution
-identity; local visualization must preserve authentication and bind to loopback
-unless explicitly configured otherwise.
+OpenStack discovery rejects configurations that disable TLS certificate
+verification, and password authentication requires HTTPS. Configure the correct
+CA certificates before running discovery.
+
+Pass the MAAS API key through the `MAAS_TOKEN` environment variable rather than
+`--maas-token`, so it does not appear in shell history or process listings.
+Over an `http://` MAAS URL the key is sent unencrypted; prefer `https://`.
+
+Treat the snap's user storage as sensitive: it can contain authentication data.
+Do not include it in bug reports or support attachments.
+
+## Juju access
+
+With `--juju-model`, `check` reads host hardware, Ceph, and OVS state through
+Juju. It runs read-only Ceph charm actions and a few read-only commands with
+`juju exec`, which runs them as root: `ceph` on `ceph-mon`, `ovs-vsctl` on
+`ovn-chassis`, and hardware reads (`lscpu`, `uname`, `/proc/meminfo`, `ip`,
+`lsblk`, `lspci`, NIC speeds) on the machines hosting Nova hypervisors.
+
+This needs admin access to the model. Admin access also allows changes to the
+model, so use a Juju account limited to the models you check. Without it, `check`
+lists the Ceph and OVS reads under issues and continues with the rest.
+
+## Sharing command output
+
+Discovery output includes deployment details such as project IDs, hostnames,
+IP and MAC addresses, and resource IDs. Review both text and JSON output before
+posting it publicly, and remove details you are not allowed to share.
