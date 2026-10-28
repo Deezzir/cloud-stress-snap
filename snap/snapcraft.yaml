@@ -5,6 +5,7 @@ license: BSD-3-Clause
 summary: Prodstack stress testing tool
 grade: devel
 confinement: strict
+icon: snap/gui/icon.png
 issues: https://github.com/Deezzir/prodstack-stress-test/issues
 source-code: https://github.com/Deezzir/prodstack-stress-test
 description: |
