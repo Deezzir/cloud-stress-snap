@@ -133,6 +133,8 @@ class JujuMachine(Record):
     id: str
     parent_id: str | None
     instance_id: str | None = None
+    hostname: str | None = None
+    ip_addresses: list[str] = Field(default_factory=list, max_length=64)
     hypervisor_id: str | None = None
 
 
@@ -350,6 +352,17 @@ class RunPlan(Record):
     image: str | None = None
     flavor: str | None = None
     volume_type: str | None = None
+    sender_machine: str | None = None
+    target_machine: str | None = None
+    target_hypervisor: str | None = None
+    target_link: str | None = None
+    target_ovs_unit: str | None = None
+    target_datapath: str | None = None
+    target_hw_offload: bool | None = None
+    network_id: str | None = None
+    image_id: str | None = None
+    flavor_id: str | None = None
+    ceph_mon: str | None = None
 
 
 class CheckResult(Record):

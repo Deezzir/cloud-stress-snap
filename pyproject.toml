@@ -20,6 +20,7 @@ dependencies = [
 
 [project.scripts]
 cloud-stress = "cloud_stress:app"
+cloud-stress-worker = "campaign.worker:main"
 
 [dependency-groups]
 format = ["ruff==0.17.3"]
@@ -35,7 +36,7 @@ required-version = ">=0.12,<0.14"
 default-groups = []
 
 [tool.hatch.build.targets.wheel]
-only-include = ["src/cloud_stress.py", "src/helpers.py", "src/probe"]
+only-include = ["src/cloud_stress.py", "src/helpers.py", "src/probe", "src/campaign"]
 sources = ["src"]
 
 [tool.hatch.build.targets.sdist]
@@ -54,6 +55,10 @@ convention = "google"
 [tool.mypy]
 python_version = "3.12"
 strict = true
+
+[[tool.mypy.overrides]]
+module = ["yaml"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests/unit", "tests/func"]

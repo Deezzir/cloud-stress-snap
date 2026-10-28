@@ -58,6 +58,8 @@ def probe_juju(
             id=key,
             parent_id=None,
             instance_id=machine.instance_id or None,
+            hostname=machine.hostname or None,
+            ip_addresses=machine.ip_addresses[:64],
         )
         for key, machine in status.machines.items()
     ]

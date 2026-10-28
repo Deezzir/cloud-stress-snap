@@ -87,7 +87,10 @@ def short_name(name: str | None) -> str:
 def link_juju_to_hypervisors(
     juju: JujuResult, maas: MaasResult, hosts: list[Host]
 ) -> list[ProbeNotice]:
-    """Match Juju machines to Nova hypervisors by MAAS address or hostname."""
+    """Match Juju machines to Nova hypervisors by address or hostname.
+
+    MAAS records are preferred; without MAAS, Juju's own machine facts are used.
+    """
     by_ip: dict[str, list[str]] = {}
     by_name: dict[str, list[str]] = {}
     for host in hosts:
@@ -97,17 +100,19 @@ def link_juju_to_hypervisors(
             by_name.setdefault(short_name(host.hostname), []).append(host.id)
     records = {record.system_id: record for record in maas.machines}
     for machine in juju.machines:
-        record = records.get(machine.instance_id or "")
-        if record is None:
+        if machine.parent_id:
             continue
+        record = records.get(machine.instance_id or "")
+        addresses = record.ip_addresses if record else machine.ip_addresses
+        hostname = short_name(record.hostname if record else machine.hostname or "")
         matches = {
             host_id
-            for ip in record.ip_addresses
+            for ip in addresses
             if len(by_ip.get(ip, [])) == 1
             for host_id in by_ip[ip]
         }
-        if not matches and len(by_name.get(short_name(record.hostname), [])) == 1:
-            matches = set(by_name[short_name(record.hostname)])
+        if not matches and hostname and len(by_name.get(hostname, [])) == 1:
+            matches = set(by_name[hostname])
         if len(matches) == 1:
             machine.hypervisor_id = matches.pop()
     compute_machines = {
@@ -123,9 +128,7 @@ def link_juju_to_hypervisors(
             "no Nova hypervisor.",
         )
         for machine in juju.machines
-        if machine.id in compute_machines
-        and machine.hypervisor_id is None
-        and machine.instance_id in records
+        if machine.id in compute_machines and machine.hypervisor_id is None
     ]
 
 
@@ -294,8 +297,18 @@ def _bond_health(probe: HostProbe, name: str) -> tuple[bool, int] | None:
     )
 
 
-def resolve_plan(result: CheckResult) -> tuple[RunPlan, dict[str, str]]:
-    """Choose run placement from live facts; return the plan and missing choices."""
+PLAN_CHOICES = ("sender", "target", "network", "image", "flavor", "volume_type")
+
+
+def resolve_plan(
+    result: CheckResult, overrides: dict[str, str] | None = None
+) -> tuple[RunPlan, dict[str, str]]:
+    """Choose run placement from live facts; return the plan and missing choices.
+
+    An override names the sender or target host, or the network, image, flavor or
+    volume type; it must still pass the same checks as an automatic choice.
+    """
+    pick = overrides or {}
     plan, missing = RunPlan(), {}
     probes = {
         probe.host_id: probe
@@ -311,6 +324,14 @@ def resolve_plan(result: CheckResult) -> tuple[RunPlan, dict[str, str]]:
         and probes[host.id].architecture == "x86_64"
     }
     charms = {app.name: app.charm for app in result.juju.apps}
+    hostnames = {host.id: host.hostname or host.id for host in result.openstack.hosts}
+    machines = {
+        machine.hypervisor_id: machine.id
+        for machine in result.juju.machines
+        if machine.hypervisor_id and machine.parent_id is None
+    }
+    mon = next((name for name, charm in charms.items() if charm == "ceph-mon"), None)
+    plan.ceph_mon = f"{mon}/leader" if mon else None
     osd_hosts = {short_name(osd.host) for osd in result.ceph.osds if osd.status == "up"}
     physnets = {ovs.host_id: ovs.physnets for ovs in result.ovs}
 
@@ -319,14 +340,20 @@ def resolve_plan(result: CheckResult) -> tuple[RunPlan, dict[str, str]]:
         for network in result.openstack.networks
         if network.network_type == "vlan"
         and any(network.physical_network in p for p in physnets.values())
+        and pick.get("network") in (None, network.name, network.id)
     ]
     network = min(
         networks, key=lambda n: (6 not in n.ip_versions, n.name or n.id), default=None
     )
     if network is None:
-        missing["network"] = "no VLAN provider network on the OVN bridge mappings"
+        missing["network"] = (
+            f"{pick['network']} is not a VLAN network on the OVN bridge mappings"
+            if "network" in pick
+            else "no VLAN provider network on the OVN bridge mappings"
+        )
     else:
         plan.network, plan.vlan = network.name or network.id, network.segmentation_id
+        plan.network_id = network.id
         plan.ip_version = 6 if 6 in network.ip_versions else 4
         if not network.ip_versions:
             plan.ip_version = None
@@ -341,14 +368,39 @@ def resolve_plan(result: CheckResult) -> tuple[RunPlan, dict[str, str]]:
             if iface and health:
                 ranked.append((not health[0], -health[1], name, host_id, iface))
     ranked.sort()
-    targets = [item for item in ranked if item[2] in osd_hosts]
+    targets = [
+        item
+        for item in ranked
+        if item[2] in osd_hosts and pick.get("target") in (None, item[2])
+    ]
     if targets:
-        plan.target = targets[0][2]
+        plan.target, plan.target_link = targets[0][2], targets[0][4]
+        plan.target_hypervisor = hostnames[targets[0][3]]
+        plan.target_machine = machines.get(targets[0][3])
+        ovs = next((o for o in result.ovs if o.host_id == targets[0][3]), None)
+        if ovs:
+            plan.target_ovs_unit, plan.target_hw_offload = ovs.unit, ovs.hw_offload
+            plan.target_datapath = ovs.bridges.get("br-int")
+    elif "target" in pick:
+        missing["target"] = (
+            f"{pick['target']} is not a usable x86_64 hypervisor with Ceph OSDs up "
+            "on the provider network"
+        )
     else:
         missing["target"] = "no usable x86_64 hypervisor with Ceph OSDs up"
-    senders = [item for item in ranked if item[2] != plan.target]
+    senders = [
+        item
+        for item in ranked
+        if item[2] != plan.target and pick.get("sender") in (None, item[2])
+    ]
     if senders:
         plan.sender, plan.sender_link = senders[0][2], senders[0][4]
+        plan.sender_machine = machines.get(senders[0][3])
+    elif "sender" in pick:
+        missing["sender"] = (
+            f"{pick['sender']} is not a usable hypervisor carrying the provider "
+            "network, or it is the target"
+        )
     elif network:
         missing["sender"] = (
             f"no second usable hypervisor carrying {network.physical_network}"
@@ -359,12 +411,17 @@ def resolve_plan(result: CheckResult) -> tuple[RunPlan, dict[str, str]]:
         for image in result.openstack.images
         if "ubuntu" in f"{image.os_distro} {image.name}".lower()
         and "amphora" not in (image.name or "").lower()
+        and pick.get("image") in (None, image.name, image.id)
     ]
     image = max(images, key=lambda i: i.created_at or "", default=None)
     if image:
-        plan.image = image.name or image.id
+        plan.image, plan.image_id = image.name or image.id, image.id
     else:
-        missing["image"] = "no Ubuntu image"
+        missing["image"] = (
+            f"{pick['image']} is not an Ubuntu image"
+            if "image" in pick
+            else "no Ubuntu image"
+        )
     flavor = min(
         (
             f
@@ -373,14 +430,20 @@ def resolve_plan(result: CheckResult) -> tuple[RunPlan, dict[str, str]]:
             and f.vcpus >= 2
             and f.ram_mb >= 4096
             and f.disk_gb >= 20
+            and pick.get("flavor") in (None, f.name, f.id)
         ),
         key=lambda f: (f.vcpus, f.ram_mb, f.disk_gb),
         default=None,
     )
     if flavor:
-        plan.flavor = flavor.name
+        plan.flavor, plan.flavor_id = flavor.name, flavor.id
     else:
-        missing["flavor"] = "no flavor with 2 vCPUs, 4 GiB RAM and 20 GB disk"
+        missing["flavor"] = (
+            f"{pick['flavor']} is restricted or smaller than 2 vCPUs, 4 GiB RAM "
+            "and 20 GB disk"
+            if "flavor" in pick
+            else "no flavor with 2 vCPUs, 4 GiB RAM and 20 GB disk"
+        )
     ceph_backends = {name for name, charm in charms.items() if charm == "cinder-ceph"}
     volume_type = next(
         (t for t in result.openstack.volume_types if t.backend in ceph_backends),
@@ -391,7 +454,22 @@ def resolve_plan(result: CheckResult) -> tuple[RunPlan, dict[str, str]]:
     backends = {charm for charm in charms.values() if charm.startswith("cinder-")} - {
         "cinder-backup"
     }
-    if volume_type:
+    if "volume_type" in pick:
+        named = next(
+            (
+                t
+                for t in result.openstack.volume_types
+                if pick["volume_type"] in (t.name, t.id)
+            ),
+            None,
+        )
+        if named and (named.backend in ceph_backends or "ceph" in named.name.lower()):
+            plan.volume_type = named.name
+        else:
+            missing["volume_type"] = (
+                f"{pick['volume_type']} is not a Ceph-backed volume type"
+            )
+    elif volume_type:
         plan.volume_type = volume_type.name
     elif backends == {"cinder-ceph"}:
         plan.volume_type = "default"
@@ -402,7 +480,7 @@ def resolve_plan(result: CheckResult) -> tuple[RunPlan, dict[str, str]]:
 
 PROFILE_NEEDS: dict[Profile, tuple[str, ...]] = {
     "flow-churn": ("network", "target", "sender", "image", "flavor"),
-    "fio-sweep": ("target", "image", "flavor", "volume_type"),
+    "fio-sweep": ("network", "target", "image", "flavor", "volume_type"),
     "network-ceph": ("network", "target", "sender", "image", "flavor", "volume_type"),
 }
 
@@ -471,13 +549,17 @@ def print_readiness(readiness: list[ProfileReadiness], plan: RunPlan) -> None:
         status = "ready" if item.ready else "blocked: " + ", ".join(item.blockers)
         rows.append([item.profile, status])
     print_table(rows)
-    if not any(item.ready for item in readiness):
-        return
+    if any(item.ready for item in readiness):
+        click.echo("\nRun plan:")
+        print_plan(plan)
+
+
+def print_plan(plan: RunPlan) -> None:
+    """Print the placement of a run."""
     network = plan.network
     if network:
         network += f", VLAN {plan.vlan}" if plan.vlan else ""
         network += f", IPv{plan.ip_version}" if plan.ip_version else ""
-    click.echo("\nRun plan:")
     print_table(
         [
             ["Sender", f"{plan.sender} ({plan.sender_link})" if plan.sender else "-"],

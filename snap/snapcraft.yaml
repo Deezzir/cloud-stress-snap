@@ -87,6 +87,22 @@ apps:
       - dot-local-share-juju
       - dot-config-openstack
       - etc-openstack
+  worker:
+    command: bin/cloud-stress-worker
+    daemon: simple
+    restart-condition: on-failure
+    sockets:
+      control:
+        listen-stream: $SNAP_COMMON/control.sock
+        socket-mode: 0666
+    plugs:
+      - network
+      - network-bind
+  recover:
+    command: bin/cloud-stress-worker recover
+    daemon: oneshot
+    plugs:
+      - network
 
 parts:
   juju-client:
@@ -99,6 +115,7 @@ parts:
     plugin: nil
     stage-packages:
       - ca-certificates
+      - openssh-client
   cloud-stress:
     after:
       - juju-client
