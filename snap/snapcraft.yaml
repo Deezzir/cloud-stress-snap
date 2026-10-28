@@ -9,10 +9,51 @@ icon: snap/gui/icon.png
 issues: https://github.com/Deezzir/prodstack-stress-test/issues
 source-code: https://github.com/Deezzir/prodstack-stress-test
 description: |
-  Stress test Prodstack infrastructure with coordinated network, storage, and
-  compute workloads. Measure performance under load, identify shared-resource
-  bottlenecks, and evaluate isolation and QoS before production. Collect metrics
-  and generate a report of achieved load and degradation for each run.
+  Stress test a Prodstack cloud.
+
+  cloud-stress checks that the cloud is ready, runs network and storage load
+  against it, and reports the achieved load and how the cloud degraded.
+
+  **How-To**
+
+  How to connect your Juju and OpenStack credentials:
+
+      sudo snap connect cloud-stress:dot-local-share-juju
+      sudo snap connect cloud-stress:dot-config-openstack
+
+  How to check a cloud (read-only):
+
+      cloud-stress check --juju-model <model>
+
+  How to start a run:
+
+      cloud-stress run start --profile flow-churn --duration 30m --juju-model <model>
+
+  How to follow, stop, or export a run:
+
+      cloud-stress run status
+      cloud-stress run stop
+      cloud-stress run status --html report.html
+
+  **Reference**
+
+  Profiles:
+
+  * `flow-churn`: UDP flood from one hypervisor to a guest on another.
+  * `fio-sweep`: fio sweep on a Ceph volume attached to a guest.
+  * `network-ceph`: flow-churn and fio together.
+
+  Requirements:
+
+  * OpenStack credentials in `OS_*` variables or `clouds.yaml` (`--cloud`).
+  * A Juju login with admin access to the OpenStack model.
+  * Optional: MAAS URL (`--maas-url`) and API key (`MAAS_TOKEN`).
+
+  Run results are stored in `/var/snap/cloud-stress/common/runs/`.
+
+  **Security**
+
+  https://github.com/Deezzir/prodstack-stress-test/blob/main/docs/security-reference.md
 
 platforms:
   amd64:
