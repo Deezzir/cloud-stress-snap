@@ -18,6 +18,9 @@ def target(where: str) -> dict[str, str]:
 def sh(juju: jubilant.Juju, where: str, script: str, wait: int = EXEC_TIMEOUT) -> str:
     """Run a shell script as root on a machine or unit and return stdout."""
     command = f"bash -c {shlex.quote(script)}"
+    if "/" not in where:
+        # `juju exec --machine` runs as the ubuntu user; units run as root.
+        command = f"sudo -n {command}"
     return juju.exec(command, wait=wait, **target(where)).stdout
 
 
