@@ -76,3 +76,14 @@ def remove_dir(juju: jubilant.Juju, where: str, path: str) -> None:
     if not path.startswith("/var/lib/cloud-stress/"):
         raise ValueError(f"refusing to remove {path}")
     sh(juju, where, f"rm -rf {shlex.quote(path)}")
+
+
+def remove_snap(juju: jubilant.Juju, where: str, name: str) -> None:
+    """Purge a run-owned snap; a snap that is already gone counts as removed."""
+    quoted = shlex.quote(name)
+    sh(
+        juju,
+        where,
+        f"snap remove --purge {quoted} || ! snap list {quoted} >/dev/null 2>&1",
+        wait=300,
+    )

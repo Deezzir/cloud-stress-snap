@@ -1,16 +1,13 @@
 # Security and permissions
 
-cloud-stress connects to your deployment using the credentials of the user
-running it. Run it on a machine you trust with those credentials.
+cloud-stress acts with the credentials of the user running it. Run it on a
+machine you trust with those credentials, and use accounts limited to the
+deployment under test.
 
-## Snap permissions
+## Snap connections
 
-The snap uses strict confinement to limit access to local files. This does not
-restrict what your credentials allow on a remote API. Use accounts
-with only the permissions needed for discovery.
-
-The snap declares the following connections. Some require manual approval;
-check which are connected on your machine:
+Strict confinement limits local file access; it does not limit what your
+credentials allow remotely. Check what is connected:
 
 ```sh
 snap connections cloud-stress
@@ -18,53 +15,60 @@ snap connections cloud-stress
 
 | Connection | What it allows |
 | --- | --- |
-| `network` | Connections to deployment APIs. |
-| `shared-memory` | Shared memory isolated to this snap. |
-| `home` | Reading and writing non-hidden files in your home directory, including CA certificate files. |
-| `dot-local-share-juju` | Reading and writing your Juju client configuration and authentication data in `~/.local/share/juju`. |
-| `dot-config-openstack` | Reading OpenStack configuration in `~/.config/openstack`. |
-| `etc-openstack` | Reading system OpenStack configuration in `/etc/openstack`. |
+| `network` | Connections to deployment APIs and run guests. |
+| `network-bind` | The worker's local control socket. |
+| `shared-memory` | Shared memory private to this snap. |
+| `home` | Non-hidden files in your home directory, such as CA certificates. |
+| `dot-local-share-juju` | Juju client configuration and credentials in `~/.local/share/juju`. |
+| `dot-config-openstack` | OpenStack configuration in `~/.config/openstack`. |
+| `etc-openstack` | OpenStack configuration in `/etc/openstack`. |
 
-Connect only what you need. To enable Juju discovery:
+Juju access needs a manual connection:
 
 ```sh
 sudo snap connect cloud-stress:dot-local-share-juju
 ```
 
-Run the tool as the user whose client configuration you intend to use. Installing the snap with `sudo` does not make later invocations run as root
-or give them access to another user's files.
+Run cloud-stress as the user whose client configuration it should use.
 
-## Credentials and connection checks
+## Credentials
 
-cloud-stress uses your existing client configuration; snap connections can
-expose files containing passwords, tokens, cookies, or private keys. Do not
-include those files in bug reports or support attachments.
-
-OpenStack discovery rejects configurations that disable TLS certificate
-verification, and password authentication requires HTTPS. Configure the correct
-CA certificates before running discovery.
-
-Pass the MAAS API key through the `MAAS_TOKEN` environment variable rather than
-`--maas-token`, so it does not appear in shell history or process listings.
-Over an `http://` MAAS URL the key is sent unencrypted; prefer `https://`.
-
-Treat the snap's user storage as sensitive: it can contain authentication data.
-Do not include it in bug reports or support attachments.
+- Client configuration and the snap's user storage can contain passwords,
+  tokens and keys. Keep them out of bug reports.
+- OpenStack configurations that disable TLS verification are rejected, and
+  password authentication requires HTTPS.
+- Pass the MAAS API key in `MAAS_TOKEN`, not `--maas-token`. Use an `https://`
+  MAAS URL; over `http://` the key is sent unencrypted.
 
 ## Juju access
 
-With `--juju-model`, `check` reads host hardware, Ceph, and OVS state through
-Juju. It runs read-only Ceph charm actions and a few read-only commands with
-`juju exec`, which runs them as root: `ceph` on `ceph-mon`, `ovs-vsctl` on
-`ovn-chassis`, and hardware reads (`lscpu`, `uname`, `/proc/meminfo`, `ip`,
-`lsblk`, `lspci`, NIC speeds) on the machines hosting Nova hypervisors.
+`--juju-model` needs admin access to the model, which also allows changes to
+it. Without it, `check` reports the Ceph and OVS reads as issues.
 
-This needs admin access to the model. Admin access also allows changes to the
-model, so use a Juju account limited to the models you check. Without it, `check`
-lists the Ceph and OVS reads under issues and continues with the rest.
+All host commands run as root through `juju exec`:
 
-## Sharing command output
+| Command | On | Does |
+| --- | --- | --- |
+| `check` | `ceph-mon`, `ovn-chassis`, hypervisors | Read-only Ceph actions, `ceph`, `ovs-vsctl` and hardware reads. |
+| `run` | Sender, target and `ceph-mon` hosts | Starts run-owned transient units and files under `/var/lib/cloud-stress/<run-id>`. |
+| `run` | Sender | Installs the `trex-generator` snap, then purges it. Needs Snap Store access. |
 
-Discovery output includes deployment details such as project IDs, hostnames,
-IP and MAC addresses, and resource IDs. Review both text and JSON output before
-posting it publicly, and remove details you are not allowed to share.
+`trex-generator` connections:
+
+| Connection | What it allows |
+| --- | --- |
+| `network-control` | Raw packet sockets. |
+| `hardware-observe` | PCI and NIC details. |
+| `process-control` | Its own core dump filter. |
+| `system-observe` | Other running processes. |
+
+## OpenStack resources
+
+`run` creates a guest, port, security group and volume in your project, and
+deletes them during finalization. It reaches the guest over SSH with a key
+generated for the run.
+
+## Sharing output
+
+Output contains project IDs, hostnames, IP and MAC addresses and resource IDs.
+Review text and JSON output before sharing it.

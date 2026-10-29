@@ -95,10 +95,13 @@ def finalize(
     # 3. Delete what no longer holds pending evidence.
     _progress(state, "deleting run-owned resources")
     for entry in run_state.outstanding(state.id):
-        if entry.kind != "dir" or entry.where in pending_where:
+        if entry.kind not in ("dir", "snap") or entry.where in pending_where:
             continue
         try:
-            remote.remove_dir(juju, entry.where or "", entry.name)
+            if entry.kind == "snap":
+                remote.remove_snap(juju, entry.where or "", entry.name)
+            else:
+                remote.remove_dir(juju, entry.where or "", entry.name)
             run_state.transition(state.id, entry, "deleted")
         except Exception as error:  # noqa: BLE001
             _failed(state, entry, error)

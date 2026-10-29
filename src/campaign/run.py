@@ -15,7 +15,7 @@ from campaign.guest import Guest, keygen
 from campaign.profiles import FioCell, uses_fio, uses_trex
 from campaign.provision import PreparationError, Target
 from campaign.state import RunState
-from campaign.trex import Sender
+from campaign.trex import SNAP, Sender
 
 SAMPLE_INTERVAL_S = {"host": 5, "ceph": 10}
 RECEIPT_PPS, RECEIPT_S, RECEIPT_MIN = 1000, 15, 0.8
@@ -135,7 +135,6 @@ class Run:
         if uses_trex(state.profile):
             self.sender = Sender(self.juju, plan.sender_machine or "", state.id)
             problems += self.sender.preflight()
-            run_state.event(state.id, "tool", name="trex", version=self.sender.version)
         if problems:
             raise PreparationError("; ".join(problems))
 
@@ -246,6 +245,10 @@ class Run:
         if not speed.isdigit() or int(speed) <= 0:
             raise PreparationError(f"cannot read the speed of {plan.sender_link}")
         self.own_host_dir(machine)
+        run_state.record(self.state.id, "snap", SNAP, "intent", where=machine)
+        self.sender.install()
+        run_state.record(self.state.id, "snap", SNAP, "created", where=machine)
+        run_state.event(self.state.id, "tool", name="trex", version=self.sender.version)
         self.sender.stage(plan.sender_link or "", int(speed))
         self.start_host_unit(
             machine,

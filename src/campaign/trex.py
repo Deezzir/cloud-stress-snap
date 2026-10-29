@@ -9,7 +9,9 @@ from campaign import remote
 from campaign.profiles import FLOOD_PORT, FLOOD_SOURCE
 from campaign.provision import Target
 
-TREX_ROOT = "/opt/trex"
+SNAP = "trex-generator"
+CHANNEL = "latest/edge"
+PLUGS = ("network-control", "hardware-observe", "process-control", "system-observe")
 RPC_PORT = 4501
 
 CONFIG = """\
@@ -24,17 +26,16 @@ CONFIG = """\
   port_mtu: 1500
 """
 
-# Runs on the sender with the host's python3 and TRex's bundled client library.
+# Runs on the sender with the snap's Python and TRex client library.
 # Every packet carries a new source address and UDP source port, so megaflow
 # wildcarding cannot fold packets together. Ports are acquired without force:
 # a port owned by another session makes the run fail instead of taking it over.
 FLOOD = """\
 import json, signal, sys, time
 
-sys.path.insert(0, sys.argv[1] + "/automation/trex_control_plane/interactive")
 from trex.stl.api import *
 
-args = json.loads(sys.argv[2])
+args = json.loads(sys.argv[1])
 out = open(args["out"], "a", buffering=1)
 signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 
@@ -86,40 +87,53 @@ finally:
 
 
 class Sender:
-    """The run-owned TRex server and flood on one sender machine."""
+    """The run-owned TRex snap, server and flood on one sender machine."""
 
     def __init__(self, juju: jubilant.Juju, machine: str, run_id: str) -> None:
         """Remember where the run's TRex units and files live."""
         self.juju = juju
         self.machine = machine
-        self.dir = f"/var/lib/cloud-stress/{run_id}/trex"
+        # A strictly confined snap only reads and writes under its own directories.
+        self.dir = f"/var/snap/{SNAP}/common/{run_id}"
         self.server_unit = f"cloud-stress-{run_id[:8]}-trex"
         self.flood_unit = f"cloud-stress-{run_id[:8]}-flood"
         self.log = f"{self.dir}/trex.log"
-        self.trex_dir = ""
         self.version = ""
 
     def preflight(self) -> list[str]:
-        """Find installed TRex and refuse a busy TRex server or port."""
-        found = remote.sh(
+        """Refuse a TRex snap the run would not own, or a busy TRex server or port."""
+        out = remote.sh(
             self.juju,
             self.machine,
-            f"ls -d {TREX_ROOT}/v*/automation/trex_control_plane/interactive/trex "
-            "2>/dev/null | sort -V | tail -1",
-        ).strip()
-        busy = remote.sh(
-            self.juju,
-            self.machine,
-            f"ss -Hltn 'sport = :{RPC_PORT}'; pgrep -x _t-rex-64 || true",
-        ).strip()
+            f"snap list {SNAP} >/dev/null 2>&1 && echo installed; "
+            f"ss -Hltn 'sport = :{RPC_PORT}' | grep -q . && echo busy; "
+            "pgrep -x _t-rex-64 >/dev/null && echo busy; "
+            f"snap info {SNAP} >/dev/null 2>&1 || echo unreachable; true",
+        ).split()
         problems = []
-        self.trex_dir = found.split("/automation/")[0]
-        self.version = self.trex_dir.rsplit("/", 1)[-1]
-        if not self.trex_dir:
-            problems.append(f"TRex is not installed under {TREX_ROOT} on the sender")
-        if busy:
+        if "installed" in out:
+            problems.append(f"the {SNAP} snap is already installed on the sender")
+        if "busy" in out:
             problems.append("another TRex server is running on the sender")
+        if "unreachable" in out:
+            problems.append(f"the sender cannot reach the Snap Store for {SNAP}")
         return problems
+
+    def install(self) -> None:
+        """Install the snap, hold refreshes for the run and connect its plugs."""
+        connect = "; ".join(f"snap connect {SNAP}:{plug}" for plug in PLUGS)
+        remote.sh(
+            self.juju,
+            self.machine,
+            f"set -e; snap install {SNAP} --channel={CHANNEL}; "
+            f"snap refresh --hold {SNAP}; {connect}",
+            wait=600,
+        )
+        self.version = remote.sh(
+            self.juju,
+            self.machine,
+            f"snap list {SNAP} | awk 'NR==2 {{print $2 \" rev \" $3}}'",
+        ).strip()
 
     def stage(self, link: str, speed_mbps: int) -> None:
         """Write the TRex config and flood script into the run's directory."""
@@ -130,9 +144,8 @@ class Sender:
     def server_command(self) -> str:
         """Command for the TRex server on the provider link with a raw socket."""
         return (
-            f"cd {shlex.quote(self.trex_dir)} && exec ./t-rex-64 -i -c 1 "
-            f"--no-scapy-server --no-ofed-check --cfg {self.dir}/trex_cfg.yaml "
-            f">> {self.log} 2>&1"
+            f"exec /snap/bin/{SNAP}.t-rex-64 -i -c 1 --no-scapy-server "
+            f"--no-ofed-check --cfg {self.dir}/trex_cfg.yaml >> {self.log} 2>&1"
         )
 
     def server_ready(self) -> bool:
@@ -159,7 +172,7 @@ class Sender:
             "out": out,
         }
         command = (
-            f"exec python3 {self.dir}/flood.py {shlex.quote(self.trex_dir)} "
+            f"exec /snap/bin/{SNAP}.python {self.dir}/flood.py "
             f"{shlex.quote(json.dumps(args))} >> {self.log} 2>&1"
         )
         return f"{self.flood_unit}-{name}", command, total + 60, out
