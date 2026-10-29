@@ -3,7 +3,7 @@ base: core24
 version: '0.1.0'
 license: BSD-3-Clause
 summary: Prodstack stress testing tool
-grade: devel
+grade: stable
 confinement: strict
 icon: snap/gui/icon.png
 issues: https://github.com/Deezzir/cloud-stress-snap/issues
