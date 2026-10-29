@@ -27,7 +27,7 @@ description: |
 
   How to start a run:
 
-      cloud-stress run start --profile flow-churn --duration 30m --juju-model <model>
+      cloud-stress run start --profile host-network --duration 30m --juju-model <model>
 
   How to follow, stop, or export a run:
 
@@ -40,9 +40,9 @@ description: |
 
   Profiles:
 
-  * `flow-churn`: UDP flood from one hypervisor to a guest on another.
-  * `fio-sweep`: fio sweep on a Ceph volume attached to a guest.
-  * `network-ceph`: flow-churn and fio together.
+  * `host-network`: UDP flood from one hypervisor to a guest on another.
+  * `ceph-block`: fio sweep on a Ceph volume attached to a guest.
+  * `network-ceph`: host-network and fio together.
 
   Requirements:
 

@@ -23,6 +23,7 @@ Usage is in the snap description in `snap/snapcraft.yaml`.
 | `src/campaign/lifecycle/` | Worker, preparation, measurement, finalization |
 | `src/campaign/report/` | Result model, text and HTML |
 
+- [Campaigns](docs/campaigns.md)
 - [Security](docs/security-reference.md)
 - [Contributing](CONTRIBUTING.md)
 

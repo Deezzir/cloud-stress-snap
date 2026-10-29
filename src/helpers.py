@@ -380,7 +380,7 @@ def resolve_plan(
                 missing["network"] = f"{plan.network} has no IPv{version} subnet"
 
     # Guests are managed over an overlay network, through its OVN metadata
-    # namespace on the target host. Octavia's lb-mgmt-net is never used.
+    # namespace on the target host.
     mgmt = min(
         (
             n
@@ -524,8 +524,8 @@ def resolve_plan(
 
 
 PROFILE_NEEDS: dict[Profile, tuple[str, ...]] = {
-    "flow-churn": ("network", "mgmt_network", "target", "sender", "image", "flavor"),
-    "fio-sweep": (
+    "host-network": ("network", "mgmt_network", "target", "sender", "image", "flavor"),
+    "ceph-block": (
         "network",
         "mgmt_network",
         "target",
@@ -569,7 +569,7 @@ def profile_readiness(
     readiness = []
     for profile, needs in PROFILE_NEEDS.items():
         found = [missing[need] for need in needs if need in missing]
-        if profile != "flow-churn":
+        if profile != "host-network":
             found += ceph_blockers
         readiness.append(
             ProfileReadiness(profile=profile, ready=not found, blockers=found)
@@ -870,7 +870,7 @@ def print_check_result(result: CheckResult, as_json: bool) -> None:
         f"{len(openstack.networks)} networks, {len(openstack.ports)} ports"
     )
     if result.maas.machines:
-        click.echo(f"MAAS: {len(result.maas.machines)} machines matched to Juju")
+        click.echo(f"MAAS: {len(result.maas.machines)} machines")
     print_hypervisors(result)
     print_juju_result(result.juju, result.maas)
     print_network(result)

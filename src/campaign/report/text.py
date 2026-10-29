@@ -227,7 +227,11 @@ def summary_text(result: dict[str, object]) -> str:
         lines += ["", "Target host and guest:", *_table(rows)]
 
     issues = [
-        *[str(c) for c in cast(list[object], run.get("causes") or [])],
+        *[
+            str(c)
+            for c in cast(list[object], run.get("causes") or [])
+            if not str(c).startswith("cleanup:")
+        ],
         *[str(e) for e in cast(list[object], result.get("errors") or [])],
         *[f"gap: {g}" for g in cast(list[object], result.get("gaps") or [])],
         *[

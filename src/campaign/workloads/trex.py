@@ -2,6 +2,7 @@
 
 import json
 import shlex
+from importlib import resources
 
 import jubilant
 
@@ -14,76 +15,7 @@ CHANNEL = "latest/edge"
 PLUGS = ("network-control", "hardware-observe", "process-control", "system-observe")
 RPC_PORT = 4501
 
-CONFIG = """\
-- version: 2
-  interfaces: ["{link}", "dummy"]
-  port_info:
-    - dest_mac: [0x00,0x00,0x00,0x00,0x00,0x01]
-      src_mac:  [0x00,0x00,0x00,0x00,0x00,0x02]
-    - dest_mac: [0x00,0x00,0x00,0x00,0x00,0x02]
-      src_mac:  [0x00,0x00,0x00,0x00,0x00,0x01]
-  port_bandwidth_gb: 10
-  port_mtu: 1500
-"""
-
-# Runs on the sender with the snap's Python and TRex client library.
-# Every packet carries a new source address and UDP source port, so megaflow
-# wildcarding cannot fold packets together. Ports are acquired without force:
-# a port owned by another session makes the run fail instead of taking it over.
-FLOOD = """\
-import json, signal, sys, time
-
-from trex.stl.api import *
-
-args = json.loads(sys.argv[1])
-out = open(args["out"], "a", buffering=1)
-signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-
-l3 = IPv6(src=args["src"], dst=args["dst"]) if args["ipv6"] else IP(
-    src=args["src"], dst=args["dst"])
-packet = Ether(dst=args["mac"]) / Dot1Q(vlan=args["vlan"]) / l3 / UDP(
-    sport=1024, dport=args["dport"]) / Raw(load=b"\\x00" * 18)
-src_size = 8 if args["ipv6"] else 2
-vm = STLScVmRaw([
-    STLVmFlowVar(name="src", min_value=1, max_value=256 ** src_size - 1,
-                 size=src_size, op="inc"),
-    STLVmWrFlowVar(fv_name="src", pkt_offset="IPv6.src" if args["ipv6"] else "IP.src",
-                   offset_fixup=8 if args["ipv6"] else 2),
-    STLVmFlowVar(name="sport", min_value=1024, max_value=65535, size=2, op="inc"),
-    STLVmWrFlowVar(fv_name="sport", pkt_offset="UDP.sport"),
-    STLVmFixChecksumHw(l3_offset="IPv6" if args["ipv6"] else "IP", l4_offset="UDP",
-                       l4_type=CTRexVmInsFixHwCs.L4_TYPE_UDP),
-])
-client = STLClient()
-client.connect()
-try:
-    client.acquire(ports=[0])
-    client.reset(ports=[0])
-    client.add_streams(STLStream(packet=STLPktBuilder(pkt=packet, vm=vm),
-                                 mode=STLTXCont()), ports=[0])
-    client.clear_stats()
-    started = False
-    for step, (pps, seconds) in enumerate(args["steps"]):
-        if started:
-            client.update(ports=[0], mult=f"{pps}pps")
-        else:
-            client.start(ports=[0], mult=f"{pps}pps", duration=args["max_s"])
-            started = True
-        end = time.time() + seconds
-        while time.time() < end:
-            time.sleep(1)
-            stats = client.get_stats()[0]
-            out.write(json.dumps({
-                "t": time.time(), "step": step, "requested_pps": pps,
-                "opackets": stats["opackets"], "tx_pps": stats["tx_pps"],
-                "oerrors": stats["oerrors"]}) + "\\n")
-finally:
-    try:
-        client.stop(ports=[0])
-        client.release(ports=[0])
-    finally:
-        client.disconnect()
-"""
+FILES = resources.files("campaign.workloads") / "files"
 
 
 class Sender:
@@ -93,7 +25,6 @@ class Sender:
         """Remember where the run's TRex units and files live."""
         self.juju = juju
         self.machine = machine
-        # A strictly confined snap only reads and writes under its own directories.
         self.dir = f"/var/snap/{SNAP}/common/{run_id}"
         self.server_unit = f"cloud-stress-{run_id[:8]}-trex"
         self.flood_unit = f"cloud-stress-{run_id[:8]}-flood"
@@ -139,9 +70,14 @@ class Sender:
 
     def stage(self, link: str) -> None:
         """Write the TRex config and flood script into the run's directory."""
-        config = CONFIG.format(link=link)
+        config = (FILES / "trex_cfg.yaml").read_text().format(link=link)
         remote.push(self.juju, self.machine, f"{self.dir}/trex_cfg.yaml", config)
-        remote.push(self.juju, self.machine, f"{self.dir}/flood.py", FLOOD)
+        remote.push(
+            self.juju,
+            self.machine,
+            f"{self.dir}/flood.py",
+            (FILES / "trex_flood.py").read_text(),
+        )
 
     def server_command(self) -> str:
         """Command for the TRex server on the provider link with a raw socket."""

@@ -285,23 +285,16 @@ def start(
     click.echo(f"{profile} for {duration} on model {juju_model}\n\nPlacement:")
     print_plan(result.plan, cast(Profile, profile))
     fmt = profiles.format_duration
-    measured = ", ".join(f"{p.name} {fmt(p.length_s)}" for p in schedule.phases)
-    if len(schedule.phases) > 1:
-        measured = f"{fmt(schedule.duration_s)}: {measured}"
-    rows = [["Measured", measured]]
+    rows = [
+        ["Phases", ", ".join(f"{p.name} {fmt(p.length_s)}" for p in schedule.phases)]
+    ]
     if schedule.trex_steps_pps:
         stress = next(p for p in schedule.phases if p.name == "stress")
         step = fmt(stress.length_s // len(schedule.trex_steps_pps))
         steps = " / ".join(f"{pps:,}" for pps in schedule.trex_steps_pps)
         rows.append(["Flood", f"{steps} pps, {step} each"])
     rows.append(
-        [
-            "Limits",
-            f"preparation {fmt(schedule.prepare_budget_s)}, "
-            f"calibration {fmt(schedule.calibrate_budget_s)}, "
-            f"finalization {fmt(schedule.finalize_budget_s)}; "
-            f"{fmt(schedule.max_elapsed_s)} in total",
-        ]
+        ["Ends within", f"{fmt(schedule.max_elapsed_s)}, with setup and cleanup"]
     )
     click.echo("\nSchedule:")
     print_table(rows)
@@ -401,7 +394,12 @@ def status(run_id: str | None, as_json: bool, html_file: Path | None) -> None:
             ["Run", state.id],
             ["Profile", state.profile],
             ["Duration", profiles.format_duration(state.duration_s)],
-            ["Phase", state.phase + (f" ({state.detail})" if state.detail else "")],
+            [
+                "Status",
+                state.detail
+                if state.phase == "running" and state.detail
+                else state.phase,
+            ],
             ["Outcome", _outcome(state)],
             ["Started", state.created_at.strftime("%Y-%m-%d %H:%M:%S UTC")],
             ["Elapsed", profiles.format_duration(elapsed)],

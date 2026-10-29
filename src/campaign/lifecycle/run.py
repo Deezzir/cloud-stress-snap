@@ -75,8 +75,6 @@ class Run:
         self.state.execution = execution
         finalize(self.state, self.conn, self.juju)
 
-    # Progress and waiting
-
     def phase(self, phase: run_state.Phase, detail: str | None = None) -> None:
         """Record a lifecycle phase change."""
         self.state.phase, self.state.detail = phase, detail
@@ -95,15 +93,13 @@ class Run:
 
     def wait_for(self, check: Callable[[], bool], timeout: float, what: str) -> None:
         """Poll check until it holds, within timeout and the preparation budget."""
-        if self.state.phase in ("preparing", "calibrating"):
+        if self.state.phase == "preparing":
             timeout = min(timeout, self.prepare_deadline - time.monotonic())
         deadline = time.monotonic() + timeout
         while not check():
             if time.monotonic() > deadline:
                 raise PreparationError(f"{what} timed out after {int(timeout)}s")
             self.wait(5)
-
-    # Preparation
 
     def prepare(self) -> None:
         """Create owned resources and verify every path before load."""
@@ -116,7 +112,6 @@ class Run:
         self.guest = self.ready_guest(self.target)
         self.note("starting collectors")
         self.start_collectors()
-        self.phase("calibrating")
         if uses_fio(state.profile):
             self.note("prefilling the data volume")
             self.prefill()
@@ -292,8 +287,6 @@ class Run:
                 "low-rate packets; check the VLAN, MAC, address and security group"
             )
 
-    # Measurement
-
     def measure(self) -> None:
         """Run the measured phases of the profile."""
         state, schedule = self.state, self.state.schedule
@@ -301,7 +294,7 @@ class Run:
         state.measured_start = run_state.now()
         run_state.save(state)
         start = time.time()
-        if state.profile == "fio-sweep":
+        if state.profile == "ceph-block":
             run_state.event(state.id, "measured-phase", phase="sweep")
             for cell in schedule.fio_cells:
                 self.note(f"fio {cell.label}")
@@ -313,7 +306,7 @@ class Run:
         for item in schedule.phases:
             self.wait(start + item.start_s - time.time())
             run_state.event(state.id, "measured-phase", phase=item.name)
-            self.note(f"{item.name} phase")
+            self.note(item.name)
             if item.name == "stress" and self.sender:
                 count = len(schedule.trex_steps_pps)
                 step_s = item.length_s // count
@@ -323,8 +316,6 @@ class Run:
         self.wait(start + schedule.duration_s - time.time())
         if state.profile == "network-ceph":
             self.wait_guest_unit("measured", 300)
-
-    # Owned units and files, journaled before they start
 
     def own_host_dir(self, where: str) -> None:
         """Journal the run's directory on a machine or unit before writing it."""

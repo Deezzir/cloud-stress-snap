@@ -27,9 +27,7 @@ PRIVATE = STATE_ROOT / "private"
 LOCK = PRIVATE / "run.lock"
 SOCKET = STATE_ROOT / "control.sock"
 
-Phase = Literal[
-    "accepted", "preparing", "calibrating", "running", "finalizing", "finished"
-]
+Phase = Literal["accepted", "preparing", "running", "finalizing", "finished"]
 Execution = Literal["completed", "cancelled", "failed", "interrupted"]
 Finalization = Literal["complete", "incomplete"]
 

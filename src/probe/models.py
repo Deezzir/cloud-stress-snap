@@ -330,7 +330,7 @@ class OvsHost(Record):
     physnets: dict[str, str] = Field(default_factory=dict)
 
 
-Profile = Literal["flow-churn", "fio-sweep", "network-ceph"]
+Profile = Literal["host-network", "ceph-block", "network-ceph"]
 
 
 class ProfileReadiness(Record):

@@ -406,9 +406,9 @@ def build(state: RunState) -> dict[str, object]:
     # A run that never reached measurement is not assessed; its cause says why.
     windows = _phases(state, evts)
     required = ["target-host"]
-    if state.profile in ("flow-churn", "network-ceph"):
+    if state.profile in ("host-network", "network-ceph"):
         required.append("sender-host")
-    if state.profile in ("fio-sweep", "network-ceph"):
+    if state.profile in ("ceph-block", "network-ceph"):
         required.append("ceph")
 
     metrics: dict[str, list[Row]] = {}

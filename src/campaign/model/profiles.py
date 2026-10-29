@@ -100,14 +100,14 @@ SWEEP = [
 ]
 
 PROFILES: dict[Profile, ProfileSpec] = {
-    "flow-churn": ProfileSpec(
+    "host-network": ProfileSpec(
         weights={"baseline": 1, "stress": 4, "recovery": 1},
         min_phase_s=60,
         trex_max_pps=1_000_000,
         trex_steps=4,
         calibrate_budget_s=120,
     ),
-    "fio-sweep": ProfileSpec(
+    "ceph-block": ProfileSpec(
         weights={"sweep": 1},
         min_phase_s=30 * len(SWEEP),
         fio_cells=SWEEP,
@@ -165,7 +165,7 @@ def resolve(profile: Profile, duration_s: int) -> Schedule:
         phases.append(Phase(name=name, start_s=start, length_s=length))
         start += length
     cells = [cell.model_copy() for cell in spec.fio_cells]
-    if profile == "fio-sweep":
+    if profile == "ceph-block":
         per_cell = duration_s // len(cells)
         for cell in cells:
             cell.length_s = per_cell

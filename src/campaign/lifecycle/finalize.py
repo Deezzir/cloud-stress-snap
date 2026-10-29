@@ -125,7 +125,6 @@ def finalize(
             except Exception as error:  # noqa: BLE001 - e.g. expired token
                 run_state.event(state.id, "cleanup-error", message=_short(error))
 
-    # 4. Result.
     _progress(state, "writing the result")
     left = run_state.outstanding(state.id)
     state.finalization = "incomplete" if left else "complete"

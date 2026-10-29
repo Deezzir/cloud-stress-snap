@@ -45,6 +45,8 @@ include = ["/src", "/snap", "/docs", "/README.md", "/LICENSE", "/CONTRIBUTING.md
 [tool.ruff]
 target-version = "py312"
 line-length = 88
+# Scripts shipped to remote hosts; they import tools that exist only there.
+extend-exclude = ["src/campaign/workloads/files"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "D"]
@@ -55,6 +57,7 @@ convention = "google"
 [tool.mypy]
 python_version = "3.12"
 strict = true
+exclude = ["src/campaign/workloads/files/"]
 
 [[tool.mypy.overrides]]
 module = ["yaml"]

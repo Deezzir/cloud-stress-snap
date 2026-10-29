@@ -87,9 +87,10 @@ class Guest:
         try:
             return remote.sh(self.juju, self.machine, ssh, wait=timeout)
         except (jubilant.CLIError, jubilant.TaskError, TimeoutError) as error:
-            detail = getattr(error, "stderr", "") or str(error)
+            detail = str(getattr(error, "stderr", "") or error)
+            detail = detail.rsplit("Stderr:", 1)[-1]
             raise RuntimeError(
-                "guest command failed: " + " ".join(str(detail).split())[:300]
+                "guest command failed: " + " ".join(detail.split())[:300]
             ) from None
 
     def reachable(self) -> bool:
