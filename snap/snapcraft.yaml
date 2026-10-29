@@ -31,8 +31,9 @@ description: |
 
   How to follow, stop, or export a run:
 
-      cloud-stress run status
+      cloud-stress run status [<run-id>]
       cloud-stress run stop
+      cloud-stress run status --json
       cloud-stress run status --html report.html
 
   **Reference**
@@ -48,6 +49,14 @@ description: |
   * OpenStack credentials in `OS_*` variables or `clouds.yaml` (`--cloud`).
   * A Juju login with admin access to the OpenStack model.
   * Optional: MAAS URL (`--maas-url`) and API key (`MAAS_TOKEN`).
+  * An overlay network with an IPv4 subnet for guest management.
+
+  Placement is chosen automatically; override it with `--sender`, `--target`,
+  `--network`, `--ip-version`, `--mgmt-network`, `--image`, `--flavor` and
+  `--volume-type`.
+
+  Results report measured SLO indicators without a verdict. Exit codes:
+  `0` completed, `20` failed, interrupted or not cleaned up, `30` cancelled.
 
   Run results are stored in `/var/snap/cloud-stress/common/runs/`.
 

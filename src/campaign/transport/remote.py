@@ -78,7 +78,8 @@ def remove_dir(juju: jubilant.Juju, where: str, path: str) -> None:
     """Remove a run-owned directory under /var/lib/cloud-stress."""
     if not path.startswith("/var/lib/cloud-stress/"):
         raise ValueError(f"refusing to remove {path}")
-    sh(juju, where, f"rm -rf {shlex.quote(path)}")
+    quoted = shlex.quote(path)
+    sh(juju, where, f"rm -rf {quoted} && test ! -e {quoted}")
 
 
 def remove_snap(juju: jubilant.Juju, where: str, name: str) -> None:
