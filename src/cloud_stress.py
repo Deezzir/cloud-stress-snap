@@ -305,14 +305,6 @@ def start(
     )
     click.echo("\nSchedule:")
     print_table(rows)
-    created = "guest, 2 ports, security group, key pair"
-    if schedule.volume_gb:
-        created += f", {schedule.volume_gb} GB volume"
-    rows = [["OpenStack", created]]
-    if schedule.trex_steps_pps:
-        rows.append(["Sender", "installs trex-generator, purged afterwards"])
-    click.echo("\nCreates (deleted during finalization):")
-    print_table(rows)
     click.echo()
     if not yes:
         if not sys.stdin.isatty():
