@@ -21,21 +21,35 @@ def _num(value: object) -> float | None:
 
 def _label(value: float) -> str:
     """Short axis label."""
-    return f"{value:.3g}" if abs(value) < 1000 else f"{value:.0f}"
+    return f"{value:.3g}" if abs(value) < 1000 else f"{value:,.0f}"
 
 
 def _chart(title: str, series: dict[str, Points], phases: list[Row]) -> str:
-    """Inline SVG line chart with shaded phases; empty without data."""
+    """Inline SVG line chart with shaded phases; empty without data.
+
+    With phases, every chart spans the same time range so charts line up.
+    """
+    starts = [v for p in phases if (v := _num(p.get("start"))) is not None]
+    ends = [v for p in phases if (v := _num(p.get("end"))) is not None]
+    if starts and ends:
+        series = {
+            name: [p for p in line if min(starts) <= p[0] <= max(ends)]
+            for name, line in series.items()
+        }
     points = [p for line in series.values() for p in line]
     if not points:
         return ""
-    width, height, pad = 720, 220, 50
+    width, height, pad, legend = 860, 220, 50, 140
     t0, t1 = min(p[0] for p in points), max(p[0] for p in points)
+    if starts and ends:
+        t0, t1 = min(starts), max(ends)
     v0, v1 = min(0.0, min(p[1] for p in points)), max(p[1] for p in points)
     t1, v1 = (t1 if t1 > t0 else t0 + 1), (v1 if v1 > v0 else v0 + 1)
 
+    right = width - legend
+
     def x(t: float) -> float:
-        return pad + (t - t0) / (t1 - t0) * (width - 2 * pad)
+        return pad + (t - t0) / (t1 - t0) * (right - pad)
 
     def y(v: float) -> float:
         return height - pad + (v0 - v) / (v1 - v0) * (height - 2 * pad)
@@ -54,24 +68,28 @@ def _chart(title: str, series: dict[str, Points], phases: list[Row]) -> str:
                 f'<text x="{x(start) + 3:.1f}" y="{pad + 12}" font-size="10">'
                 f"{html_lib.escape(name)}</text>"
             )
+    for frac in (0.0, 0.5, 1.0):
+        v, t = v0 + frac * (v1 - v0), t0 + frac * (t1 - t0)
+        anchor = ("start", "middle", "end")[int(frac * 2)]
+        parts.append(
+            f'<line x1="{pad}" y1="{y(v):.1f}" x2="{right}" y2="{y(v):.1f}" '
+            f'stroke="#ddd"/>'
+            f'<text x="{pad - 4}" y="{y(v) + 4:.1f}" font-size="10" '
+            f'text-anchor="end">{_label(v)}</text>'
+            f'<text x="{x(t):.1f}" y="{height - pad + 14}" font-size="10" '
+            f'text-anchor="{anchor}">{format_duration(int(t - t0))}</text>'
+        )
     parts.append(
-        f'<line x1="{pad}" y1="{height - pad}" x2="{width - pad}" y2="{height - pad}" '
+        f'<line x1="{pad}" y1="{height - pad}" x2="{right}" y2="{height - pad}" '
         f'stroke="#333"/><line x1="{pad}" y1="{pad}" x2="{pad}" y2="{height - pad}" '
         f'stroke="#333"/>'
-        f'<text x="{pad - 4}" y="{height - pad}" font-size="10" text-anchor="end">'
-        f"{_label(v0)}</text>"
-        f'<text x="{pad - 4}" y="{pad + 4}" font-size="10" text-anchor="end">'
-        f"{_label(v1)}</text>"
-        f'<text x="{pad}" y="{height - pad + 14}" font-size="10">0s</text>'
-        f'<text x="{width - pad}" y="{height - pad + 14}" font-size="10" '
-        f'text-anchor="end">{format_duration(int(t1 - t0))}</text>'
     )
     for index, (name, line) in enumerate(series.items()):
         color = COLORS[index % len(COLORS)]
         coords = " ".join(f"{x(t):.1f},{y(v):.1f}" for t, v in sorted(line))
         parts.append(
             f'<polyline fill="none" stroke="{color}" stroke-width="1.5" '
-            f'points="{coords}"/><text x="{width - pad + 4}" y="{pad + 14 * index}" '
+            f'points="{coords}"/><text x="{right + 8}" y="{pad + 14 * index + 4}" '
             f'font-size="10" fill="{color}">{html_lib.escape(name)}</text>'
         )
     parts.append("</svg>")
@@ -148,18 +166,13 @@ def html(result: dict[str, object], metrics: dict[str, list[Row]]) -> str:
             phases,
         ),
         _chart(
-            "Target drops (per s)",
+            "Drops on the target path (per s)",
             {
-                "host drops (bond)": _points(target, f"{link}.rx_dropped_per_s")
-                if link
-                else [],
-                "NIC ring drops": _summed(target, ".rx_out_of_buffer_per_s"),
+                "link": _points(target, f"{link}.rx_dropped_per_s") if link else [],
+                "NIC ring": _summed(target, ".rx_out_of_buffer_per_s"),
+                "OVS lost upcalls": _points(target, "ovs.lost_per_s"),
+                "guest tap": _points(target, "tap.tx_dropped_per_s"),
             },
-            phases,
-        ),
-        _chart(
-            "OVS lost upcalls (per s)",
-            {"lost": _points(target, "ovs.lost_per_s")},
             phases,
         ),
         _chart(
@@ -174,9 +187,9 @@ def html(result: dict[str, object], metrics: dict[str, list[Row]]) -> str:
     return (
         "<!DOCTYPE html><html><head><meta charset='utf-8'>"
         f"<title>{title}</title><style>"
-        "body{font-family:sans-serif;margin:2em;max-width:900px}"
+        "body{font-family:sans-serif;margin:2em;max-width:960px}"
         "pre{background:#f6f6f6;padding:1em;overflow-x:auto}"
         "h3{font-size:1em;margin:1.5em 0 .3em}</style></head><body>"
-        f"<h1>{title}</h1><pre>{html_lib.escape(summary_text(result))}</pre>"
+        f"<pre>{html_lib.escape(summary_text(result))}</pre>"
         f"{''.join(charts)}</body></html>\n"
     )

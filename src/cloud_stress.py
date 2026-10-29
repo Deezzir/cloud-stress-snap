@@ -361,12 +361,10 @@ def stop(run_id: str | None, cloud: str | None, abandon_evidence: bool) -> None:
     "--html",
     "html_file",
     type=click.Path(dir_okay=False, path_type=Path),
-    help="Write the run's HTML report to this file; needs RUN_ID.",
+    help="Write the run's HTML report to this file.",
 )
 def status(run_id: str | None, as_json: bool, html_file: Path | None) -> None:
     """Show the active run, or a retained run (the latest by default)."""
-    if html_file and not run_id:
-        raise click.UsageError("--html needs the run ID.")
     if html_file and str(html_file.resolve()).startswith(("/tmp/", "/var/tmp/")):
         raise click.UsageError(
             "The snap has its own /tmp; write the report to your home directory."
