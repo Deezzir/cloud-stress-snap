@@ -69,7 +69,7 @@ def ceiling(steps: list[Row]) -> str | None:
 def _placement(result: dict[str, object]) -> list[list[object]]:
     """Where the run ran, one readable row per participant."""
     p = _dict(result.get("placement"))
-    manifest = _dict(result.get("manifest"))
+    run = _dict(result.get("run"))
     datapath = _dict(result.get("datapath"))
     trex = _dict(result.get("tools")).get("trex")
 
@@ -113,13 +113,7 @@ def _placement(result: dict[str, object]) -> list[list[object]]:
             if p.get("volume_id")
             else None,
         ],
-        [
-            "Model",
-            join(
-                manifest.get("model"),
-                manifest.get("snap_revision") and f"snap {manifest['snap_revision']}",
-            ),
-        ],
+        ["Model", run.get("model")],
     ]
     return [row for row in rows if row[1]]
 

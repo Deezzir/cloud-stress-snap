@@ -149,7 +149,8 @@ class Run:
             uses_trex(self.state.profile),
             self.wait,
         )
-        (self.dir / "target.json").write_text(target.model_dump_json(indent=2))
+        self.state.target = target
+        run_state.save(self.state)
         run_state.event(self.state.id, "target", **target.model_dump())
         self.own_host_dir(self.state.plan.target_machine or "")
         guest = guest_for(self.juju, self.state, target)

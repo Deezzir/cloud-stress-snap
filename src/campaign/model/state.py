@@ -19,6 +19,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from campaign.model.profiles import Schedule
+from campaign.model.target import Target
 from probe.models import Profile, RunPlan
 
 STATE_ROOT = Path(os.environ.get("SNAP_COMMON", ".scratch/state"))
@@ -44,6 +45,7 @@ class RunState(BaseModel):
     cloud: str
     plan: RunPlan
     schedule: Schedule
+    target: Target | None = None
     owner_uid: int
     phase: Phase = "accepted"
     detail: str | None = None
@@ -270,15 +272,5 @@ def create(
     run_dir(state.id).mkdir(mode=0o755)
     for sub in ("metrics", "raw"):
         (run_dir(state.id) / sub).mkdir(mode=0o755)
-    manifest = {
-        "run_id": state.id,
-        "cloud": cloud,
-        "model": model,
-        "snap_revision": os.environ.get("SNAP_REVISION"),
-        "created_at": created.isoformat(),
-        "plan": plan.model_dump(),
-        "schedule": schedule.model_dump(),
-    }
-    write_file(run_dir(state.id) / "manifest.json", json.dumps(manifest, indent=2))
     save(state)
     return state

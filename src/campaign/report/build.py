@@ -12,7 +12,6 @@ from typing import cast
 from campaign.model.profiles import format_duration
 from campaign.model.state import RunState, events, now, outstanding, run_dir
 from campaign.report.html import html
-from campaign.report.text import summary_text
 from campaign.workloads import collect, fio
 
 Row = dict[str, object]
@@ -379,6 +378,8 @@ def _run(state: RunState, finished: str) -> Row:
         "id": state.id,
         "profile": state.profile,
         "duration": format_duration(state.duration_s),
+        "model": state.model,
+        "cloud": state.cloud,
         "created": state.created_at.isoformat(),
         "finished": finished,
         "execution": state.execution,
@@ -394,15 +395,7 @@ def build(state: RunState) -> dict[str, object]:
     plan = state.plan
     evts = events(state.id)
     gaps: list[str] = []
-    try:
-        target: Row = json.loads(_text(bundle, "target.json", gaps) or "")
-    except ValueError:
-        target = {}
-    try:
-        manifest: object = json.loads(_text(bundle, "manifest.json", gaps) or "")
-    except ValueError:
-        manifest = None
-        gaps.append("manifest.json missing")
+    target = state.target.model_dump() if state.target else {}
     # A run that never reached measurement is not assessed; its cause says why.
     windows = _phases(state, evts)
     required = ["target-host"]
@@ -499,7 +492,6 @@ def build(state: RunState) -> dict[str, object]:
     ceph = {w[0]: _ceph(metrics["ceph"], w) for w in windows} if metrics["ceph"] else {}
     return {
         "run": _run(state, state.updated_at.isoformat()),
-        "manifest": manifest,
         "placement": {**{k: getattr(plan, k) for k in PLACEMENT}, **target},
         "tools": {
             str(e.get("name")): e.get("version")
@@ -553,15 +545,25 @@ def exit_code(state: RunState) -> int:
 
 
 def write(state: RunState, result: dict[str, object]) -> None:
-    """Stamp the final state into result and write every report file from it."""
+    """Stamp the final state into result and write report.json and its metrics."""
     bundle = run_dir(state.id)
     metrics = cast(dict[str, list[Row]], result.pop("_metrics", {}))
     result["run"] = _run(state, now().isoformat())
     (bundle / "metrics").mkdir(parents=True, exist_ok=True)
     for name, rows in metrics.items():
-        if name in COLLECTORS or name.startswith("fio-"):
-            text = "".join(json.dumps(row) + "\n" for row in rows)
-            (bundle / "metrics" / f"{name}.jsonl").write_text(text)
+        text = "".join(json.dumps(row) + "\n" for row in rows)
+        (bundle / "metrics" / f"{name}.jsonl").write_text(text)
     (bundle / "report.json").write_text(json.dumps(result, indent=2, default=str))
-    (bundle / "summary.txt").write_text(summary_text(result))
-    (bundle / "report.html").write_text(html(result, metrics))
+
+
+def render_html(run_id: str) -> str | None:
+    """The run's HTML report from report.json and metrics, if the run has a result."""
+    bundle = run_dir(run_id)
+    result_file = bundle / "report.json"
+    if not result_file.is_file():
+        return None
+    metrics = {
+        path.stem: [json.loads(line) for line in path.read_text().splitlines() if line]
+        for path in sorted((bundle / "metrics").glob("*.jsonl"))
+    }
+    return html(json.loads(result_file.read_text()), metrics)

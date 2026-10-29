@@ -18,7 +18,6 @@ from openstack.connection import Connection
 from campaign.lifecycle import provision
 from campaign.model import state as run_state
 from campaign.model.state import ResourceEntry, RunState
-from campaign.model.target import Target
 from campaign.report import build as report
 from campaign.transport import remote
 from campaign.transport.guest import Guest, guest_for
@@ -158,10 +157,9 @@ def _progress(state: RunState, detail: str) -> None:
 
 def _guest(state: RunState, juju: jubilant.Juju) -> Guest | None:
     """The run's guest, if it was provisioned."""
-    target = run_state.run_dir(state.id) / "target.json"
-    if not target.is_file():
+    if state.target is None:
         return None
-    return guest_for(juju, state, Target.model_validate_json(target.read_text()))
+    return guest_for(juju, state, state.target)
 
 
 def _fetch_guest(guest: Guest, path: str, target: Path) -> None:

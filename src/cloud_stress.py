@@ -16,6 +16,7 @@ import click
 from campaign.lifecycle import access
 from campaign.model import profiles
 from campaign.model import state as run_state
+from campaign.report.build import render_html
 from campaign.report.text import summary_text
 from helpers import (
     PLAN_CHOICES,
@@ -371,9 +372,10 @@ def status(run_id: str | None, as_json: bool, html_file: Path | None) -> None:
         return
     bundle = run_state.run_dir(state.id)
     if html_file:
-        if not (bundle / "report.html").is_file():
-            raise click.UsageError("This run has no HTML report yet.")
-        html_file.write_text((bundle / "report.html").read_text())
+        report = render_html(state.id)
+        if report is None:
+            raise click.UsageError("This run has no report yet.")
+        html_file.write_text(report)
         click.echo(f"Wrote {html_file.resolve()}")
         return
     if as_json:
