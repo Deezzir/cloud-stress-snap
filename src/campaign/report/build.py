@@ -23,6 +23,7 @@ MAX_FILE_BYTES = 64 * 1024**2
 MAX_CLOCK_OFFSET_S = 2.0
 PLACEMENT = (
     "sender",
+    "sender_link",
     "target",
     "network",
     "vlan",

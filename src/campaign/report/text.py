@@ -173,8 +173,10 @@ def summary_text(result: dict[str, object]) -> str:
             lines.append(f"  {note}")
     receipt = _dict(target.get("receipt"))
     if receipt:
+        if not sent:
+            lines += ["", "Network load:"]
         lines.append(
-            f"  preflight: target received {_pct(receipt.get('ratio'))} "
+            f"  receipt check: target received {_pct(receipt.get('ratio'))} "
             f"of a {_fmt(receipt.get('sent_pps'))} pps burst"
         )
 

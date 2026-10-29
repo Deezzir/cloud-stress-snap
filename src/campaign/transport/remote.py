@@ -50,14 +50,18 @@ def fetch(juju: jubilant.Juju, where: str, path: str) -> str | None:
 def start_unit(
     juju: jubilant.Juju, where: str, unit: str, max_runtime_s: int, command: str
 ) -> None:
-    """Start a transient systemd unit that stops itself after max_runtime_s."""
+    """Start a transient systemd unit that stops itself after max_runtime_s.
+
+    snapd moves a snap app into its own cgroup scope, out of the unit's reach, so
+    `timeout` bounds the command too and forwards the unit's stop signal to it.
+    """
     sh(
         juju,
         where,
         f"systemd-run --unit {unit} --collect "
         f"--property RuntimeMaxSec={max_runtime_s} "
         f"--property KillMode=control-group "
-        f"bash -c {shlex.quote(command)}",
+        f"timeout --kill-after=10 {max_runtime_s} bash -c {shlex.quote(command)}",
     )
 
 
@@ -65,13 +69,34 @@ STOP = """\
 if systemctl list-units --all --plain --no-legend {unit}.service | grep -q .; then
   systemctl stop {unit}.service
 fi
-! systemctl is-active --quiet {unit}.service
+if systemctl is-active --quiet {unit}.service; then exit 1; fi
 """
 
 
-def stop_unit(juju: jubilant.Juju, where: str, unit: str) -> None:
-    """Stop a run-owned transient unit and confirm it is gone or inactive."""
-    sh(juju, where, STOP.format(unit=unit))
+# Processes whose command line names the run's directory; the bracket keeps the
+# pattern from matching this script's own command line.
+REAP = """\
+pkill -f {pattern} || true
+for _ in 1 2 3 4 5; do pgrep -f {pattern} >/dev/null || exit 0; sleep 1; done
+pkill -KILL -f {pattern} || true
+sleep 1
+! pgrep -f {pattern} >/dev/null
+"""
+
+
+def stop_unit(
+    juju: jubilant.Juju, where: str, unit: str, run_dir: str | None = None
+) -> None:
+    """Stop a run-owned transient unit and confirm it is gone or inactive.
+
+    With run_dir, also stop any process that escaped the unit and still names
+    that directory, such as a snap app in its own cgroup scope.
+    """
+    script = STOP.format(unit=unit)
+    if run_dir:
+        pattern = shlex.quote(f"[{run_dir[0]}]{run_dir[1:]}/")
+        script += REAP.format(pattern=pattern)
+    sh(juju, where, script)
 
 
 def remove_dir(juju: jubilant.Juju, where: str, path: str) -> None:

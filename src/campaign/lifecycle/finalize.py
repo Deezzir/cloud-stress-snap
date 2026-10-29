@@ -58,7 +58,8 @@ def finalize(
     for entry in sorted(entries, key=lambda e: "flood" not in e.name):
         try:
             if entry.kind == "unit":
-                remote.stop_unit(juju, entry.where or "", entry.name)
+                run_dir = entry.id.rsplit("/", 1)[0] if entry.id else None
+                remote.stop_unit(juju, entry.where or "", entry.name, run_dir)
             elif entry.kind == "guest-unit" and guest:
                 guest.stop_unit(entry.name)
         except Exception as error:  # noqa: BLE001 - keep finalizing the rest

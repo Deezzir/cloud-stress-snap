@@ -106,15 +106,17 @@ class Sender:
             self.juju,
             self.machine,
             f"snap list {SNAP} >/dev/null 2>&1 && echo installed; "
-            f"ss -Hltn 'sport = :{RPC_PORT}' | grep -q . && echo busy; "
-            "pgrep -x _t-rex-64 >/dev/null && echo busy; "
+            f"ss -Hltn 'sport = :{RPC_PORT}' | grep -q . && echo port; "
+            "pgrep -x _t-rex-64 >/dev/null && echo process; "
             f"snap info {SNAP} >/dev/null 2>&1 || echo unreachable; true",
         ).split()
         problems = []
         if "installed" in out:
             problems.append(f"the {SNAP} snap is already installed on the sender")
-        if "busy" in out:
-            problems.append("another TRex server is running on the sender")
+        if "process" in out:
+            problems.append("a _t-rex-64 process is already running on the sender")
+        if "port" in out:
+            problems.append(f"TCP port {RPC_PORT} is already in use on the sender")
         if "unreachable" in out:
             problems.append(f"the sender cannot reach the Snap Store for {SNAP}")
         return problems
