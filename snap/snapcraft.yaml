@@ -6,8 +6,8 @@ summary: Prodstack stress testing tool
 grade: devel
 confinement: strict
 icon: snap/gui/icon.png
-issues: https://github.com/Deezzir/prodstack-stress-test/issues
-source-code: https://github.com/Deezzir/prodstack-stress-test
+issues: https://github.com/Deezzir/cloud-stress-snap/issues
+source-code: https://github.com/Deezzir/cloud-stress-snap
 description: |
   Stress test a Prodstack cloud.
 
@@ -53,7 +53,7 @@ description: |
 
   **Security**
 
-  https://github.com/Deezzir/prodstack-stress-test/blob/main/docs/security-reference.md
+  https://github.com/Deezzir/cloud-stress-snap/blob/main/docs/security-reference.md
 
 platforms:
   amd64:
