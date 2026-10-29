@@ -84,7 +84,7 @@ def summary_text(result: dict[str, object]) -> str:
         **_dict(result.get("placement")),
     }
     rows: list[list[object]] = [
-        [k.upper(), v] for k, v in placement.items() if v is not None
+        [k.upper(), str(v)] for k, v in placement.items() if v is not None
     ]
     if rows:
         lines += ["", "Placement:", *_table(rows)]

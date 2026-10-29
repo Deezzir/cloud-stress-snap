@@ -454,6 +454,8 @@ def resolve_plan(
         for image in result.openstack.images
         if "ubuntu" in f"{image.os_distro} {image.name}".lower()
         and "amphora" not in (image.name or "").lower()
+        # Nova accepts only its own architecture names, e.g. not "amd64v3".
+        and image.architecture in (None, "x86_64")
         and pick.get("image") in (None, image.name, image.id)
     ]
     image = max(images, key=lambda i: i.created_at or "", default=None)
@@ -461,9 +463,9 @@ def resolve_plan(
         plan.image, plan.image_id = image.name or image.id, image.id
     else:
         missing["image"] = (
-            f"{pick['image']} is not an Ubuntu image"
+            f"{pick['image']} is not an x86_64 Ubuntu image"
             if "image" in pick
-            else "no Ubuntu image"
+            else "no x86_64 Ubuntu image"
         )
     flavor = min(
         (

@@ -234,6 +234,7 @@ def probe_openstack(cloud: CloudRegion) -> tuple[OpenstackResult, list[ProbeNoti
             id=str(item.id),
             name=item.name,
             os_distro=item.os_distro,
+            architecture=item.architecture,
             created_at=item.created_at,
         )
         for item in _collect(

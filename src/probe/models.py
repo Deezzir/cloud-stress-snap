@@ -79,6 +79,7 @@ class Image(Record):
     id: str
     name: str | None
     os_distro: str | None
+    architecture: str | None = None
     created_at: str | None
 
 
