@@ -2,7 +2,8 @@
 
 import html as html_lib
 
-from campaign.profiles import format_duration
+from campaign.model.profiles import format_duration
+from campaign.report.text import summary_text
 
 Row = dict[str, object]
 Points = list[tuple[float, float]]
@@ -103,9 +104,6 @@ def _summed(rows: list[Row], suffix: str) -> Points:
 
 def html(result: dict[str, object], metrics: dict[str, list[Row]]) -> str:
     """HTML document with inline CSS and SVG charts for a result."""
-    # Imported here because report imports this module.
-    from campaign.report import summary_text
-
     raw_phases = result.get("phases")
     phases = (
         [p for p in raw_phases if isinstance(p, dict)]

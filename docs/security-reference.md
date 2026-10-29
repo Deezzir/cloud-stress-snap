@@ -15,7 +15,7 @@ snap connections cloud-stress
 
 | Connection | What it allows |
 | --- | --- |
-| `network` | Connections to deployment APIs and run guests. |
+| `network` | Connections to deployment APIs. |
 | `network-bind` | The worker's local control socket. |
 | `shared-memory` | Shared memory private to this snap. |
 | `home` | Non-hidden files in your home directory, such as CA certificates. |
@@ -51,6 +51,7 @@ All host commands run as root through `juju exec`:
 | --- | --- | --- |
 | `check` | `ceph-mon`, `ovn-chassis`, hypervisors | Read-only Ceph actions, `ceph`, `ovs-vsctl` and hardware reads. |
 | `run` | Sender, target and `ceph-mon` hosts | Starts run-owned transient units and files under `/var/lib/cloud-stress/<run-id>`. |
+| `run` | Target | Holds the run's guest key and runs SSH to the guest from the management network's OVN metadata namespace. |
 | `run` | Sender | Installs the `trex-generator` snap, then purges it. Needs Snap Store access. |
 
 `trex-generator` connections:
@@ -64,9 +65,9 @@ All host commands run as root through `juju exec`:
 
 ## OpenStack resources
 
-`run` creates a guest, port, security group and volume in your project, and
-deletes them during finalization. It reaches the guest over SSH with a key
-generated for the run.
+`run` creates a guest, two ports, a security group and a volume in your project,
+and deletes them during finalization. The guest accepts SSH only from the
+management network's metadata address, with a key generated for the run.
 
 ## Sharing output
 

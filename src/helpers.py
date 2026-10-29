@@ -297,7 +297,16 @@ def _bond_health(probe: HostProbe, name: str) -> tuple[bool, int] | None:
     )
 
 
-PLAN_CHOICES = ("sender", "target", "network", "image", "flavor", "volume_type")
+PLAN_CHOICES = (
+    "sender",
+    "target",
+    "network",
+    "ip_version",
+    "mgmt_network",
+    "image",
+    "flavor",
+    "volume_type",
+)
 
 
 def resolve_plan(
@@ -305,8 +314,9 @@ def resolve_plan(
 ) -> tuple[RunPlan, dict[str, str]]:
     """Choose run placement from live facts; return the plan and missing choices.
 
-    An override names the sender or target host, or the network, image, flavor or
-    volume type; it must still pass the same checks as an automatic choice.
+    An override names the sender or target host, the network, IP version or
+    management network, or the image, flavor or volume type; it must still pass the
+    same checks as an automatic choice.
     """
     pick = overrides or {}
     plan, missing = RunPlan(), {}
@@ -342,8 +352,14 @@ def resolve_plan(
         and any(network.physical_network in p for p in physnets.values())
         and pick.get("network") in (None, network.name, network.id)
     ]
+    version = int(pick["ip_version"]) if "ip_version" in pick else None
     network = min(
-        networks, key=lambda n: (6 not in n.ip_versions, n.name or n.id), default=None
+        networks,
+        key=lambda n: (
+            (version or 6) not in n.ip_versions,
+            n.name or n.id,
+        ),
+        default=None,
     )
     if network is None:
         missing["network"] = (
@@ -358,6 +374,33 @@ def resolve_plan(
         if not network.ip_versions:
             plan.ip_version = None
             missing["network"] = f"{plan.network} has no subnet"
+        elif version:
+            plan.ip_version = 4 if version == 4 else 6
+            if version not in network.ip_versions:
+                missing["network"] = f"{plan.network} has no IPv{version} subnet"
+
+    # Guests are managed over an overlay network, through its OVN metadata
+    # namespace on the target host. Octavia's lb-mgmt-net is never used.
+    mgmt = min(
+        (
+            n
+            for n in result.openstack.networks
+            if n.network_type in ("geneve", "vxlan")
+            and 4 in n.ip_versions
+            and n.name != "lb-mgmt-net"
+            and pick.get("mgmt_network") in (None, n.name, n.id)
+        ),
+        key=lambda n: n.name or n.id,
+        default=None,
+    )
+    if mgmt:
+        plan.mgmt_network, plan.mgmt_network_id = mgmt.name or mgmt.id, mgmt.id
+    else:
+        missing["mgmt_network"] = (
+            f"{pick['mgmt_network']} is not an overlay network with an IPv4 subnet"
+            if "mgmt_network" in pick
+            else "no overlay network with an IPv4 subnet for guest management"
+        )
 
     # Healthiest provider link first: all bond members up, then total speed.
     ranked = []
@@ -479,9 +522,24 @@ def resolve_plan(
 
 
 PROFILE_NEEDS: dict[Profile, tuple[str, ...]] = {
-    "flow-churn": ("network", "target", "sender", "image", "flavor"),
-    "fio-sweep": ("network", "target", "image", "flavor", "volume_type"),
-    "network-ceph": ("network", "target", "sender", "image", "flavor", "volume_type"),
+    "flow-churn": ("network", "mgmt_network", "target", "sender", "image", "flavor"),
+    "fio-sweep": (
+        "network",
+        "mgmt_network",
+        "target",
+        "image",
+        "flavor",
+        "volume_type",
+    ),
+    "network-ceph": (
+        "network",
+        "mgmt_network",
+        "target",
+        "sender",
+        "image",
+        "flavor",
+        "volume_type",
+    ),
 }
 
 
@@ -565,6 +623,7 @@ def print_plan(plan: RunPlan) -> None:
             ["Sender", f"{plan.sender} ({plan.sender_link})" if plan.sender else "-"],
             ["Target", plan.target or "-"],
             ["Network", network or "-"],
+            ["Management", plan.mgmt_network or "-"],
             ["Image", plan.image or "-"],
             ["Flavor", plan.flavor or "-"],
             ["Volume type", plan.volume_type or "-"],

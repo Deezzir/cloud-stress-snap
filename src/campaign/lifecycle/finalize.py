@@ -15,10 +15,13 @@ from pathlib import Path
 import jubilant
 from openstack.connection import Connection
 
-from campaign import provision, remote, report
-from campaign import state as run_state
-from campaign.guest import Guest
-from campaign.state import ResourceEntry, RunState
+from campaign.lifecycle import provision
+from campaign.model import state as run_state
+from campaign.model.state import ResourceEntry, RunState
+from campaign.model.target import Target
+from campaign.report import build as report
+from campaign.transport import remote
+from campaign.transport.guest import Guest, guest_for
 
 
 def _short(error: BaseException) -> str:
@@ -48,7 +51,7 @@ def finalize(
     run_state.event(state.id, "phase", phase="finalizing")
     raw = run_state.run_dir(state.id) / "raw"
     private = run_state.private_dir(state.id)
-    guest = _guest(state)
+    guest = _guest(state, juju)
 
     # 1. Stop: floods first so no load outlives the run.
     entries = run_state.outstanding(state.id)
@@ -92,8 +95,11 @@ def finalize(
             else:
                 guest_pending = True
 
-    # 3. Delete what no longer holds pending evidence.
+    # 3. Delete what no longer holds pending evidence. The target host's directory
+    # holds the guest key, so it stays while guest evidence is pending.
     _progress(state, "deleting run-owned resources")
+    if guest_pending:
+        pending_where.add(state.plan.target_machine or "")
     for entry in run_state.outstanding(state.id):
         if entry.kind not in ("dir", "snap") or entry.where in pending_where:
             continue
@@ -128,10 +134,6 @@ def finalize(
     ]
     try:
         result = report.build(state)
-        qualification = result["qualification"]
-        assert isinstance(qualification, dict)
-        state.qualification = qualification["summary"]
-        state.causes += [c for c in qualification["causes"] if c not in state.causes]
         state.code = report.exit_code(state)
         report.write(state, result)
     except Exception as error:  # noqa: BLE001 - a missing result is incomplete
@@ -154,14 +156,12 @@ def _progress(state: RunState, detail: str) -> None:
     run_state.save(state)
 
 
-def _guest(state: RunState) -> Guest | None:
-    """The run's guest, if it was provisioned and its keys are still present."""
+def _guest(state: RunState, juju: jubilant.Juju) -> Guest | None:
+    """The run's guest, if it was provisioned."""
     target = run_state.run_dir(state.id) / "target.json"
-    private = run_state.private_dir(state.id)
-    if not target.is_file() or not (private / "id_ed25519").is_file():
+    if not target.is_file():
         return None
-    address = provision.Target.model_validate_json(target.read_text()).address
-    return Guest(address, private / "id_ed25519", private / "known_hosts")
+    return guest_for(juju, state, Target.model_validate_json(target.read_text()))
 
 
 def _fetch_guest(guest: Guest, path: str, target: Path) -> None:

@@ -3,8 +3,8 @@
 import json
 import shlex
 
-from campaign.guest import Guest
-from campaign.profiles import FioCell
+from campaign.model.profiles import FioCell
+from campaign.transport.guest import Guest
 
 NUMJOBS = 2
 # fio latency histogram layout (FIO_IO_U_PLAT_BITS/VAL); bins are in ns.

@@ -1,4 +1,4 @@
-"""Run result: report.json, the human summary and a self-contained HTML report.
+"""Run result model: report.json, metric series, and the files built from them.
 
 Everything is computed from the run bundle, so a partial bundle still produces a
 result with its gaps listed rather than an error.
@@ -9,10 +9,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import cast
 
-from campaign import collect, fio
-from campaign.profiles import format_duration
-from campaign.report_html import html
-from campaign.state import RunState, events, now, outstanding, run_dir
+from campaign.model.profiles import format_duration
+from campaign.model.state import RunState, events, now, outstanding, run_dir
+from campaign.report.html import html
+from campaign.report.text import summary_text
+from campaign.workloads import collect, fio
 
 Row = dict[str, object]
 Window = tuple[str, float, float]
@@ -20,15 +21,13 @@ Window = tuple[str, float, float]
 COLLECTORS = ("target-host", "sender-host", "ceph")
 MAX_FILE_BYTES = 64 * 1024**2
 MAX_CLOCK_OFFSET_S = 2.0
-LOAD_FRACTION = 0.9
-RECEIPT_FRACTION = 0.9
-OFFERED_FRACTION = 0.95
 PLACEMENT = (
     "sender",
     "target",
     "network",
     "vlan",
     "ip_version",
+    "mgmt_network",
     "image",
     "flavor",
     "volume_type",
@@ -245,8 +244,8 @@ def _count(rows: list[Row], keys: set[str]) -> int | None:
     return round(sum(found)) if found else None
 
 
-def _host(target: list[Row], ceph: list[Row], link: str | None, window: Window) -> Row:
-    """Target host and Ceph evidence over one window.
+def _host(target: list[Row], link: str | None, window: Window) -> Row:
+    """Target host evidence over one window.
 
     Bond-level drops and the members' driver ring drops count overlapping packets,
     so they are reported separately and never summed.
@@ -255,7 +254,6 @@ def _host(target: list[Row], ceph: list[Row], link: str | None, window: Window) 
     inside = _inside(target, start, end)
     cpu = [r for r in inside if not r.get("cpu.reset")]
     rings = {k for r in inside for k in r if k.endswith(".rx_out_of_buffer_per_s")}
-    slow = _values(_inside(ceph, start, end), "ceph.slow_ops")
     return {
         "cpu_busy_pct": _mean(_values(cpu, "cpu.busy_pct")),
         "cpu_iowait_pct": _mean(_values(cpu, "cpu.iowait_pct")),
@@ -263,8 +261,14 @@ def _host(target: list[Row], ceph: list[Row], link: str | None, window: Window) 
         "host_drops": _count(inside, {f"{link}.rx_dropped_per_s"}) if link else None,
         "nic_ring_drops": _count(inside, rings),
         "lost_upcalls": _count(inside, {"ovs.lost_per_s"}),
-        "ceph_slow_ops_max": max(slow) if slow else None,
     }
+
+
+def _ceph(ceph: list[Row], window: Window) -> Row:
+    """Ceph slow operations over one window."""
+    _, start, end = window
+    slow = _values(_inside(ceph, start, end), "ceph.slow_ops")
+    return {"slow_ops_max": max(slow) if slow else None}
 
 
 def _load(samples: list[Row], rx: list[tuple[float, float]]) -> list[Row]:
@@ -284,7 +288,7 @@ def _load(samples: list[Row], rx: list[tuple[float, float]]) -> list[Row]:
                 "requested_pps": _num(rows[0].get("requested_pps")),
                 "tx_pps": tx,
                 "rx_pps": rx_pps,
-                "achieved": _ratio(tx, rows[0].get("requested_pps")),
+                "delivered": _ratio(tx, rows[0].get("requested_pps")),
                 "loss": round(1 - rx_pps / tx, 3)
                 if rx_pps is not None and tx
                 else None,
@@ -294,116 +298,55 @@ def _load(samples: list[Row], rx: list[tuple[float, float]]) -> list[Row]:
     return out
 
 
-def _criterion(name: str, status: str, detail: str) -> Row:
-    """One qualification criterion row."""
-    return {"name": name, "status": status, "detail": detail}
+def _indicator(name: str, where: str, value: object, unit: str = "") -> Row:
+    """One measured value an operator compares with their SLO."""
+    return {"name": name, "where": where, "value": value, "unit": unit}
 
 
-def _load_criteria(state: RunState, steps: list[Row]) -> list[Row]:
-    """TRex criteria: requested load delivered and target receipt under load."""
-    planned = len(state.schedule.trex_steps_pps)
-    short = [
-        f"step {s['step']} {s['achieved'] or 0:.0%}"
-        for s in steps
-        if (_num(s["achieved"]) or 0) < LOAD_FRACTION
-    ]
-    if not steps or len(steps) < planned:
-        load = _criterion(
-            "requested load delivered",
-            "incomplete",
-            f"TRex samples for {len(steps)} of {planned} steps",
-        )
-    elif short:
-        load = _criterion("requested load delivered", "incomplete", ", ".join(short))
-    else:
-        load = _criterion(
-            "requested load delivered",
-            "passed",
-            f"all {len(steps)} steps delivered >= {LOAD_FRACTION:.0%} of requested",
-        )
-    no_rx = [str(s["step"]) for s in steps if s["rx_pps"] is None or not s["tx_pps"]]
-    losses = ", ".join(
-        f"step {s['step']} loss {s['loss']:.1%}" for s in steps if s["loss"] is not None
-    )
-    if not steps or no_rx:
-        receipt = _criterion(
-            "target receipt under load",
-            "incomplete",
-            f"no receive data for steps {', '.join(no_rx)}"
-            if no_rx
-            else "no TRex steps",
-        )
-    elif any((_num(s["loss"]) or 0) > 1 - RECEIPT_FRACTION for s in steps):
-        receipt = _criterion("target receipt under load", "incomplete", losses)
-    else:
-        receipt = _criterion("target receipt under load", "passed", losses)
-    return [load, receipt]
-
-
-def _ceph_criteria(
-    fio_result: Row,
-    phases: dict[str, Row],
-    windows: list[Window],
-    samples: list[Row],
+def _indicators(
+    steps: list[Row],
+    fio_phases: dict[str, Row],
+    host: dict[str, Row],
+    ceph: dict[str, Row],
 ) -> list[Row]:
-    """network-ceph fio criteria: job completion, offered I/O and phase coverage."""
-    cells = cast(list[Row], fio_result["cells"])
-    measured = next((c for c in cells if c["name"] == "measured"), None)
-    criteria = [
-        _criterion(
-            "fio measured job complete",
-            "passed" if measured and measured.get("complete") else "incomplete",
-            str(measured.get("error") or "complete")
-            if measured
-            else "no measured fio output",
-        )
-    ]
-    fraction = _ratio(
-        phases.get("baseline", {}).get("iops"), fio_result["offered_iops"]
-    )
-    criteria.append(
-        _criterion(
-            "offered I/O delivered in baseline",
-            "incomplete"
-            if fraction is None or fraction < OFFERED_FRACTION
-            else "passed",
-            "no baseline IOPS or offered rate"
-            if fraction is None
-            else f"baseline delivered {fraction:.0%} of offered IOPS",
-        )
-    )
-    missing = [
-        n
-        for n in ("baseline", "stress", "recovery")
-        if not phases.get(n, {}).get("ios")
-    ]
-    times = _values(samples, "t")
-    stress = next((w for w in windows if w[0] == "stress"), None)
-    if stress and not (times and min(times) < stress[2] and max(times) >= stress[1]):
-        missing.append("TRex load during stress")
-    criteria.append(
-        _criterion(
-            "phase coverage",
-            "incomplete" if missing else "passed",
-            f"missing: {', '.join(missing)}" if missing else "all phases covered",
-        )
-    )
-    criteria.append(_criterion("latency SLO", "not-assessed", "no SLO configured"))
-    return criteria
+    """SLO-relevant measurements, without a verdict."""
+    rows = []
+    if steps:
+        top = steps[-1]
+        where = f"top step ({_fmt_pps(top['requested_pps'])} requested)"
+        rows.append(_indicator("sender delivered", where, top["tx_pps"], "pps"))
+        if (loss := _num(top["loss"])) is not None:
+            rows.append(_indicator("target loss", where, round(100 * loss, 2), "%"))
+    base = fio_phases.get("baseline", {})
+    for phase, values in fio_phases.items():
+        rows.append(_indicator("fio IOPS", phase, values.get("iops")))
+        rows.append(_indicator("fio p99 latency", phase, values.get("p99_ms"), "ms"))
+        if phase != "baseline":
+            change = _ratio(values.get("p99_ms"), base.get("p99_ms"))
+            if change is not None:
+                rows.append(
+                    _indicator(
+                        "fio p99 vs baseline", phase, round(100 * (change - 1), 1), "%"
+                    )
+                )
+    stress = host.get("stress", {})
+    for key, name in (
+        ("host_drops", "target host drops"),
+        ("nic_ring_drops", "target NIC ring drops"),
+        ("lost_upcalls", "OVS lost upcalls"),
+    ):
+        if stress.get(key) is not None:
+            rows.append(_indicator(name, "stress", stress[key], "packets"))
+    slow = [v for c in ceph.values() if (v := _num(c.get("slow_ops_max"))) is not None]
+    if slow:
+        rows.append(_indicator("Ceph slow ops (max)", "run", max(slow)))
+    return rows
 
 
-def _qualify(criteria: list[Row]) -> Row:
-    """Summary status and causes from criteria."""
-    statuses = {c["status"] for c in criteria}
-    summary = next(
-        (s for s in ("failed", "incomplete", "passed") if s in statuses), "not-assessed"
-    )
-    causes = [
-        f"{c['name']}: {c['detail']}"
-        for c in criteria
-        if c["status"] not in ("passed", "not-assessed")
-    ]
-    return {"summary": summary, "criteria": criteria, "causes": causes}
+def _fmt_pps(value: object) -> str:
+    """Rate with thousands separators."""
+    number = _num(value)
+    return f"{number:,.0f} pps" if number is not None else "-"
 
 
 def _run(state: RunState, finished: str) -> Row:
@@ -415,7 +358,6 @@ def _run(state: RunState, finished: str) -> Row:
         "created": state.created_at.isoformat(),
         "finished": finished,
         "execution": state.execution,
-        "qualification": state.qualification,
         "finalization": state.finalization,
         "code": state.code,
         "causes": state.causes,
@@ -526,33 +468,8 @@ def build(state: RunState) -> dict[str, object]:
         rising = stress is not None and baseline is not None and stress > baseline
         offload = "observed" if rising else "unverified"
 
-    criteria: list[Row] = []
-    if windows and state.profile in ("flow-churn", "network-ceph"):
-        criteria += _load_criteria(state, steps)
-    if windows and state.profile == "fio-sweep":
-        done = {c["label"] for c in fio_cells if c.get("complete")}
-        missing = [c.label for c in state.schedule.fio_cells if c.label not in done]
-        criteria.append(
-            _criterion(
-                "fio cells complete",
-                "incomplete" if missing else "passed",
-                f"incomplete cells: {', '.join(missing)}"
-                if missing
-                else f"all {len(state.schedule.fio_cells)} cells complete",
-            )
-        )
-    if windows and state.profile == "network-ceph":
-        criteria += _ceph_criteria(fio_result, fio_phases, windows, samples)
-    lacking = [f"{n}: {', '.join(problems[n])}" for n in required if problems.get(n)]
-    if windows:
-        criteria.append(
-            _criterion(
-                "required evidence",
-                "incomplete" if lacking else "passed",
-                "; ".join(lacking) if lacking else f"{', '.join(required)} complete",
-            )
-        )
-
+    host = {w[0]: _host(metrics["target-host"], plan.target_link, w) for w in windows}
+    ceph = {w[0]: _ceph(metrics["ceph"], w) for w in windows} if metrics["ceph"] else {}
     return {
         "run": _run(state, state.updated_at.isoformat()),
         "manifest": manifest,
@@ -564,13 +481,25 @@ def build(state: RunState) -> dict[str, object]:
         },
         "schedule": [p.model_dump() for p in state.schedule.phases],
         "phases": [{"name": n, "start": s, "end": e} for n, s, e in windows],
-        "load": {"planned_pps": state.schedule.trex_steps_pps, "steps": steps},
-        "receipt": next((e for e in evts if e.get("event") == "receipt"), None),
-        "fio": fio_result,
-        "host": {
-            w[0]: _host(metrics["target-host"], metrics["ceph"], plan.target_link, w)
-            for w in windows
+        "sender": {
+            "planned_pps": state.schedule.trex_steps_pps,
+            "steps": [
+                {k: step[k] for k in ("step", "requested_pps", "tx_pps", "delivered")}
+                | {"oerrors": step["oerrors"]}
+                for step in steps
+            ],
         },
+        "target": {
+            "receipt": next((e for e in evts if e.get("event") == "receipt"), None),
+            "steps": [
+                {k: step[k] for k in ("step", "tx_pps", "rx_pps", "loss")}
+                for step in steps
+            ],
+            "host": host,
+        },
+        "guest": {"fio": fio_result},
+        "ceph": ceph,
+        "indicators": _indicators(steps, fio_phases, host, ceph),
         "datapath": {
             "kind": "kernel"
             if plan.target_datapath in (None, "system")
@@ -584,23 +513,16 @@ def build(state: RunState) -> dict[str, object]:
             {"kind": e.kind, "name": e.name, "action": e.action, "where": e.where}
             for e in outstanding(state.id)
         ],
-        "qualification": _qualify(criteria),
         # Popped by write(): metric series are written to metrics/, not report.json.
         "_metrics": metrics,
     }
 
 
 def exit_code(state: RunState) -> int:
-    """Process exit code: 20 incomplete/failed run, 30 cancelled, 10 failed, else 0."""
+    """Process exit code: 0 completed, 30 cancelled, 20 failed or not cleaned up."""
     if state.finalization != "complete" or state.execution in ("failed", "interrupted"):
         return 20
-    if state.execution == "cancelled":
-        return 30
-    if state.qualification == "incomplete":
-        return 20
-    if state.qualification == "failed":
-        return 10
-    return 0
+    return 30 if state.execution == "cancelled" else 0
 
 
 def write(state: RunState, result: dict[str, object]) -> None:
@@ -616,128 +538,3 @@ def write(state: RunState, result: dict[str, object]) -> None:
     (bundle / "report.json").write_text(json.dumps(result, indent=2, default=str))
     (bundle / "summary.txt").write_text(summary_text(result))
     (bundle / "report.html").write_text(html(result, metrics))
-
-
-def _fmt(value: object) -> str:
-    """Format a value for a table cell; "-" for missing values."""
-    if value is None:
-        return "-"
-    if isinstance(value, float):
-        return f"{value:.3g}" if abs(value) < 1000 else f"{value:.0f}"
-    return str(value)
-
-
-def _table(rows: list[list[object]]) -> list[str]:
-    """Format rows, header first, as indented two-space columns."""
-    cells = [[_fmt(c) for c in row] for row in rows]
-    widths = [max(len(row[i]) for row in cells) for i in range(len(cells[0]))]
-    return [
-        "  " + "  ".join(c.ljust(w) for c, w in zip(row, widths, strict=True)).rstrip()
-        for row in cells
-    ]
-
-
-def _dict(value: object) -> Row:
-    """Value when it is a dict, else an empty dict."""
-    return value if isinstance(value, dict) else {}
-
-
-def _list(value: object) -> list[Row]:
-    """Dict items of value when it is a list."""
-    return [v for v in value if isinstance(v, dict)] if isinstance(value, list) else []
-
-
-def _dicts(value: object) -> dict[str, Row]:
-    """Dict-valued entries of value when it is a dict."""
-    return {k: v for k, v in _dict(value).items() if isinstance(v, dict)}
-
-
-def summary_text(result: dict[str, object]) -> str:
-    """Human summary of a result with titled, aligned sections."""
-    run = _dict(result.get("run"))
-    qual = _dict(result.get("qualification"))
-    lines = [
-        f"Run {run.get('id')} ({run.get('profile')}, {run.get('duration')})",
-        *_table(
-            [
-                ["EXECUTION", "FINALIZATION", "QUALIFICATION", "CODE"],
-                [
-                    run.get("execution"),
-                    run.get("finalization"),
-                    qual.get("summary"),
-                    run.get("code"),
-                ],
-            ]
-        ),
-    ]
-    manifest = _dict(result.get("manifest"))
-    placement = {
-        **{k: manifest.get(k) for k in ("cloud", "model", "snap_revision")},
-        **_dict(result.get("placement")),
-    }
-    rows: list[list[object]] = [
-        [k.upper(), v] for k, v in placement.items() if v is not None
-    ]
-    if rows:
-        lines += ["", "Placement:", *_table(rows)]
-    steps = _list(_dict(result.get("load")).get("steps"))
-    if steps:
-        rows = [["STEP", "REQUESTED PPS", "TX PPS", "TARGET RX PPS", "LOSS"]]
-        keys = ("step", "requested_pps", "tx_pps", "rx_pps", "loss")
-        rows += [[s.get(k) for k in keys] for s in steps]
-        lines += ["", "Load:", *_table(rows)]
-    receipt = _dict(result.get("receipt"))
-    if receipt:
-        lines.append(f"  preflight receipt ratio {_fmt(receipt.get('ratio'))}")
-    fio_result = _dict(result.get("fio"))
-    rows = [["CELL", "IOS", "IOPS", "P50 MS", "P99 MS", "COMPLETE"]]
-    keys = ("total_ios", "iops", "p50_ms", "p99_ms", "complete")
-    rows += [
-        [c.get("name"), *(c.get(k) for k in keys)]
-        for c in _list(fio_result.get("cells"))
-        if "iops" in c and c.get("name") not in ("prefill", "calibration", "measured")
-    ]
-    rows += [
-        [name, p.get("ios"), p.get("iops"), p.get("p50_ms"), p.get("p99_ms"), ""]
-        for name, p in _dicts(fio_result.get("phases")).items()
-    ]
-    if len(rows) > 1:
-        lines += ["", "fio:", *_table(rows)]
-    if fio_result.get("offered_iops") is not None:
-        lines.append(f"  offered IOPS {_fmt(fio_result.get('offered_iops'))}")
-    host = _dict(result.get("host"))
-    if host:
-        rows = [["PHASE", "CPU BUSY %", "IOWAIT %", "SOFTIRQ %", "HOST DROPS"]]
-        rows[0] += ["NIC RING DROPS", "LOST UPCALLS", "SLOW OPS"]
-        columns = (
-            "cpu_busy_pct",
-            "cpu_iowait_pct",
-            "cpu_softirq_pct",
-            "host_drops",
-            "nic_ring_drops",
-            "lost_upcalls",
-            "ceph_slow_ops_max",
-        )
-        rows += [[n, *(h.get(k) for k in columns)] for n, h in _dicts(host).items()]
-        lines += ["", "Target host:", *_table(rows)]
-    datapath = _dict(result.get("datapath"))
-    if datapath:
-        kind, offload = _fmt(datapath.get("kind")), _fmt(datapath.get("offload"))
-        lines.append(f"  datapath {kind}, offload {offload}")
-    criteria = _list(qual.get("criteria"))
-    if criteria:
-        rows = [["CRITERION", "STATUS", "DETAIL"]]
-        rows += [[c.get("name"), c.get("status"), c.get("detail")] for c in criteria]
-        lines += ["", "Qualification:", *_table(rows)]
-    issues = [
-        *[str(c) for c in cast(list[object], run.get("causes") or [])],
-        *[str(e) for e in cast(list[object], result.get("errors") or [])],
-        *[f"gap: {g}" for g in cast(list[object], result.get("gaps") or [])],
-        *[
-            f"not cleaned up: {r.get('kind')} {r.get('name')} ({r.get('action')})"
-            for r in _list(result.get("cleanup"))
-        ],
-    ]
-    if issues:
-        lines += ["", "Issues:", *[f"  {i}" for i in dict.fromkeys(issues)]]
-    return "\n".join(lines) + "\n"

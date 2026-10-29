@@ -8,14 +8,17 @@ from collections.abc import Callable
 import jubilant
 from openstack.connection import Connection
 
-from campaign import collect, fio, provision, remote
-from campaign import state as run_state
-from campaign.finalize import finalize
-from campaign.guest import Guest, keygen
-from campaign.profiles import FioCell, uses_fio, uses_trex
-from campaign.provision import PreparationError, Target
-from campaign.state import RunState
-from campaign.trex import SNAP, Sender
+from campaign.lifecycle import provision
+from campaign.lifecycle.finalize import finalize
+from campaign.lifecycle.provision import PreparationError
+from campaign.model import state as run_state
+from campaign.model.profiles import FioCell, uses_fio, uses_trex
+from campaign.model.state import RunState
+from campaign.model.target import Target
+from campaign.transport import remote
+from campaign.transport.guest import Guest, guest_for, keygen
+from campaign.workloads import collect, fio
+from campaign.workloads.trex import SNAP, Sender
 
 SAMPLE_INTERVAL_S = {"host": 5, "ceph": 10}
 RECEIPT_PPS, RECEIPT_S, RECEIPT_MIN = 1000, 15, 0.8
@@ -143,7 +146,6 @@ class Run:
         public_key = keygen(self.private / "id_ed25519")
         host_public = keygen(self.private / "host_ed25519")
         host_private = (self.private / "host_ed25519").read_text()
-        (self.private / "known_hosts").write_text("")
         target = provision.provision(
             self.conn,
             self.state,
@@ -154,16 +156,18 @@ class Run:
         )
         (self.dir / "target.json").write_text(target.model_dump_json(indent=2))
         run_state.event(self.state.id, "target", **target.model_dump())
-        guest = Guest(
-            target.address, self.private / "id_ed25519", self.private / "known_hosts"
-        )
-        guest.pin(host_public)
+        self.own_host_dir(self.state.plan.target_machine or "")
+        guest = guest_for(self.juju, self.state, target)
+        guest.install_keys((self.private / "id_ed25519").read_text(), host_public)
         return target
 
     def ready_guest(self, target: Target) -> Guest:
         """Wait for SSH and cloud-init; find the data interface and volume."""
-        guest = Guest(
-            target.address, self.private / "id_ed25519", self.private / "known_hosts"
+        guest = guest_for(self.juju, self.state, target)
+        self.wait_for(
+            guest.namespace_ready,
+            BOOT_TIMEOUT_S,
+            f"the {guest.namespace} namespace on the target host",
         )
         self.wait_for(guest.reachable, BOOT_TIMEOUT_S, "SSH to the target guest")
         status = guest.run("cloud-init status --wait >/dev/null; echo $?", timeout=900)

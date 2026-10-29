@@ -25,10 +25,11 @@ from pathlib import Path
 
 import jubilant
 
-from campaign import access, profiles
-from campaign import state as run_state
-from campaign.finalize import finalize
-from campaign.run import Run
+from campaign.lifecycle import access
+from campaign.lifecycle.finalize import finalize
+from campaign.lifecycle.run import Run
+from campaign.model import profiles
+from campaign.model import state as run_state
 from probe.models import RunPlan
 
 IDLE_EXIT_S = 60

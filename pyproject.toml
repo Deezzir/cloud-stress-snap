@@ -20,7 +20,7 @@ dependencies = [
 
 [project.scripts]
 cloud-stress = "cloud_stress:app"
-cloud-stress-worker = "campaign.worker:main"
+cloud-stress-worker = "campaign.lifecycle.worker:main"
 
 [dependency-groups]
 format = ["ruff==0.17.3"]

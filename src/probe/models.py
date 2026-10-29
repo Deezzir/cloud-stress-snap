@@ -360,6 +360,8 @@ class RunPlan(Record):
     target_datapath: str | None = None
     target_hw_offload: bool | None = None
     network_id: str | None = None
+    mgmt_network: str | None = None
+    mgmt_network_id: str | None = None
     image_id: str | None = None
     flavor_id: str | None = None
     ceph_mon: str | None = None

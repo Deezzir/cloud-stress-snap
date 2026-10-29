@@ -1,7 +1,6 @@
 """Run-owned OpenStack resources, created after a journaled intent."""
 
 import base64
-import socket
 import time
 from collections.abc import Callable
 from typing import Any
@@ -9,34 +8,17 @@ from typing import Any
 import yaml
 from openstack import exceptions
 from openstack.connection import Connection
-from pydantic import BaseModel, ConfigDict
 
-from campaign import state as run_state
-from campaign.profiles import FLOOD_PORT, FLOOD_SOURCE_CIDR
-from campaign.state import RunState
+from campaign.model import state as run_state
+from campaign.model.profiles import FLOOD_PORT, FLOOD_SOURCE_CIDR
+from campaign.model.state import RunState
+from campaign.model.target import Target
 
 BUILD_TIMEOUT = 600
 
 
 class PreparationError(Exception):
     """A required capability is missing; no load was applied."""
-
-
-class Target(BaseModel):
-    """The provisioned target guest as observed after creation."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    server_id: str
-    port_id: str
-    mac: str
-    address: str
-    binding_host: str | None
-    security_groups: list[str]
-    volume_id: str | None = None
-    volume_type: str | None = None
-    volume_backend: str | None = None
-    volume_size_gb: int | None = None
 
 
 def name(state: RunState, kind: str) -> str:
@@ -86,17 +68,17 @@ def _wait(
     raise PreparationError(f"{what} not ready after {BUILD_TIMEOUT}s")
 
 
-def controller_address(address: str) -> str:
-    """Local source address the controller uses to reach address."""
-    family = socket.AF_INET6 if ":" in address else socket.AF_INET
-    try:
-        with socket.socket(family, socket.SOCK_DGRAM) as probe:
-            probe.connect((address, 22))
-            return str(probe.getsockname()[0])
-    except OSError as error:
-        raise PreparationError(
-            f"the controller has no route to the guest address {address}: {error}"
-        ) from None
+def metadata_address(conn: Connection, network_id: str) -> str:
+    """IPv4 address of the network's OVN metadata port, the guests' SSH source."""
+    for port in conn.network.ports(
+        network_id=network_id, device_owner="network:distributed"
+    ):
+        for item in port.fixed_ips:
+            if ":" not in item["ip_address"]:
+                return str(item["ip_address"])
+    raise PreparationError(
+        "the management network has no OVN metadata port with an IPv4 address"
+    )
 
 
 def check_quota(conn: Connection, vcpus: int, ram_mb: int, volume_gb: int) -> list[str]:
@@ -125,8 +107,9 @@ def provision(
     trex: bool,
     sleep: Callable[[float], None],
 ) -> Target:
-    """Create the run's key pair, security group, port, volume and target guest."""
+    """Create the run's key pair, security group, ports, volume and target guest."""
     plan, schedule = state.plan, state.schedule
+    source = metadata_address(conn, plan.mgmt_network_id or "")
     volume_type = None
     if schedule.volume_gb:
         types = {t.name for t in conn.block_storage.types()}
@@ -153,12 +136,21 @@ def provision(
             name=n, network_id=plan.network_id, security_group_ids=[group.id]
         ),
     )
+    mgmt_port = _create(
+        state,
+        "mgmt-port",
+        lambda n: conn.network.create_port(
+            name=n, network_id=plan.mgmt_network_id, security_group_ids=[group.id]
+        ),
+    )
     addresses = [item["ip_address"] for item in port.fixed_ips]
     address = next(
         (a for a in addresses if (":" in a) == (plan.ip_version == 6)), addresses[0]
     )
-    source = controller_address(address)
-    rules = [("tcp", 22, f"{source}/{128 if ':' in source else 32}")]
+    mgmt_address = next(
+        a["ip_address"] for a in mgmt_port.fixed_ips if ":" not in a["ip_address"]
+    )
+    rules = [("tcp", 22, f"{source}/32")]
     if trex:
         rules.append(("udp", FLOOD_PORT, FLOOD_SOURCE_CIDR[plan.ip_version or 6]))
     for protocol, port_number, cidr in rules:
@@ -195,7 +187,8 @@ def provision(
             name=n,
             image_id=plan.image_id,
             flavor_id=plan.flavor_id,
-            networks=[{"port": port.id}],
+            networks=[{"port": mgmt_port.id}, {"port": port.id}],
+            config_drive=True,
             key_name=keypair.name,
             user_data=base64.b64encode(user_data.encode()).decode(),
             hypervisor_hostname=plan.target_hypervisor,
@@ -217,6 +210,8 @@ def provision(
         port_id=port.id,
         mac=port.mac_address,
         address=address,
+        mgmt_port_id=mgmt_port.id,
+        mgmt_address=mgmt_address,
         binding_host=None,
         security_groups=[group.id],
     )
@@ -269,6 +264,7 @@ DELETE: dict[str, Callable[[Connection, str], None]] = {
         id, ignore_missing=True
     ),
     "port": lambda conn, id: conn.network.delete_port(id, ignore_missing=True),
+    "mgmt-port": lambda conn, id: conn.network.delete_port(id, ignore_missing=True),
     "volume": lambda conn, id: conn.block_storage.delete_volume(
         id, ignore_missing=True
     ),
@@ -279,6 +275,7 @@ FIND: dict[str, Callable[[Connection, str], Any]] = {
     "keypair": lambda conn, n: conn.compute.find_keypair(n),
     "security-group": lambda conn, n: conn.network.find_security_group(n),
     "port": lambda conn, n: conn.network.find_port(n),
+    "mgmt-port": lambda conn, n: conn.network.find_port(n),
     "volume": lambda conn, n: conn.block_storage.find_volume(n),
     "server": lambda conn, n: conn.compute.find_server(n),
 }

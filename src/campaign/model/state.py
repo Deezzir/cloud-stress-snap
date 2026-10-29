@@ -18,7 +18,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from campaign.profiles import Schedule
+from campaign.model.profiles import Schedule
 from probe.models import Profile, RunPlan
 
 STATE_ROOT = Path(os.environ.get("SNAP_COMMON", ".scratch/state"))
@@ -31,7 +31,6 @@ Phase = Literal[
     "accepted", "preparing", "calibrating", "running", "finalizing", "finished"
 ]
 Execution = Literal["completed", "cancelled", "failed", "interrupted"]
-Qualification = Literal["passed", "failed", "incomplete", "not-assessed"]
 Finalization = Literal["complete", "incomplete"]
 
 
@@ -53,7 +52,6 @@ class RunState(BaseModel):
     cancel_requested: bool = False
     measured_start: datetime | None = None
     execution: Execution | None = None
-    qualification: Qualification | None = None
     finalization: Finalization | None = None
     code: int | None = None
     causes: list[str] = Field(default_factory=list)

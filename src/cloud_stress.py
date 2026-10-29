@@ -12,8 +12,10 @@ from pathlib import Path
 
 import click
 
-from campaign import access, profiles, report
-from campaign import state as run_state
+from campaign.lifecycle import access
+from campaign.model import profiles
+from campaign.model import state as run_state
+from campaign.report.text import summary_text
 from helpers import (
     PLAN_CHOICES,
     datapath_notices,
@@ -218,7 +220,7 @@ def show_result(state: run_state.RunState) -> None:
     """Print a run's summary, or its outcome when no result was written."""
     result_file = run_state.run_dir(state.id) / "report.json"
     if result_file.is_file():
-        click.echo(report.summary_text(json.loads(result_file.read_text())))
+        click.echo(summary_text(json.loads(result_file.read_text())))
     else:
         for cause in state.causes:
             click.echo(f"  - {cause}")
@@ -237,6 +239,12 @@ def show_result(state: run_state.RunState) -> None:
 @click.option("--sender", help="Sender hypervisor (short hostname).")
 @click.option("--target", help="Target hypervisor (short hostname).")
 @click.option("--network", help="VLAN provider network name or ID.")
+@click.option(
+    "--ip-version",
+    type=click.Choice(["4", "6"]),
+    help="Target address family; default IPv6 when the network has it.",
+)
+@click.option("--mgmt-network", help="Overlay network name or ID for guest access.")
 @click.option("--image", help="Guest image name or ID.")
 @click.option("--flavor", help="Guest flavor name or ID.")
 @click.option("--volume-type", help="Cinder volume type name or ID.")
@@ -336,7 +344,6 @@ def stop(run_id: str | None, cloud: str | None, abandon_evidence: bool) -> None:
     }
     reply = request(payload, check=False)
     if reply.get("needs_access"):
-        # Cleanup of an interrupted run needs a fresh login; cancelling does not.
         payload["access"] = operator_access(cloud or pending.cloud).model_dump()
         reply = request(payload)
     elif not reply.get("ok"):
@@ -412,7 +419,7 @@ def status(run_id: str | None, as_json: bool, html_file: Path | None) -> None:
 def _outcome(state: run_state.RunState) -> str:
     if state.code is None:
         return "-"
-    parts = [state.execution, state.qualification, f"exit {state.code}"]
+    parts = [state.execution, f"exit {state.code}"]
     return ", ".join(part for part in parts if part)
 
 

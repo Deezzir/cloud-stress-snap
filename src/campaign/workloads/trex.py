@@ -5,9 +5,9 @@ import shlex
 
 import jubilant
 
-from campaign import remote
-from campaign.profiles import FLOOD_PORT, FLOOD_SOURCE
-from campaign.provision import Target
+from campaign.model.profiles import FLOOD_PORT, FLOOD_SOURCE
+from campaign.model.target import Target
+from campaign.transport import remote
 
 SNAP = "trex-generator"
 CHANNEL = "latest/edge"
