@@ -66,6 +66,64 @@ def ceiling(steps: list[Row]) -> str | None:
     )
 
 
+def _placement(result: dict[str, object]) -> list[list[object]]:
+    """Where the run ran, one readable row per participant."""
+    p = _dict(result.get("placement"))
+    manifest = _dict(result.get("manifest"))
+    datapath = _dict(result.get("datapath"))
+    trex = _dict(result.get("tools")).get("trex")
+
+    def join(*parts: object) -> str | None:
+        text = ", ".join(str(x) for x in parts if x)
+        return text or None
+
+    def link(host: object, iface: object) -> str | None:
+        return f"{host} ({iface})" if host and iface else join(host)
+
+    offload = "offload on" if datapath.get("hw_offload") else "offload off"
+    family = f"IPv{p['ip_version']}" if p.get("ip_version") else None
+    volume = p.get("volume_size_gb")
+    rows: list[list[object]] = [
+        [
+            "Sender",
+            join(link(p.get("sender"), p.get("sender_link")), trex and f"TRex {trex}"),
+        ],
+        [
+            "Target",
+            join(
+                link(p.get("target"), p.get("target_link")),
+                datapath.get("kind") and f"{datapath['kind']} datapath",
+                datapath and offload,
+            ),
+        ],
+        [
+            "Network",
+            join(
+                p.get("network"),
+                p.get("vlan") and f"VLAN {p['vlan']}",
+                family,
+                p.get("address"),
+            ),
+        ],
+        ["Management", join(p.get("mgmt_network"), p.get("mgmt_address"))],
+        ["Guest", join(p.get("flavor"), p.get("image"))],
+        [
+            "Volume",
+            join(p.get("volume_type"), volume and f"{volume} GB")
+            if p.get("volume_id")
+            else None,
+        ],
+        [
+            "Model",
+            join(
+                manifest.get("model"),
+                manifest.get("snap_revision") and f"snap {manifest['snap_revision']}",
+            ),
+        ],
+    ]
+    return [row for row in rows if row[1]]
+
+
 def summary_text(result: dict[str, object]) -> str:
     """Human summary of a result with titled, aligned sections."""
     run = _dict(result.get("run"))
@@ -73,19 +131,12 @@ def summary_text(result: dict[str, object]) -> str:
         f"Run {run.get('id')} ({run.get('profile')}, {run.get('duration')})",
         *_table(
             [
-                ["EXECUTION", "FINALIZATION", "CODE"],
-                [run.get("execution"), run.get("finalization"), run.get("code")],
+                ["Outcome", f"{run.get('execution')}, exit {run.get('code')}"],
+                ["Cleanup", run.get("finalization")],
             ]
         ),
     ]
-    manifest = _dict(result.get("manifest"))
-    placement = {
-        **{k: manifest.get(k) for k in ("cloud", "model", "snap_revision")},
-        **_dict(result.get("placement")),
-    }
-    rows: list[list[object]] = [
-        [k.upper(), str(v)] for k, v in placement.items() if v is not None
-    ]
+    rows = _placement(result)
     if rows:
         lines += ["", "Placement:", *_table(rows)]
 
@@ -147,25 +198,31 @@ def summary_text(result: dict[str, object]) -> str:
     host = _dicts(target.get("host"))
     ceph = _dicts(result.get("ceph"))
     if host:
-        rows = [["PHASE", "CPU BUSY %", "IOWAIT %", "SOFTIRQ %", "HOST DROPS"]]
-        rows[0] += ["NIC RING DROPS", "LOST UPCALLS", "CEPH SLOW OPS"]
-        columns = (
-            "cpu_busy_pct",
-            "cpu_iowait_pct",
-            "cpu_softirq_pct",
-            "host_drops",
-            "nic_ring_drops",
-            "lost_upcalls",
-        )
-        rows += [
-            [n, *(h.get(k) for k in columns), ceph.get(n, {}).get("slow_ops_max")]
-            for n, h in host.items()
+        columns = {
+            "CPU BUSY %": "cpu_busy_pct",
+            "SOFTIRQ %": "cpu_softirq_pct",
+            "IOWAIT %": "cpu_iowait_pct",
+            "LINK DROPS": "host_drops",
+            "RING DROPS": "nic_ring_drops",
+            "LOST UPCALLS": "lost_upcalls",
+            "TAP DROPS": "tap_drops",
+            "GUEST DROPS": "guest_drops",
+        }
+        table = {
+            phase: {
+                **{label: h.get(key) for label, key in columns.items()},
+                "CEPH SLOW OPS": ceph.get(phase, {}).get("slow_ops_max"),
+            }
+            for phase, h in host.items()
+        }
+        shown = [
+            label
+            for label in [*columns, "CEPH SLOW OPS"]
+            if any(values[label] is not None for values in table.values())
         ]
-        lines += ["", "Target host:", *_table(rows)]
-    datapath = _dict(result.get("datapath"))
-    if datapath:
-        kind, offload = _fmt(datapath.get("kind")), _fmt(datapath.get("offload"))
-        lines.append(f"  datapath {kind}, offload {offload}")
+        rows = [["PHASE", *shown]]
+        rows += [[p, *(v[label] for label in shown)] for p, v in table.items()]
+        lines += ["", "Target host and guest:", *_table(rows)]
 
     issues = [
         *[str(c) for c in cast(list[object], run.get("causes") or [])],

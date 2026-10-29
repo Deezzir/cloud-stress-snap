@@ -96,6 +96,12 @@ while True:
     else:
         sample = {f"cpu.{k}": v for k, v in cpu().items()}
         sample.update(nic(args["link"]))
+        if tap := args.get("tap"):
+            # The guest's tap: tx_dropped counts packets the guest did not take.
+            for counter in ("tx_packets", "tx_dropped"):
+                value = read(f"/sys/class/net/{tap}/statistics/{counter}").strip()
+                if value.isdigit():
+                    sample[f"tap.{counter}"] = int(value)
         sample.update(ovs(args.get("offload")))
     out.write(json.dumps({"t": started, "seq": seq, **sample}) + "\n")
     seq += 1
@@ -144,6 +150,6 @@ def normalize(text: str) -> list[dict[str, object]]:
     return rows
 
 
-def start_args(link: str | None, offload: bool | None) -> str:
+def start_args(link: str | None, offload: bool | None, tap: str | None = None) -> str:
     """Sampler arguments as a JSON string."""
-    return json.dumps({"link": link, "offload": bool(offload)})
+    return json.dumps({"link": link, "offload": bool(offload), "tap": tap})

@@ -84,22 +84,35 @@ def _jsonl(bundle: Path, rel: str, gaps: list[str]) -> list[Row]:
     return rows
 
 
-def _rx_log(bundle: Path, gaps: list[str]) -> list[tuple[float, float]]:
-    """Guest receive counter samples as (epoch seconds, rx_packets)."""
+def _rx_log(
+    bundle: Path, gaps: list[str]
+) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
+    """Guest receive and drop counter samples as (epoch seconds, count) lists."""
     rel = "raw/rx/rx.log"
     points: list[tuple[float, float]] = []
+    drops: list[tuple[float, float]] = []
     bad = 0
     for line in (_text(bundle, rel, gaps) or "").splitlines():
         if not line.strip():
             continue
         try:
-            t, count = line.split()
+            t, count, *rest = line.split()
             points.append((float(t), float(count)))
+            if rest:
+                drops.append((float(t), float(rest[0])))
         except ValueError:
             bad += 1
     if bad:
         gaps.append(f"{bad} malformed lines in {rel}")
-    return sorted(points)
+    return sorted(points), sorted(drops)
+
+
+def _delta(points: list[tuple[float, float]], start: float, end: float) -> int | None:
+    """Counter increase inside [start, end], or None without a clean pair."""
+    inside = [p for p in points if start <= p[0] <= end]
+    if len(inside) < 2 or inside[-1][1] < inside[0][1]:
+        return None
+    return round(inside[-1][1] - inside[0][1])
 
 
 def _rx_pps(rx: list[tuple[float, float]], start: float, end: float) -> float | None:
@@ -244,7 +257,12 @@ def _count(rows: list[Row], keys: set[str]) -> int | None:
     return round(sum(found)) if found else None
 
 
-def _host(target: list[Row], link: str | None, window: Window) -> Row:
+def _host(
+    target: list[Row],
+    link: str | None,
+    window: Window,
+    guest_drops: list[tuple[float, float]],
+) -> Row:
     """Target host evidence over one window.
 
     Bond-level drops and the members' driver ring drops count overlapping packets,
@@ -261,6 +279,8 @@ def _host(target: list[Row], link: str | None, window: Window) -> Row:
         "host_drops": _count(inside, {f"{link}.rx_dropped_per_s"}) if link else None,
         "nic_ring_drops": _count(inside, rings),
         "lost_upcalls": _count(inside, {"ovs.lost_per_s"}),
+        "tap_drops": _count(inside, {"tap.tx_dropped_per_s"}),
+        "guest_drops": _delta(guest_drops, start, end),
     }
 
 
@@ -289,7 +309,8 @@ def _load(samples: list[Row], rx: list[tuple[float, float]]) -> list[Row]:
                 "tx_pps": tx,
                 "rx_pps": rx_pps,
                 "delivered": _ratio(tx, rows[0].get("requested_pps")),
-                "loss": round(1 - rx_pps / tx, 3)
+                # Sample windows can make rx exceed tx slightly; that is no loss.
+                "loss": max(round(1 - rx_pps / tx, 3), 0.0)
                 if rx_pps is not None and tx
                 else None,
                 "oerrors": max(_values(rows, "oerrors"), default=0),
@@ -334,6 +355,8 @@ def _indicators(
         ("host_drops", "target host drops"),
         ("nic_ring_drops", "target NIC ring drops"),
         ("lost_upcalls", "OVS lost upcalls"),
+        ("tap_drops", "guest tap drops"),
+        ("guest_drops", "guest NIC drops"),
     ):
         if stress.get(key) is not None:
             rows.append(_indicator(name, "stress", stress[key], "packets"))
@@ -447,7 +470,7 @@ def build(state: RunState) -> dict[str, object]:
                 fio_phases.get(name, {}).get(key), base.get(key)
             )
 
-    rx = _rx_log(bundle, gaps)
+    rx, guest_drops = _rx_log(bundle, gaps)
     samples = _jsonl(bundle, "raw/stress.jsonl", gaps)
     metrics["stress"] = samples
     metrics["rx"] = _rx_series(rx)
@@ -468,7 +491,10 @@ def build(state: RunState) -> dict[str, object]:
         rising = stress is not None and baseline is not None and stress > baseline
         offload = "observed" if rising else "unverified"
 
-    host = {w[0]: _host(metrics["target-host"], plan.target_link, w) for w in windows}
+    host = {
+        w[0]: _host(metrics["target-host"], plan.target_link, w, guest_drops)
+        for w in windows
+    }
     ceph = {w[0]: _ceph(metrics["ceph"], w) for w in windows} if metrics["ceph"] else {}
     return {
         "run": _run(state, state.updated_at.isoformat()),

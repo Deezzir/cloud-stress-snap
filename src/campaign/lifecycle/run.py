@@ -190,12 +190,13 @@ class Run:
             if not device:
                 raise PreparationError(reason)
             self.device = device
-        counter = f"/sys/class/net/{self.guest_link}/statistics/rx_packets"
+        stats = f"/sys/class/net/{self.guest_link}/statistics"
         self.start_guest_unit(
             guest,
             "rx",
             self.state.schedule.max_elapsed_s,
-            f"while true; do echo $(date +%s.%N) $(cat {counter}); sleep 1; done "
+            f"while true; do echo $(date +%s.%N) $(cat {stats}/rx_packets) "
+            f"$(cat {stats}/rx_dropped); sleep 1; done "
             f"> {self.guest_dir}/rx/rx.log",
         )
         return guest
@@ -381,15 +382,24 @@ class Run:
                 plan.target_machine,
                 plan.target_link,
                 plan.target_hw_offload,
+                # Nova names a guest's tap device after its port.
+                f"tap{self.target.port_id[:11]}" if self.target else None,
             ),
         ]
         if uses_trex(self.state.profile):
             sources.append(
-                ("sender-host", "host", plan.sender_machine, plan.sender_link, False)
+                (
+                    "sender-host",
+                    "host",
+                    plan.sender_machine,
+                    plan.sender_link,
+                    False,
+                    None,
+                )
             )
         if uses_fio(self.state.profile) and plan.ceph_mon:
-            sources.append(("ceph", "ceph", plan.ceph_mon, None, False))
-        for name, mode, where, link, offload in sources:
+            sources.append(("ceph", "ceph", plan.ceph_mon, None, False, None))
+        for name, mode, where, link, offload, tap in sources:
             if not where:
                 continue
             output = f"{self.host_dir}/{name}.jsonl"
@@ -407,7 +417,7 @@ class Run:
                     self.state.schedule.max_elapsed_s,
                     f"exec python3 {self.host_dir}/sampler.py {mode} {output} "
                     f"{SAMPLE_INTERVAL_S[mode]} "
-                    f"{shlex.quote(collect.start_args(link, offload))}",
+                    f"{shlex.quote(collect.start_args(link, offload, tap))}",
                     output,
                 )
                 run_state.event(

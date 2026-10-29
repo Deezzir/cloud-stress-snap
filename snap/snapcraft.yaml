@@ -34,7 +34,7 @@ description: |
       cloud-stress run status [<run-id>]
       cloud-stress run stop
       cloud-stress run status --json
-      cloud-stress run status --html report.html
+      cloud-stress run status <run-id> --html report.html
 
   **Reference**
 

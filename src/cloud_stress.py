@@ -360,10 +360,16 @@ def stop(run_id: str | None, cloud: str | None, abandon_evidence: bool) -> None:
     "--html",
     "html_file",
     type=click.Path(dir_okay=False, path_type=Path),
-    help="Write the HTML report to this file.",
+    help="Write the run's HTML report to this file; needs RUN_ID.",
 )
 def status(run_id: str | None, as_json: bool, html_file: Path | None) -> None:
     """Show the active run, or a retained run (the latest by default)."""
+    if html_file and not run_id:
+        raise click.UsageError("--html needs the run ID.")
+    if html_file and str(html_file.resolve()).startswith(("/tmp/", "/var/tmp/")):
+        raise click.UsageError(
+            "The snap has its own /tmp; write the report to your home directory."
+        )
     try:
         state = run_state.load(run_id) if run_id else next(iter(run_state.runs()), None)
     except FileNotFoundError:
@@ -376,7 +382,7 @@ def status(run_id: str | None, as_json: bool, html_file: Path | None) -> None:
         if not (bundle / "report.html").is_file():
             raise click.UsageError("This run has no HTML report yet.")
         html_file.write_text((bundle / "report.html").read_text())
-        click.echo(f"Wrote {html_file}")
+        click.echo(f"Wrote {html_file.resolve()}")
         return
     if as_json:
         result_file = bundle / "report.json"
@@ -386,7 +392,10 @@ def status(run_id: str | None, as_json: bool, html_file: Path | None) -> None:
             else state.model_dump_json(indent=2)
         )
         return
-    end = state.updated_at if state.phase == "finished" else datetime.now(UTC)
+    if state.phase == "finished":
+        show_result(state)
+        return
+    end = datetime.now(UTC)
     elapsed = int((end - state.created_at).total_seconds())
     print_table(
         [
@@ -399,11 +408,6 @@ def status(run_id: str | None, as_json: bool, html_file: Path | None) -> None:
             ["Elapsed", profiles.format_duration(elapsed)],
         ]
     )
-    if state.code is not None:
-        click.echo()
-        show_result(state)
-    if state.phase == "finished":
-        return
     click.echo("\nPlacement:")
     print_plan(state.plan)
     pending = run_state.outstanding(state.id)
