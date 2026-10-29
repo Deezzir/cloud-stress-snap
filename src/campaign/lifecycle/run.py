@@ -172,7 +172,17 @@ class Run:
         self.wait_for(guest.reachable, BOOT_TIMEOUT_S, "SSH to the target guest")
         status = guest.run("cloud-init status --wait >/dev/null; echo $?", timeout=900)
         if status.strip() not in ("0", "2"):
-            raise PreparationError(f"cloud-init failed in the guest ({status.strip()})")
+            detail = guest.run("cloud-init status --long 2>&1 | tail -n 15; true")
+            run_state.event(self.state.id, "cloud-init", status=detail.strip())
+            errors = [
+                line.strip(" -")
+                for line in detail.splitlines()
+                if line.strip().startswith("- ")
+            ]
+            raise PreparationError(
+                "cloud-init failed in the guest"
+                + (f": {'; '.join(errors)[:300]}" if errors else f" ({status.strip()})")
+            )
         self.guest_link = guest.run(
             "for d in /sys/class/net/*; do "
             f'[ "$(cat $d/address)" = {target.mac} ] && basename $d; done; true'
