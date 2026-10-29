@@ -614,21 +614,31 @@ def print_readiness(readiness: list[ProfileReadiness], plan: RunPlan) -> None:
         print_plan(plan)
 
 
-def print_plan(plan: RunPlan) -> None:
-    """Print the placement of a run."""
+def print_plan(plan: RunPlan, profile: Profile | None = None) -> None:
+    """Print the placement of a run; with a profile, only what it uses."""
+    needs = PROFILE_NEEDS[profile] if profile else None
     network = plan.network
     if network:
         network += f", VLAN {plan.vlan}" if plan.vlan else ""
         network += f", IPv{plan.ip_version}" if plan.ip_version else ""
+    guest = ", ".join(x for x in (plan.flavor, plan.image) if x)
+    rows = [
+        (
+            "sender",
+            "Sender",
+            f"{plan.sender} ({plan.sender_link})" if plan.sender else None,
+        ),
+        ("target", "Target", plan.target),
+        ("network", "Network", network),
+        ("mgmt_network", "Management", plan.mgmt_network),
+        ("image", "Guest", guest),
+        ("volume_type", "Volume type", plan.volume_type),
+    ]
     print_table(
         [
-            ["Sender", f"{plan.sender} ({plan.sender_link})" if plan.sender else "-"],
-            ["Target", plan.target or "-"],
-            ["Network", network or "-"],
-            ["Management", plan.mgmt_network or "-"],
-            ["Image", plan.image or "-"],
-            ["Flavor", plan.flavor or "-"],
-            ["Volume type", plan.volume_type or "-"],
+            [label, value or "-"]
+            for need, label, value in rows
+            if needs is None or need in needs
         ]
     )
 

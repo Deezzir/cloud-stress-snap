@@ -9,6 +9,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 import click
 
@@ -32,7 +33,7 @@ from probe.ceph_probe import probe_ceph
 from probe.infra_probe import probe_infra
 from probe.juju_probe import probe_juju
 from probe.maas_probe import probe_maas
-from probe.models import CheckResult
+from probe.models import CheckResult, Profile
 from probe.openstack_probe import resolve_cloud
 from probe.ovs_probe import probe_ovs
 
@@ -281,28 +282,36 @@ def start(
         for blocker in readiness.blockers:
             click.echo(f"  - {blocker}", err=True)
         raise SystemExit(2)
-    click.echo("Run plan:")
-    print_plan(result.plan)
-    click.echo("\nSchedule:")
-    rows = [
-        [phase.name.capitalize(), profiles.format_duration(phase.length_s)]
-        for phase in schedule.phases
-    ]
+    click.echo(f"{profile} for {duration} on model {juju_model}\n\nPlacement:")
+    print_plan(result.plan, cast(Profile, profile))
+    fmt = profiles.format_duration
+    measured = ", ".join(f"{p.name} {fmt(p.length_s)}" for p in schedule.phases)
+    if len(schedule.phases) > 1:
+        measured = f"{fmt(schedule.duration_s)}: {measured}"
+    rows = [["Measured", measured]]
     if schedule.trex_steps_pps:
-        steps = ", ".join(f"{pps:,}" for pps in schedule.trex_steps_pps)
-        rows.append(["Flood steps", f"{steps} pps"])
-    rows += [
-        ["Preparation", f"up to {profiles.format_duration(schedule.prepare_budget_s)}"],
+        stress = next(p for p in schedule.phases if p.name == "stress")
+        step = fmt(stress.length_s // len(schedule.trex_steps_pps))
+        steps = " / ".join(f"{pps:,}" for pps in schedule.trex_steps_pps)
+        rows.append(["Flood", f"{steps} pps, {step} each"])
+    rows.append(
         [
-            "Calibration",
-            f"up to {profiles.format_duration(schedule.calibrate_budget_s)}",
-        ],
-        [
-            "Finalization",
-            f"up to {profiles.format_duration(schedule.finalize_budget_s)}",
-        ],
-        ["Maximum total", profiles.format_duration(schedule.max_elapsed_s)],
-    ]
+            "Limits",
+            f"preparation {fmt(schedule.prepare_budget_s)}, "
+            f"calibration {fmt(schedule.calibrate_budget_s)}, "
+            f"finalization {fmt(schedule.finalize_budget_s)}; "
+            f"{fmt(schedule.max_elapsed_s)} in total",
+        ]
+    )
+    click.echo("\nSchedule:")
+    print_table(rows)
+    created = "guest, 2 ports, security group, key pair"
+    if schedule.volume_gb:
+        created += f", {schedule.volume_gb} GB volume"
+    rows = [["OpenStack", created]]
+    if schedule.trex_steps_pps:
+        rows.append(["Sender", "installs trex-generator, purged afterwards"])
+    click.echo("\nCreates (deleted during finalization):")
     print_table(rows)
     click.echo()
     if not yes:
@@ -409,7 +418,7 @@ def status(run_id: str | None, as_json: bool, html_file: Path | None) -> None:
         ]
     )
     click.echo("\nPlacement:")
-    print_plan(state.plan)
+    print_plan(state.plan, state.profile)
     pending = run_state.outstanding(state.id)
     if state.finalization == "incomplete" and pending:
         click.echo(f"\nCleanup pending: {len(pending)} item(s).")
