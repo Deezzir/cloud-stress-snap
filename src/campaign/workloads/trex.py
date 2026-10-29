@@ -22,7 +22,7 @@ CONFIG = """\
       src_mac:  [0x00,0x00,0x00,0x00,0x00,0x02]
     - dest_mac: [0x00,0x00,0x00,0x00,0x00,0x02]
       src_mac:  [0x00,0x00,0x00,0x00,0x00,0x01]
-  port_bandwidth_gb: {bandwidth_gb}
+  port_bandwidth_gb: 10
   port_mtu: 1500
 """
 
@@ -135,9 +135,9 @@ class Sender:
             f"snap list {SNAP} | awk 'NR==2 {{print $2 \" rev \" $3}}'",
         ).strip()
 
-    def stage(self, link: str, speed_mbps: int) -> None:
+    def stage(self, link: str) -> None:
         """Write the TRex config and flood script into the run's directory."""
-        config = CONFIG.format(link=link, bandwidth_gb=max(speed_mbps // 1000, 1))
+        config = CONFIG.format(link=link)
         remote.push(self.juju, self.machine, f"{self.dir}/trex_cfg.yaml", config)
         remote.push(self.juju, self.machine, f"{self.dir}/flood.py", FLOOD)
 

@@ -112,7 +112,7 @@ class Run:
         self.check_prerequisites()
         self.note("creating the target guest")
         self.target = self.create_target()
-        self.note(f"waiting for SSH to {self.target.address}")
+        self.note(f"waiting for SSH to {self.target.mgmt_address}")
         self.guest = self.ready_guest(self.target)
         self.note("starting collectors")
         self.start_collectors()
@@ -243,17 +243,12 @@ class Run:
         assert self.sender
         plan = self.state.plan
         machine = plan.sender_machine or ""
-        speed = remote.sh(
-            self.juju, machine, f"cat /sys/class/net/{plan.sender_link}/speed"
-        ).strip()
-        if not speed.isdigit() or int(speed) <= 0:
-            raise PreparationError(f"cannot read the speed of {plan.sender_link}")
         self.own_host_dir(machine)
         run_state.record(self.state.id, "snap", SNAP, "intent", where=machine)
         self.sender.install()
         run_state.record(self.state.id, "snap", SNAP, "created", where=machine)
         run_state.event(self.state.id, "tool", name="trex", version=self.sender.version)
-        self.sender.stage(plan.sender_link or "", int(speed))
+        self.sender.stage(plan.sender_link or "")
         self.start_host_unit(
             machine,
             self.sender.server_unit,
