@@ -69,6 +69,7 @@ def discover(
     maas_token: str | None,
     verbose: bool,
     overrides: dict[str, str] | None = None,
+    allow_recovering: bool = False,
 ) -> CheckResult:
     """Run live, read-only discovery and resolve the run plan."""
     if verbose:
@@ -113,7 +114,7 @@ def discover(
         ],
     )
     result.plan, missing = resolve_plan(result, overrides)
-    result.readiness = profile_readiness(result, missing)
+    result.readiness = profile_readiness(result, missing, allow_recovering)
     result.notices[:0] = nova_state_notices(result)
     result.notices.extend(datapath_notices(result))
     return result
@@ -127,6 +128,9 @@ def app() -> None:
 @app.command()
 @access_options
 @click.option("--json", "as_json", is_flag=True, help="Print live results as JSON.")
+@click.option(
+    "--allow-recowering", is_flag=True, help="Allow active Ceph recovery/backfill PGs."
+)
 def check(
     cloud: str | None,
     juju_model: str | None,
@@ -134,9 +138,17 @@ def check(
     maas_token: str | None,
     verbose: bool,
     as_json: bool,
+    allow_recowering: bool,
 ) -> None:
     """Check access and print live, read-only infrastructure observations."""
-    result = discover(cloud, juju_model, maas_url, maas_token, verbose)
+    result = discover(
+        cloud,
+        juju_model,
+        maas_url,
+        maas_token,
+        verbose,
+        allow_recovering=allow_recowering,
+    )
     print_check_result(result, as_json)
     if not result.openstack.hosts:
         click.echo("No compute hosts were discovered", err=True)
@@ -251,6 +263,9 @@ def show_result(state: run_state.RunState) -> None:
 @click.option("--flavor", help="Guest flavor name or ID.")
 @click.option("--volume-type", help="Cinder volume type name or ID.")
 @click.option("--yes", is_flag=True, help="Start without asking for confirmation.")
+@click.option(
+    "--allow-recowering", is_flag=True, help="Allow active Ceph recovery/backfill PGs."
+)
 def start(
     profile: str,
     duration: str,
@@ -260,6 +275,7 @@ def start(
     maas_token: str | None,
     verbose: bool,
     yes: bool,
+    allow_recowering: bool,
     **choices: str | None,
 ) -> None:
     """Start a stress run with a selected profile and duration."""
@@ -276,7 +292,15 @@ def start(
         )
     overrides = {key: value for key, value in choices.items() if value}
     assert set(overrides) <= set(PLAN_CHOICES)
-    result = discover(cloud, juju_model, maas_url, maas_token, verbose, overrides)
+    result = discover(
+        cloud,
+        juju_model,
+        maas_url,
+        maas_token,
+        verbose,
+        overrides,
+        allow_recovering=allow_recowering,
+    )
     readiness = next(item for item in result.readiness if item.profile == profile)
     if not readiness.ready:
         click.echo(f"{profile} cannot start:", err=True)

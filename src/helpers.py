@@ -546,7 +546,7 @@ PROFILE_NEEDS: dict[Profile, tuple[str, ...]] = {
 
 
 def profile_readiness(
-    result: CheckResult, missing: dict[str, str]
+    result: CheckResult, missing: dict[str, str], allow_recovering: bool = False
 ) -> list[ProfileReadiness]:
     """Gate each profile on its placement choices and on Ceph health."""
     ceph = result.ceph
@@ -561,8 +561,22 @@ def profile_readiness(
         ceph_blockers.append(f"{down} OSDs down")
     if "SLOW_OPS" in checks:
         ceph_blockers.append("Ceph has slow operations")
+    allowed_states = {"active", "clean", "scrubbing", "deep"}
+    if allow_recovering:
+        allowed_states.update(
+            {"remapped", "backfill_wait", "backfilling", "recovery_wait", "recovering"}
+        )
     unclean = sum(
-        count for state, count in ceph.pg_states.items() if state != "active+clean"
+        count
+        for state, count in ceph.pg_states.items()
+        if not (
+            state == "active+clean"
+            or (
+                allow_recovering
+                and "active" in state.split("+")
+                and set(state.split("+")) <= allowed_states
+            )
+        )
     )
     if unclean:
         ceph_blockers.append(f"{unclean} PGs not active+clean")
