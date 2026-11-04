@@ -10,6 +10,7 @@ from urllib.parse import quote, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 import jubilant
+import yaml
 
 from probe.juju_probe import juju_read
 from probe.models import MaasInterface, MaasMachine, MaasResult, ProbeNotice
@@ -67,9 +68,11 @@ def _maas_access(model: str) -> tuple[str, str]:
     info = juju.show_model()
     if info.type != "maas" or info.credential is None:
         raise LookupError(f"model {model} is not on a MAAS cloud")
-    scope = ["--controller", info.controller_name, "--format", "json"]
-    cloud = json.loads(juju.cli("show-cloud", info.cloud, *scope, include_model=False))
-    credential = json.loads(
+    scope = ["--controller", info.controller_name, "--format", "yaml"]
+    cloud = yaml.safe_load(
+        juju.cli("show-cloud", info.cloud, *scope, include_model=False)
+    )
+    credential = yaml.safe_load(
         juju.cli(
             "show-credential",
             info.cloud,
