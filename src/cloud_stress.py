@@ -41,7 +41,7 @@ def access_options[F: Callable[..., object]](func: F) -> F:
         [
             click.option(
                 "--juju-model",
-                help="Read membership from this Juju model; defaults to 'openstack'.",
+                help="Read membership from this Juju model.",
                 default="openstack",
             ),
             click.option(
@@ -50,7 +50,8 @@ def access_options[F: Callable[..., object]](func: F) -> F:
             click.option(
                 "--maas-token",
                 envvar="MAAS_TOKEN",
-                help="MAAS API key (consumer:token:secret); defaults to $MAAS_TOKEN.",
+                help="MAAS API key (consumer:token:secret).",
+                show_envvar=True,
             ),
             click.option(
                 "-v", "--verbose", is_flag=True, help="Print diagnostic details."
@@ -120,7 +121,10 @@ def discover(
     return result
 
 
-@click.group(no_args_is_help=True)
+@click.group(
+    no_args_is_help=True,
+    context_settings={"help_option_names": ["-h", "--help"], "show_default": True},
+)
 def app() -> None:
     """Stress test Prodstack network, storage, and compute infrastructure."""
 
