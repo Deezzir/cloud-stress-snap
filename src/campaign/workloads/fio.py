@@ -106,6 +106,11 @@ def percentile(bins: list[int], fraction: float) -> float | None:
     return bin_value_ns(len(bins) - 1) / 1e6
 
 
+def add_histograms(total: list[int] | None, bins: list[int]) -> list[int]:
+    """Bin-wise sum of two latency histograms; an empty total takes `bins`."""
+    return [a + b for a, b in zip(total, bins, strict=False)] if total else bins
+
+
 def parse_hist(text: str) -> dict[int, list[int]]:
     """Per-second histogram from a fio hist log: {second: bins}."""
     seconds: dict[int, list[int]] = {}
@@ -113,12 +118,7 @@ def parse_hist(text: str) -> dict[int, list[int]]:
         fields = [int(f) for f in line.split(",")]
         bins = fields[3:]
         second = fields[0] // 1000
-        if second in seconds:
-            seconds[second] = [
-                a + b for a, b in zip(seconds[second], bins, strict=False)
-            ]
-        else:
-            seconds[second] = bins
+        seconds[second] = add_histograms(seconds.get(second), bins)
     return seconds
 
 

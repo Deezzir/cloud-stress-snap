@@ -1,6 +1,7 @@
 """Read Juju membership without switching models or changing resources."""
 
 import logging
+from collections.abc import Callable
 
 import jubilant
 
@@ -9,20 +10,61 @@ from probe.models import JujuApp, JujuMachine, JujuResult, JujuUnit, ProbeNotice
 log = logging.getLogger(__name__)
 
 
-def probe_juju(
-    model: str | None,
-) -> tuple[JujuResult, list[ProbeNotice]]:
-    """Discover Juju machines, and units for the specified model."""
-    juju: JujuResult = JujuResult(model=model, machines=[], units=[])
-    if model is None:
-        return juju, [
+def juju_read[T](
+    source: str,
+    description: str,
+    notices: list[ProbeNotice],
+    read: Callable[[], T],
+) -> T | None:
+    """Run one Juju read and turn failures into probe notices."""
+    try:
+        return read()
+    except FileNotFoundError:
+        notices.append(
             ProbeNotice(
-                source="juju",
-                reason="not-queried",
-                message="Juju membership was not requested; add --juju-model "
-                "to inspect a model.",
+                source=source,
+                reason="missing-tool",
+                message="The juju CLI is missing. Install it to read Ceph and OVS.",
             )
-        ]
+        )
+    except (jubilant.CLIError, jubilant.TaskError) as error:
+        detail = str(getattr(error, "stderr", "") or error)
+        log.debug("%s failed: %s", description, " ".join(detail.split())[:300])
+        denied = "permission denied" in detail.lower()
+        notices.append(
+            ProbeNotice(
+                source=source,
+                reason="permission-denied" if denied else "unavailable",
+                message=f"{description}: "
+                + (
+                    "access denied. Check the Juju user's access to the model."
+                    if denied
+                    else "failed. Check the unit and its charm revision."
+                ),
+            )
+        )
+    except TimeoutError:
+        notices.append(
+            ProbeNotice(
+                source=source,
+                reason="transport-unreachable",
+                message=f"{description}: timed out on the Juju unit.",
+            )
+        )
+    except (ValueError, KeyError, TypeError, AttributeError):
+        notices.append(
+            ProbeNotice(
+                source=source,
+                reason="unsupported-version",
+                message=f"{description}: unsupported output format.",
+            )
+        )
+    return None
+
+
+def probe_juju(model: str) -> tuple[JujuResult, list[ProbeNotice]]:
+    """Discover Juju machines, and units for the specified model."""
+    juju = JujuResult(model=model, machines=[], units=[])
     try:
         log.debug("Juju: reading status of model %r", model)
         status = jubilant.Juju(model=model).status()

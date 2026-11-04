@@ -7,12 +7,11 @@ result with its gaps listed rather than an error.
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import cast
 
 from campaign.model.profiles import format_duration
 from campaign.model.state import RunState, events, now, outstanding, run_dir
-from campaign.report.html import html
 from campaign.workloads import collect, fio
+from probe.models import RunPlan
 
 Row = dict[str, object]
 Window = tuple[str, float, float]
@@ -209,10 +208,7 @@ def _fio_dir(
             gaps.append(f"{rel}: unreadable fio log for job {job}")
             continue
         for second, bins in job_hist.items():
-            old = hist.get(start + second)
-            hist[start + second] = (
-                [a + b for a, b in zip(old, bins, strict=False)] if old else bins
-            )
+            hist[start + second] = fio.add_histograms(hist.get(start + second), bins)
         for second, count in job_iops.items():
             iops[start + second] = iops.get(start + second, 0) + count
     rows: list[Row] = [
@@ -234,9 +230,7 @@ def _window_fio(
     merged: list[int] = []
     for second, bins in hist.items():
         if start <= second < end:
-            merged = (
-                [a + b for a, b in zip(merged, bins, strict=False)] if merged else bins
-            )
+            merged = fio.add_histograms(merged, bins)
     counts = _values(_inside(rows, start, end), "iops")
     return {
         "ios": int(sum(counts)) if counts else None,
@@ -389,15 +383,14 @@ def _run(state: RunState, finished: str) -> Row:
     }
 
 
-def build(state: RunState) -> dict[str, object]:
-    """Compute the run result from the bundle without writing anything."""
-    bundle = run_dir(state.id)
-    plan = state.plan
-    evts = events(state.id)
-    gaps: list[str] = []
-    target = state.target.model_dump() if state.target else {}
-    # A run that never reached measurement is not assessed; its cause says why.
-    windows = _phases(state, evts)
+def _collectors(
+    state: RunState,
+    bundle: Path,
+    evts: list[Row],
+    windows: list[Window],
+    gaps: list[str],
+) -> dict[str, list[Row]]:
+    """Normalize collector samples; record their problems as gaps when measured."""
     required = ["target-host"]
     if state.profile in ("host-network", "network-ceph"):
         required.append("sender-host")
@@ -410,7 +403,7 @@ def build(state: RunState) -> dict[str, object]:
         found = problems.setdefault(name, [])
         raw = _jsonl(bundle, f"raw/{name}.jsonl", gaps)
         try:
-            rows = collect.normalize("\n".join(json.dumps(r) for r in raw))
+            rows = collect.normalize(raw)
         except (KeyError, TypeError) as error:
             rows = []
             found.append(f"unreadable samples ({error})")
@@ -434,7 +427,17 @@ def build(state: RunState) -> dict[str, object]:
                 )
     if windows:
         gaps += [f"{n}: {p}" for n in required for p in problems.get(n, [])]
+    return metrics
 
+
+def _fio(
+    bundle: Path,
+    evts: list[Row],
+    windows: list[Window],
+    gaps: list[str],
+    metrics: dict[str, list[Row]],
+) -> tuple[Row, dict[str, Row]]:
+    """Aggregate fio cells and measured phases, with ratios against baseline."""
     fio_cells: list[Row] = []
     fio_phases: dict[str, Row] = {}
     raw_dir = bundle / "raw"
@@ -463,6 +466,39 @@ def build(state: RunState) -> dict[str, object]:
             fio_result[f"{name}_vs_baseline_{key}"] = _ratio(
                 fio_phases.get(name, {}).get(key), base.get(key)
             )
+    return fio_result, fio_phases
+
+
+def _offload(
+    plan: RunPlan,
+    metrics: dict[str, list[Row]],
+    windows: list[Window],
+) -> str:
+    """Offload is observed only when offloaded flows rise from baseline to stress."""
+    if not (plan.target_datapath == "doca" and plan.target_hw_offload):
+        return "not-applicable"
+    means = {
+        name: _mean(
+            _values(_inside(metrics["target-host"], start, end), "ovs.offloaded_flows")
+        )
+        for name, start, end in windows
+    }
+    stress, baseline = means.get("stress"), means.get("baseline")
+    rising = stress is not None and baseline is not None and stress > baseline
+    return "observed" if rising else "unverified"
+
+
+def build(state: RunState) -> tuple[Row, dict[str, list[Row]]]:
+    """Compute the run result and metric series without writing anything."""
+    bundle = run_dir(state.id)
+    plan = state.plan
+    evts = events(state.id)
+    gaps: list[str] = []
+    target = state.target.model_dump() if state.target else {}
+    # A run that never reached measurement is not assessed; its cause says why.
+    windows = _phases(state, evts)
+    metrics = _collectors(state, bundle, evts, windows, gaps)
+    fio_result, fio_phases = _fio(bundle, evts, windows, gaps, metrics)
 
     rx, guest_drops = _rx_log(bundle, gaps)
     samples = _jsonl(bundle, "raw/stress.jsonl", gaps)
@@ -470,28 +506,13 @@ def build(state: RunState) -> dict[str, object]:
     metrics["rx"] = _rx_series(rx)
     steps = _load(samples, rx)
 
-    # Offload is observed only when offloaded flows rise from baseline to stress.
-    offload = "not-applicable"
-    if plan.target_datapath == "doca" and plan.target_hw_offload:
-        means = {
-            name: _mean(
-                _values(
-                    _inside(metrics["target-host"], start, end), "ovs.offloaded_flows"
-                )
-            )
-            for name, start, end in windows
-        }
-        stress, baseline = means.get("stress"), means.get("baseline")
-        rising = stress is not None and baseline is not None and stress > baseline
-        offload = "observed" if rising else "unverified"
-
+    offload = _offload(plan, metrics, windows)
     host = {
         w[0]: _host(metrics["target-host"], plan.target_link, w, guest_drops)
         for w in windows
     }
     ceph = {w[0]: _ceph(metrics["ceph"], w) for w in windows} if metrics["ceph"] else {}
-    return {
-        "run": _run(state, state.updated_at.isoformat()),
+    result: Row = {
         "placement": {**{k: getattr(plan, k) for k in PLACEMENT}, **target},
         "tools": {
             str(e.get("name")): e.get("version")
@@ -532,9 +553,8 @@ def build(state: RunState) -> dict[str, object]:
             {"kind": e.kind, "name": e.name, "action": e.action, "where": e.where}
             for e in outstanding(state.id)
         ],
-        # Popped by write(): metric series are written to metrics/, not report.json.
-        "_metrics": metrics,
     }
+    return result, metrics
 
 
 def exit_code(state: RunState) -> int:
@@ -544,26 +564,12 @@ def exit_code(state: RunState) -> int:
     return 30 if state.execution == "cancelled" else 0
 
 
-def write(state: RunState, result: dict[str, object]) -> None:
-    """Stamp the final state into result and write report.json and its metrics."""
+def write(state: RunState, result: Row, metrics: dict[str, list[Row]]) -> None:
+    """Write report.json, headed by the final run state, and its metrics."""
     bundle = run_dir(state.id)
-    metrics = cast(dict[str, list[Row]], result.pop("_metrics", {}))
-    result["run"] = _run(state, now().isoformat())
+    result = {"run": _run(state, now().isoformat()), **result}
     (bundle / "metrics").mkdir(parents=True, exist_ok=True)
     for name, rows in metrics.items():
         text = "".join(json.dumps(row) + "\n" for row in rows)
         (bundle / "metrics" / f"{name}.jsonl").write_text(text)
-    (bundle / "report.json").write_text(json.dumps(result, indent=2, default=str))
-
-
-def render_html(run_id: str) -> str | None:
-    """The run's HTML report from report.json and metrics, if the run has a result."""
-    bundle = run_dir(run_id)
-    result_file = bundle / "report.json"
-    if not result_file.is_file():
-        return None
-    metrics = {
-        path.stem: [json.loads(line) for line in path.read_text().splitlines() if line]
-        for path in sorted((bundle / "metrics").glob("*.jsonl"))
-    }
-    return html(json.loads(result_file.read_text()), metrics)
+    (bundle / "report.json").write_text(json.dumps(result, indent=2))

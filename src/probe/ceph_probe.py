@@ -13,6 +13,7 @@ from typing import Any
 
 import jubilant
 
+from probe.juju_probe import juju_read
 from probe.models import (
     CephCrushRule,
     CephOsd,
@@ -36,58 +37,6 @@ log = logging.getLogger(__name__)
 def _version(text: str) -> str:
     match = re.search(r"ceph version (\S+)", text)
     return match[1] if match else text[:64]
-
-
-def juju_read(
-    source: str,
-    description: str,
-    notices: list[ProbeNotice],
-    read: Callable[[], Any],
-) -> Any:
-    """Run one Juju read and turn failures into probe notices."""
-    try:
-        return read()
-    except FileNotFoundError:
-        notices.append(
-            ProbeNotice(
-                source=source,
-                reason="missing-tool",
-                message="The juju CLI is missing. Install it to read Ceph and OVS.",
-            )
-        )
-    except (jubilant.CLIError, jubilant.TaskError) as error:
-        detail = str(getattr(error, "stderr", "") or error)
-        log.debug("%s failed: %s", description, " ".join(detail.split())[:300])
-        denied = "permission denied" in detail.lower()
-        notices.append(
-            ProbeNotice(
-                source=source,
-                reason="permission-denied" if denied else "unavailable",
-                message=f"{description}: "
-                + (
-                    "access denied. Check the Juju user's access to the model."
-                    if denied
-                    else "failed. Check the unit and its charm revision."
-                ),
-            )
-        )
-    except TimeoutError:
-        notices.append(
-            ProbeNotice(
-                source=source,
-                reason="transport-unreachable",
-                message=f"{description}: timed out on the Juju unit.",
-            )
-        )
-    except (ValueError, KeyError, TypeError, AttributeError):
-        notices.append(
-            ProbeNotice(
-                source=source,
-                reason="unsupported-version",
-                message=f"{description}: unsupported output format.",
-            )
-        )
-    return None
 
 
 def _versions(stdout: str) -> dict[str, list[str]]:
@@ -215,21 +164,16 @@ def _health_notices(result: CephResult) -> list[ProbeNotice]:
     return notices
 
 
-def probe_ceph(
-    model: str | None, juju: JujuResult
-) -> tuple[CephResult, list[ProbeNotice]]:
+def probe_ceph(model: str, juju: JujuResult) -> tuple[CephResult, list[ProbeNotice]]:
     """Read Ceph state with read-only ceph-mon actions and ceph commands."""
     apps = {app.charm: app for app in juju.apps}
     mon = apps.get("ceph-mon")
-    if model is None or mon is None:
+    if mon is None:
         return CephResult(), [
             ProbeNotice(
                 source="ceph",
                 reason="not-queried",
-                message="Ceph was not inspected; add --juju-model for a model "
-                "with ceph-mon."
-                if model is None
-                else "Ceph was not inspected; the Juju model has no ceph-mon.",
+                message="Ceph was not inspected; the Juju model has no ceph-mon.",
             )
         ]
     osd = apps.get("ceph-osd")
@@ -260,11 +204,15 @@ def probe_ceph(
             return future, found
 
         reads = [
-            submit("ceph.status", "Ceph status", partial(ceph, "status", "-f", "json")),
+            submit(
+                "ceph.status",
+                "Ceph status",
+                lambda: _status(result, ceph("status", "-f", "json")),
+            ),
             submit(
                 "ceph.versions",
                 "Ceph versions",
-                partial(ceph, "versions", "-f", "json"),
+                lambda: _versions(ceph("versions", "-f", "json")),
             ),
             submit(
                 "ceph.osds",
@@ -293,21 +241,8 @@ def probe_ceph(
         values = [future.result() for future, _ in reads]
     for _, found in reads:
         notices.extend(found)
-    status, versions, osds, pools_found, rules, *configs = values
-    if status:
-        juju_read(
-            "ceph.status", "Ceph status", notices, partial(_status, result, status)
-        )
-    if versions:
-        result.versions = (
-            juju_read(
-                "ceph.versions",
-                "Ceph versions",
-                notices,
-                partial(_versions, versions),
-            )
-            or {}
-        )
+    _, versions, osds, pools_found, rules, *configs = values
+    result.versions = versions or {}
     result.osds = osds or []
     result.pools = pools_found or []
     result.crush_rules = rules or []

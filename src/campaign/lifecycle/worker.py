@@ -103,8 +103,6 @@ class Worker:
                 return {"ok": False, "error": "; ".join(problems)}
             stack.enter_context(run_state.lock())
             state = run_state.create(
-                profile=schedule.profile,
-                duration_s=schedule.duration_s,
                 model=model,
                 cloud=cloud,
                 plan=plan,

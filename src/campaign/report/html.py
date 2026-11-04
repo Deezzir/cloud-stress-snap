@@ -1,8 +1,10 @@
 """Self-contained HTML report: the summary text plus inline SVG charts."""
 
 import html as html_lib
+import json
 
 from campaign.model.profiles import format_duration
+from campaign.model.state import run_dir
 from campaign.report.text import summary_text
 
 Row = dict[str, object]
@@ -193,3 +195,16 @@ def html(result: dict[str, object], metrics: dict[str, list[Row]]) -> str:
         f"<pre>{html_lib.escape(summary_text(result))}</pre>"
         f"{''.join(charts)}</body></html>\n"
     )
+
+
+def render_html(run_id: str) -> str | None:
+    """The run's HTML report from report.json and metrics, if the run has a result."""
+    bundle = run_dir(run_id)
+    result_file = bundle / "report.json"
+    if not result_file.is_file():
+        return None
+    metrics = {
+        path.stem: [json.loads(line) for line in path.read_text().splitlines() if line]
+        for path in sorted((bundle / "metrics").glob("*.jsonl"))
+    }
+    return html(json.loads(result_file.read_text()), metrics)

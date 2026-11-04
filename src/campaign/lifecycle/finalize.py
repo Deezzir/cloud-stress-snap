@@ -50,7 +50,7 @@ def finalize(
     run_state.event(state.id, "phase", phase="finalizing")
     raw = run_state.run_dir(state.id) / "raw"
     private = run_state.private_dir(state.id)
-    guest = _guest(state, juju)
+    guest = guest_for(juju, state, state.target) if state.target else None
 
     # 1. Stop: floods first so no load outlives the run.
     entries = run_state.outstanding(state.id)
@@ -132,9 +132,9 @@ def finalize(
         f"cleanup: {e.kind} {e.name} on {e.where}: {e.action}" for e in left
     ]
     try:
-        result = report.build(state)
+        result, metrics = report.build(state)
         state.code = report.exit_code(state)
-        report.write(state, result)
+        report.write(state, result, metrics)
     except Exception as error:  # noqa: BLE001 - a missing result is incomplete
         state.finalization = "incomplete"
         state.causes.append(f"result: {_short(error)}")
@@ -153,13 +153,6 @@ def finalize(
 def _progress(state: RunState, detail: str) -> None:
     state.detail = detail
     run_state.save(state)
-
-
-def _guest(state: RunState, juju: jubilant.Juju) -> Guest | None:
-    """The run's guest, if it was provisioned."""
-    if state.target is None:
-        return None
-    return guest_for(juju, state, state.target)
 
 
 def _fetch_guest(guest: Guest, path: str, target: Path) -> None:

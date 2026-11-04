@@ -36,7 +36,7 @@ required-version = ">=0.12,<0.14"
 default-groups = []
 
 [tool.hatch.build.targets.wheel]
-only-include = ["src/cloud_stress.py", "src/helpers.py", "src/probe", "src/campaign"]
+only-include = ["src/cloud_stress.py", "src/probe", "src/campaign"]
 sources = ["src"]
 
 [tool.hatch.build.targets.sdist]

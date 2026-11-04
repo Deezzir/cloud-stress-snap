@@ -16,27 +16,23 @@ import click
 from campaign.lifecycle import access
 from campaign.model import profiles
 from campaign.model import state as run_state
-from campaign.report.build import render_html
+from campaign.report.html import render_html
 from campaign.report.text import summary_text
-from helpers import (
-    PLAN_CHOICES,
+from probe.ceph_probe import probe_ceph
+from probe.discover import (
     datapath_notices,
     discover_cloud,
     link_juju_to_hypervisors,
     nova_state_notices,
-    print_check_result,
-    print_plan,
-    print_table,
-    profile_readiness,
-    resolve_plan,
 )
-from probe.ceph_probe import probe_ceph
+from probe.display import print_check_result, print_plan, print_table
 from probe.infra_probe import probe_infra
 from probe.juju_probe import probe_juju
 from probe.maas_probe import probe_maas
 from probe.models import CheckResult, Profile
 from probe.openstack_probe import resolve_cloud
 from probe.ovs_probe import probe_ovs
+from probe.plan import profile_readiness, resolve_plan
 
 
 def access_options[F: Callable[..., object]](func: F) -> F:
@@ -46,7 +42,7 @@ def access_options[F: Callable[..., object]](func: F) -> F:
             click.option("--cloud", help="Select a named cloud in clouds.yaml."),
             click.option(
                 "--juju-model",
-                help="Read membership from this Juju model.",
+                help="Read membership from this Juju model; defaults to 'openstack'.",
                 default="openstack",
             ),
             click.option(
@@ -68,7 +64,7 @@ def access_options[F: Callable[..., object]](func: F) -> F:
 
 def discover(
     cloud: str | None,
-    juju_model: str | None,
+    juju_model: str,
     maas_url: str | None,
     maas_token: str | None,
     verbose: bool,
@@ -79,9 +75,11 @@ def discover(
     if verbose:
         handler = logging.StreamHandler()
         handler.setFormatter(logging.Formatter("debug: %(message)s"))
-        for name in ("helpers", "probe"):
+        for name in ("probe",):
             logging.getLogger(name).addHandler(handler)
             logging.getLogger(name).setLevel(logging.DEBUG)
+    if not juju_model:
+        raise click.UsageError("--juju-model must not be empty")
     if maas_url and not maas_token:
         raise click.UsageError("--maas-url requires --maas-token or MAAS_TOKEN")
     with ThreadPoolExecutor(max_workers=3) as pool:
@@ -132,33 +130,19 @@ def app() -> None:
 @app.command()
 @access_options
 @click.option("--json", "as_json", is_flag=True, help="Print live results as JSON.")
-@click.option(
-    "--allow-recowering", is_flag=True, help="Allow active Ceph recovery/backfill PGs."
-)
 def check(
     cloud: str | None,
-    juju_model: str | None,
+    juju_model: str,
     maas_url: str | None,
     maas_token: str | None,
     verbose: bool,
     as_json: bool,
-    allow_recowering: bool,
 ) -> None:
     """Check access and print live, read-only infrastructure observations."""
-    result = discover(
-        cloud,
-        juju_model,
-        maas_url,
-        maas_token,
-        verbose,
-        allow_recovering=allow_recowering,
-    )
+    result = discover(cloud, juju_model, maas_url, maas_token, verbose)
     print_check_result(result, as_json)
     if not result.openstack.hosts:
         click.echo("No compute hosts were discovered", err=True)
-        raise SystemExit(2)
-    if not juju_model:
-        click.echo("Host probes require --juju-model", err=True)
         raise SystemExit(2)
     if not any(
         probe.status in ("queried", "partial") for probe in result.infra.host_probes
@@ -271,18 +255,18 @@ def show_result(state: run_state.RunState) -> None:
 @click.option("--volume-type", help="Cinder volume type name or ID.")
 @click.option("--yes", is_flag=True, help="Start without asking for confirmation.")
 @click.option(
-    "--allow-recowering", is_flag=True, help="Allow active Ceph recovery/backfill PGs."
+    "--allow-recovering", is_flag=True, help="Allow active Ceph recovery/backfill PGs."
 )
 def start(
     profile: str,
     duration: str,
     cloud: str | None,
-    juju_model: str | None,
+    juju_model: str,
     maas_url: str | None,
     maas_token: str | None,
     verbose: bool,
     yes: bool,
-    allow_recowering: bool,
+    allow_recovering: bool,
     **choices: str | None,
 ) -> None:
     """Start a stress run with a selected profile and duration."""
@@ -290,15 +274,12 @@ def start(
         schedule = profiles.resolve(profile, profiles.parse_duration(duration))  # type: ignore[arg-type]
     except ValueError as error:
         raise click.UsageError(str(error)) from None
-    if not juju_model:
-        raise click.UsageError("run start requires --juju-model")
     if pending := run_state.unfinished():
         raise click.UsageError(
             f"Run {pending.id} is not finished; "
             'see "cloud-stress run status" or run "cloud-stress run stop".'
         )
     overrides = {key: value for key, value in choices.items() if value}
-    assert set(overrides) <= set(PLAN_CHOICES)
     result = discover(
         cloud,
         juju_model,
@@ -306,7 +287,7 @@ def start(
         maas_token,
         verbose,
         overrides,
-        allow_recovering=allow_recowering,
+        allow_recovering=allow_recovering,
     )
     readiness = next(item for item in result.readiness if item.profile == profile)
     if not readiness.ready:

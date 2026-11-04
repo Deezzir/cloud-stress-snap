@@ -132,18 +132,15 @@ def _sections(stdout: str) -> dict[str, tuple[int, str]]:
 
 
 def probe_infra(
-    model: str | None, juju: JujuResult, hosts: list[Host]
+    model: str, juju: JujuResult, hosts: list[Host]
 ) -> tuple[InfraResult, list[ProbeNotice]]:
     """Probe Nova-listed hosts through their verified Juju machines."""
-    if model is None or not hosts:
+    if not hosts:
         return InfraResult(host_probes=[]), [
             ProbeNotice(
                 source="host-probes",
                 reason="not-queried",
-                message="Host hardware probes were skipped; add --juju-model "
-                "to probe discovered hosts."
-                if hosts
-                else "No compute hosts were discovered to probe.",
+                message="No compute hosts were discovered to probe.",
             )
         ]
     machines = {

@@ -16,7 +16,7 @@ def _fmt(value: object) -> str:
         return "yes" if value else "no"
     if isinstance(value, float):
         return f"{value:.3g}" if abs(value) < 1000 else f"{value:,.0f}"
-    if isinstance(value, int) and not isinstance(value, bool):
+    if isinstance(value, int):
         return f"{value:,}"
     return str(value)
 
@@ -124,6 +124,100 @@ def _placement(result: dict[str, object]) -> list[list[object]]:
     return [row for row in rows if row[1]]
 
 
+def _network_lines(result: dict[str, object]) -> list[str]:
+    """Sender steps against target receipt, and the receipt check."""
+    lines: list[str] = []
+    sender = _dict(result.get("sender"))
+    target = _dict(result.get("target"))
+    sent = {s.get("step"): s for s in _list(sender.get("steps"))}
+    received = _list(target.get("steps"))
+    if sent:
+        rows: list[list[object]] = [
+            ["STEP", "REQUESTED", "SENT", "DELIVERED", "RECEIVED", "LOSS"]
+        ]
+        for step in received or [{"step": k} for k in sent]:
+            s = sent.get(step.get("step"), {})
+            rows.append(
+                [
+                    step.get("step"),
+                    s.get("requested_pps"),
+                    s.get("tx_pps"),
+                    _pct(s.get("delivered")),
+                    step.get("rx_pps"),
+                    _pct(step.get("loss"), 1),
+                ]
+            )
+        lines += ["", "Network load (pps, sender to target):", *_table(rows)]
+        note = ceiling(list(sent.values()))
+        if note:
+            lines.append(f"  {note}")
+    receipt = _dict(target.get("receipt"))
+    if receipt:
+        if not sent:
+            lines += ["", "Network load:"]
+        lines.append(
+            f"  receipt check: target received {_pct(receipt.get('ratio'))} "
+            f"of a {_fmt(receipt.get('sent_pps'))} pps burst"
+        )
+    return lines
+
+
+def _fio_lines(result: dict[str, object]) -> list[str]:
+    """Guest fio cells and measured phases."""
+    lines: list[str] = []
+    fio_result = _dict(_dict(result.get("guest")).get("fio"))
+    rows: list[list[object]] = [["CELL", "IOS", "IOPS", "P50 MS", "P99 MS", "COMPLETE"]]
+    keys = ("total_ios", "iops", "p50_ms", "p99_ms", "complete")
+    rows += [
+        [c.get("name"), *(c.get(k) for k in keys)]
+        for c in _list(fio_result.get("cells"))
+        if "iops" in c and c.get("name") not in ("prefill", "calibration", "measured")
+    ]
+    rows += [
+        [name, p.get("ios"), p.get("iops"), p.get("p50_ms"), p.get("p99_ms"), ""]
+        for name, p in _dicts(fio_result.get("phases")).items()
+    ]
+    if len(rows) > 1:
+        lines += ["", "Guest fio:", *_table(rows)]
+    if fio_result.get("offered_iops") is not None:
+        lines.append(f"  offered {_fmt(fio_result.get('offered_iops'))} IOPS")
+    return lines
+
+
+def _host_lines(result: dict[str, object]) -> list[str]:
+    """Target host and guest drops and CPU per phase, with Ceph slow ops."""
+    target = _dict(result.get("target"))
+    host = _dicts(target.get("host"))
+    ceph = _dicts(result.get("ceph"))
+    if not host:
+        return []
+    columns = {
+        "CPU BUSY %": "cpu_busy_pct",
+        "SOFTIRQ %": "cpu_softirq_pct",
+        "IOWAIT %": "cpu_iowait_pct",
+        "LINK DROPS": "host_drops",
+        "RING DROPS": "nic_ring_drops",
+        "LOST UPCALLS": "lost_upcalls",
+        "TAP DROPS": "tap_drops",
+        "GUEST DROPS": "guest_drops",
+    }
+    table = {
+        phase: {
+            **{label: h.get(key) for label, key in columns.items()},
+            "CEPH SLOW OPS": ceph.get(phase, {}).get("slow_ops_max"),
+        }
+        for phase, h in host.items()
+    }
+    shown = [
+        label
+        for label in [*columns, "CEPH SLOW OPS"]
+        if any(values[label] is not None for values in table.values())
+    ]
+    rows: list[list[object]] = [["PHASE", *shown]]
+    rows += [[p, *(v[label] for label in shown)] for p, v in table.items()]
+    return ["", "Target host and guest:", *_table(rows)]
+
+
 def summary_text(result: dict[str, object]) -> str:
     """Human summary of a result with titled, aligned sections."""
     run = _dict(result.get("run"))
@@ -149,82 +243,9 @@ def summary_text(result: dict[str, object]) -> str:
         ]
         lines += ["", "SLO indicators (compare with your targets):", *_table(rows)]
 
-    sender = _dict(result.get("sender"))
-    target = _dict(result.get("target"))
-    sent = {s.get("step"): s for s in _list(sender.get("steps"))}
-    received = _list(target.get("steps"))
-    if sent:
-        rows = [["STEP", "REQUESTED", "SENT", "DELIVERED", "RECEIVED", "LOSS"]]
-        for step in received or [{"step": k} for k in sent]:
-            s = sent.get(step.get("step"), {})
-            rows.append(
-                [
-                    step.get("step"),
-                    s.get("requested_pps"),
-                    s.get("tx_pps"),
-                    _pct(s.get("delivered")),
-                    step.get("rx_pps"),
-                    _pct(step.get("loss"), 1),
-                ]
-            )
-        lines += ["", "Network load (pps, sender to target):", *_table(rows)]
-        note = ceiling(list(sent.values()))
-        if note:
-            lines.append(f"  {note}")
-    receipt = _dict(target.get("receipt"))
-    if receipt:
-        if not sent:
-            lines += ["", "Network load:"]
-        lines.append(
-            f"  receipt check: target received {_pct(receipt.get('ratio'))} "
-            f"of a {_fmt(receipt.get('sent_pps'))} pps burst"
-        )
-
-    fio_result = _dict(_dict(result.get("guest")).get("fio"))
-    rows = [["CELL", "IOS", "IOPS", "P50 MS", "P99 MS", "COMPLETE"]]
-    keys = ("total_ios", "iops", "p50_ms", "p99_ms", "complete")
-    rows += [
-        [c.get("name"), *(c.get(k) for k in keys)]
-        for c in _list(fio_result.get("cells"))
-        if "iops" in c and c.get("name") not in ("prefill", "calibration", "measured")
-    ]
-    rows += [
-        [name, p.get("ios"), p.get("iops"), p.get("p50_ms"), p.get("p99_ms"), ""]
-        for name, p in _dicts(fio_result.get("phases")).items()
-    ]
-    if len(rows) > 1:
-        lines += ["", "Guest fio:", *_table(rows)]
-    if fio_result.get("offered_iops") is not None:
-        lines.append(f"  offered {_fmt(fio_result.get('offered_iops'))} IOPS")
-
-    host = _dicts(target.get("host"))
-    ceph = _dicts(result.get("ceph"))
-    if host:
-        columns = {
-            "CPU BUSY %": "cpu_busy_pct",
-            "SOFTIRQ %": "cpu_softirq_pct",
-            "IOWAIT %": "cpu_iowait_pct",
-            "LINK DROPS": "host_drops",
-            "RING DROPS": "nic_ring_drops",
-            "LOST UPCALLS": "lost_upcalls",
-            "TAP DROPS": "tap_drops",
-            "GUEST DROPS": "guest_drops",
-        }
-        table = {
-            phase: {
-                **{label: h.get(key) for label, key in columns.items()},
-                "CEPH SLOW OPS": ceph.get(phase, {}).get("slow_ops_max"),
-            }
-            for phase, h in host.items()
-        }
-        shown = [
-            label
-            for label in [*columns, "CEPH SLOW OPS"]
-            if any(values[label] is not None for values in table.values())
-        ]
-        rows = [["PHASE", *shown]]
-        rows += [[p, *(v[label] for label in shown)] for p, v in table.items()]
-        lines += ["", "Target host and guest:", *_table(rows)]
+    lines += _network_lines(result)
+    lines += _fio_lines(result)
+    lines += _host_lines(result)
 
     issues = [
         *[

@@ -164,7 +164,6 @@ class Run:
             self.state,
             public_key,
             (host_private, host_public),
-            uses_trex(self.state.profile),
             self.wait,
         )
         self.state.target = target
@@ -243,7 +242,7 @@ class Run:
         assert self.guest
         schedule = self.state.schedule
         cell = schedule.fio_cells[0].model_copy(update={"length_s": CALIBRATE_S})
-        self.run_fio(cell, None, "calibration")
+        self.run_fio(cell, "calibration")
         text = self.guest.run(f"cat {self.guest_dir}/calibration/{cell.label}.json")
         result = fio.summary(text)
         if not result["complete"]:
@@ -314,7 +313,7 @@ class Run:
             for cell in schedule.fio_cells:
                 self.note(f"fio {cell.label}")
                 run_state.event(state.id, "fio-cell", cell=cell.label)
-                self.run_fio(cell, None, cell.label)
+                self.run_fio(cell, cell.label)
             return
         if state.profile == "network-ceph":
             self.start_fio(schedule.fio_cells[0], self.offered_iops, "measured")
@@ -376,9 +375,9 @@ class Run:
         command = fio.run_command(cell, job, f"{self.guest_dir}/{name}")
         self.start_guest_unit(self.guest, name, cell.length_s + 120, command)
 
-    def run_fio(self, cell: FioCell, rate: int | None, name: str) -> None:
-        """Run one fio job in the guest and wait for it."""
-        self.start_fio(cell, rate, name)
+    def run_fio(self, cell: FioCell, name: str) -> None:
+        """Run one unthrottled fio job in the guest and wait for it."""
+        self.start_fio(cell, None, name)
         self.wait_guest_unit(name, cell.length_s + 120)
 
     def flood(self, name: str, steps: list[tuple[int, int]]) -> None:

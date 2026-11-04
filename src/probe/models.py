@@ -23,9 +23,6 @@ class Host(Record):
     status: str | None = None
     source: Literal["nova"] = "nova"
     capacity_source: Literal["placement"] | None = None
-    inspection: Literal[
-        "unqueried", "queried", "partial", "unreachable", "excluded"
-    ] = "unqueried"
 
 
 class ComputeService(Record):
@@ -251,7 +248,7 @@ class OpenstackResult(Record):
 class JujuResult(Record):
     """Juju discovery results."""
 
-    model: str | None = None
+    model: str
     machines: list[JujuMachine]
     units: list[JujuUnit]
     apps: list[JujuApp] = Field(default_factory=list)

@@ -7,6 +7,7 @@ sample rather than reported as zero; a counter that goes backwards is a reset.
 
 import json
 from importlib import resources
+from typing import Any
 
 SAMPLER = (resources.files("campaign.workloads") / "files" / "sampler.py").read_text()
 
@@ -14,13 +15,12 @@ CPU_FIELDS = ("user", "nice", "system", "idle", "iowait", "irq", "softirq", "ste
 GAUGES = {"ovs.flows", "ovs.flow_limit", "ovs.offloaded_flows"}
 
 
-def normalize(text: str) -> list[dict[str, object]]:
+def normalize(samples: list[dict[str, Any]]) -> list[dict[str, object]]:
     """Turn cumulative counters into per-second rates and CPU percentages.
 
     Each row keeps the remote timestamp and sequence; a gap in sequence or a
     counter that went backwards is marked so it is not read as a real value.
     """
-    samples = [json.loads(line) for line in text.splitlines() if line.strip()]
     rows: list[dict[str, object]] = []
     for prev, cur in zip(samples, samples[1:], strict=False):
         elapsed = cur["t"] - prev["t"]
@@ -52,6 +52,6 @@ def normalize(text: str) -> list[dict[str, object]]:
     return rows
 
 
-def start_args(link: str | None, offload: bool | None, tap: str | None = None) -> str:
+def start_args(link: str | None, offload: bool | None, tap: str | None) -> str:
     """Sampler arguments as a JSON string."""
     return json.dumps({"link": link, "offload": bool(offload), "tap": tap})

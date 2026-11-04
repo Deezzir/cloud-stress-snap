@@ -15,8 +15,7 @@ Usage is in the snap description in `snap/snapcraft.yaml`.
 | Path | Contents |
 | --- | --- |
 | `src/cloud_stress.py` | CLI |
-| `src/probe/` | Read-only discovery for `check` |
-| `src/helpers.py` | Readiness and run plan |
+| `src/probe/` | Read-only discovery, run plan, readiness and `check` output |
 | `src/campaign/model/` | Run state, journal, profiles, target |
 | `src/campaign/transport/` | `juju exec` and guest SSH |
 | `src/campaign/workloads/` | TRex, fio and samplers |

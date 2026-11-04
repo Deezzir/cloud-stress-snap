@@ -35,13 +35,11 @@ try:
     client.add_streams(STLStream(packet=STLPktBuilder(pkt=packet, vm=vm),
                                  mode=STLTXCont()), ports=[0])
     client.clear_stats()
-    started = False
     for step, (pps, seconds) in enumerate(args["steps"]):
-        if started:
+        if step:
             client.update(ports=[0], mult=f"{pps}pps")
         else:
             client.start(ports=[0], mult=f"{pps}pps", duration=args["max_s"])
-            started = True
         end = time.time() + seconds
         while time.time() < end:
             time.sleep(1)

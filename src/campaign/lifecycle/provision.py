@@ -10,7 +10,7 @@ from openstack import exceptions
 from openstack.connection import Connection
 
 from campaign.model import state as run_state
-from campaign.model.profiles import FLOOD_PORT, FLOOD_SOURCE_CIDR
+from campaign.model.profiles import FLOOD_PORT, FLOOD_SOURCE_CIDR, uses_trex
 from campaign.model.state import RunState
 from campaign.model.target import Target
 
@@ -104,7 +104,6 @@ def provision(
     state: RunState,
     public_key: str,
     host_key: tuple[str, str],
-    trex: bool,
     sleep: Callable[[float], None],
 ) -> Target:
     """Create the run's key pair, security group, ports, volume and target guest."""
@@ -151,7 +150,7 @@ def provision(
         a["ip_address"] for a in mgmt_port.fixed_ips if ":" not in a["ip_address"]
     )
     rules = [("tcp", 22, f"{source}/32")]
-    if trex:
+    if uses_trex(state.profile):
         rules.append(("udp", FLOOD_PORT, FLOOD_SOURCE_CIDR[plan.ip_version or 6]))
     for protocol, port_number, cidr in rules:
         conn.network.create_security_group_rule(
@@ -281,13 +280,12 @@ FIND: dict[str, Callable[[Connection, str], Any]] = {
 }
 
 
-def cleanup(conn: Connection, state: RunState) -> list[str]:
-    """Delete outstanding run-owned cloud resources; return what is left.
+def cleanup(conn: Connection, state: RunState) -> None:
+    """Delete outstanding run-owned cloud resources; failures stay in the journal.
 
     Deleting the server detaches its volume, so attachments are settled after
     the server instead of through a separate detach call.
     """
-    left = []
     entries = [
         e for e in reversed(run_state.outstanding(state.id)) if e.where == "openstack"
     ]
@@ -334,5 +332,3 @@ def cleanup(conn: Connection, state: RunState) -> list[str]:
             )
             action: run_state.Action = "requires-login" if login else "failed"
             run_state.transition(state.id, entry, action, detail)
-            left.append(f"{entry.kind} {entry.name}: {action}")
-    return left

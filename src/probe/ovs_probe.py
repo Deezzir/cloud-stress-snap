@@ -12,7 +12,7 @@ from typing import Any
 
 import jubilant
 
-from probe.ceph_probe import juju_read
+from probe.juju_probe import juju_read
 from probe.models import JujuResult, OvsHost, ProbeNotice
 
 EXEC_TIMEOUT = 180
@@ -49,9 +49,7 @@ def _physnets(config: Mapping[str, Any]) -> dict[str, str]:
     }
 
 
-def probe_ovs(
-    model: str | None, juju: JujuResult
-) -> tuple[list[OvsHost], list[ProbeNotice]]:
+def probe_ovs(model: str, juju: JujuResult) -> tuple[list[OvsHost], list[ProbeNotice]]:
     """Read OVS state on each hypervisor that has an ovn-chassis unit."""
     chassis = {app.name for app in juju.apps if app.charm in CHASSIS_CHARMS}
     hypervisors = {
@@ -66,15 +64,12 @@ def probe_ovs(
         and unit.parent_machine_id in hypervisors
         and unit.machine_id == unit.parent_machine_id
     ]
-    if model is None or not targets:
+    if not targets:
         return [], [
             ProbeNotice(
                 source="ovs",
                 reason="not-queried",
-                message="OVS was not inspected; add --juju-model for a model "
-                "with ovn-chassis on the hypervisors."
-                if model is None
-                else "OVS was not inspected; no ovn-chassis unit is on a "
+                message="OVS was not inspected; no ovn-chassis unit is on a "
                 "verified hypervisor.",
             )
         ]

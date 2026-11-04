@@ -10,18 +10,13 @@ EXEC_TIMEOUT = 120
 MAX_FETCH = 64 * 1024 * 1024
 
 
-def target(where: str) -> dict[str, str]:
-    """Juju exec target: a machine ID or a unit name."""
-    return {"unit": where} if "/" in where else {"machine": where}
-
-
 def sh(juju: jubilant.Juju, where: str, script: str, wait: int = EXEC_TIMEOUT) -> str:
     """Run a shell script as root on a machine or unit and return stdout."""
     command = f"bash -c {shlex.quote(script)}"
-    if "/" not in where:
-        # `juju exec --machine` runs as the ubuntu user; units run as root.
-        command = f"sudo -n {command}"
-    return juju.exec(command, wait=wait, **target(where)).stdout
+    if "/" in where:
+        return juju.exec(command, wait=wait, unit=where).stdout
+    # `juju exec --machine` runs as the ubuntu user; units run as root.
+    return juju.exec(f"sudo -n {command}", wait=wait, machine=where).stdout
 
 
 def push(juju: jubilant.Juju, where: str, path: str, content: str) -> None:
@@ -84,9 +79,7 @@ sleep 1
 """
 
 
-def stop_unit(
-    juju: jubilant.Juju, where: str, unit: str, run_dir: str | None = None
-) -> None:
+def stop_unit(juju: jubilant.Juju, where: str, unit: str, run_dir: str | None) -> None:
     """Stop a run-owned transient unit and confirm it is gone or inactive.
 
     With run_dir, also stop any process that escaped the unit and still names

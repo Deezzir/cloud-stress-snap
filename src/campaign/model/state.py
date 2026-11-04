@@ -31,6 +31,7 @@ SOCKET = STATE_ROOT / "control.sock"
 Phase = Literal["accepted", "preparing", "running", "finalizing", "finished"]
 Execution = Literal["completed", "cancelled", "failed", "interrupted"]
 Finalization = Literal["complete", "incomplete"]
+Action = Literal["intent", "created", "deleted", "rejected", "failed", "requires-login"]
 
 
 class RunState(BaseModel):
@@ -68,9 +69,7 @@ class ResourceEntry(BaseModel):
 
     kind: str
     name: str
-    action: Literal[
-        "intent", "created", "deleted", "rejected", "failed", "requires-login"
-    ]
+    action: Action
     id: str | None = None
     where: str | None = None
     detail: str | None = None
@@ -96,10 +95,10 @@ def private_dir(run_id: str) -> Path:
     return PRIVATE / "runs" / run_id
 
 
-def write_file(path: Path, text: str, mode: int = 0o644) -> None:
+def write_file(path: Path, text: str) -> None:
     """Replace a file atomically."""
     tmp = path.with_name(path.name + ".tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
     with os.fdopen(fd, "w", encoding="utf-8") as file:
         file.write(text)
         file.flush()
@@ -144,9 +143,6 @@ def save(state: RunState) -> None:
     """Persist a run's state, stamping the update time."""
     state.updated_at = now()
     write_file(run_dir(state.id) / "state.json", state.model_dump_json(indent=2))
-
-
-Action = Literal["intent", "created", "deleted", "rejected", "failed", "requires-login"]
 
 
 def record(
@@ -239,8 +235,6 @@ def lock() -> Iterator[None]:
 
 def create(
     *,
-    profile: Profile,
-    duration_s: int,
     model: str,
     cloud: str,
     plan: RunPlan,
@@ -255,8 +249,8 @@ def create(
     created = now()
     state = RunState(
         id=str(uuid.uuid4()),
-        profile=profile,
-        duration_s=duration_s,
+        profile=schedule.profile,
+        duration_s=schedule.duration_s,
         model=model,
         cloud=cloud,
         plan=plan,
