@@ -1,5 +1,6 @@
 """Execute one run: prepare, calibrate and measure; finalize.py cleans up."""
 
+import re
 import shlex
 import threading
 import time
@@ -24,6 +25,22 @@ SAMPLE_INTERVAL_S = {"host": 5, "ceph": 10}
 RECEIPT_PPS, RECEIPT_S, RECEIPT_MIN = 1000, 15, 0.8
 CALIBRATE_S = 60
 BOOT_TIMEOUT_S = 600
+# One `cloud-init status --long` error: ('module', SomeError("message"))
+CLOUD_INIT_ERROR = re.compile(r"""\('([^']+)', \w+\((['"])(.*)\2\)\)""")
+
+
+def cloud_init_errors(status: str) -> list[str]:
+    """Readable entries from the errors section of `cloud-init status --long`."""
+    errors, section = [], ""
+    for line in status.splitlines():
+        text = line.strip()
+        if text.startswith("- "):
+            if section == "errors":
+                match = CLOUD_INIT_ERROR.fullmatch(text[2:])
+                errors.append(f"{match[1]}: {match[3]}" if match else text[2:])
+        elif text.endswith(":"):
+            section = text[:-1]
+    return errors
 
 
 class Cancelled(Exception):
@@ -68,7 +85,8 @@ class Run:
             execution, error = "failed", f"preparation: {failure}"
         except Exception as failure:  # noqa: BLE001 - recorded, then finalized
             execution = "failed"
-            error = f"{type(failure).__name__}: {' '.join(str(failure).split())[:300]}"
+            name, text = type(failure).__name__, " ".join(str(failure).split())
+            error = (text if text.startswith(name) else f"{name}: {text}")[:300]
         if error:
             run_state.event(self.state.id, "error", message=error)
             self.state.causes.append(error)
@@ -168,16 +186,12 @@ class Run:
         self.wait_for(guest.reachable, BOOT_TIMEOUT_S, "SSH to the target guest")
         status = guest.run("cloud-init status --wait >/dev/null; echo $?", timeout=900)
         if status.strip() not in ("0", "2"):
-            detail = guest.run("cloud-init status --long 2>&1 | tail -n 15; true")
+            detail = guest.run("cloud-init status --long 2>&1; true")
             run_state.event(self.state.id, "cloud-init", status=detail.strip())
-            errors = [
-                line.strip(" -")
-                for line in detail.splitlines()
-                if line.strip().startswith("- ")
-            ]
+            errors = cloud_init_errors(detail)
             raise PreparationError(
                 "cloud-init failed in the guest"
-                + (f": {'; '.join(errors)[:300]}" if errors else f" ({status.strip()})")
+                + (f": {'; '.join(errors)}" if errors else f" ({status.strip()})")
             )
         self.guest_link = guest.run(
             "for d in /sys/class/net/*; do "
@@ -315,6 +329,8 @@ class Run:
                 steps[-1] = (steps[-1][0], item.length_s - step_s * (count - 1))
                 self.flood("stress", steps)
         self.wait(start + schedule.duration_s - time.time())
+        if any(item.name == "stress" for item in schedule.phases) and self.sender:
+            self.wait_flood("stress")
         if state.profile == "network-ceph":
             self.wait_guest_unit("measured", 300)
 
@@ -373,6 +389,26 @@ class Run:
         )
         self.start_host_unit(self.sender.machine, unit, lifetime, command, out)
         run_state.event(self.state.id, "flood", name=name, steps=steps)
+
+    def wait_flood(self, name: str) -> None:
+        """Wait for a TRex flood to finish and require a zero exit code."""
+        assert self.sender
+        where = self.sender.machine
+        unit = f"{self.sender.flood_unit}-{name}"
+        rc = shlex.quote(f"{self.sender.dir}/{name}.jsonl.rc")
+        self.wait_for(
+            lambda: (
+                remote.sh(
+                    self.juju, where, f"systemctl is-active {unit}.service || true"
+                ).strip()
+                != "active"
+            ),
+            120,
+            f"TRex flood {name}",
+        )
+        code = remote.sh(self.juju, where, f"cat {rc} 2>/dev/null || true").strip()
+        if code != "0":
+            raise RuntimeError(f"TRex flood {name} exited with {code or 'no code'}")
 
     def start_collectors(self) -> None:
         """Start host and Ceph samplers with a lifetime covering the run."""

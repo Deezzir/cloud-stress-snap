@@ -110,7 +110,8 @@ class Sender:
             "out": out,
         }
         command = (
-            f"exec /snap/bin/{SNAP}.python {self.dir}/flood.py "
-            f"{shlex.quote(json.dumps(args))} >> {self.log} 2>&1"
+            f"/snap/bin/{SNAP}.python {self.dir}/flood.py "
+            f"{shlex.quote(json.dumps(args))} >> {self.log} 2>&1; "
+            f"echo $? > {out}.rc"
         )
         return f"{self.flood_unit}-{name}", command, total + 60, out

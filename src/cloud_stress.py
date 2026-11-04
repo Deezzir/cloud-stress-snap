@@ -44,7 +44,11 @@ def access_options[F: Callable[..., object]](func: F) -> F:
     for option in reversed(
         [
             click.option("--cloud", help="Select a named cloud in clouds.yaml."),
-            click.option("--juju-model", help="Read membership from this Juju model."),
+            click.option(
+                "--juju-model",
+                help="Read membership from this Juju model.",
+                default="openstack",
+            ),
             click.option(
                 "--maas-url", help="Read MAAS records for scoped Juju machines."
             ),
@@ -242,25 +246,28 @@ def show_result(state: run_state.RunState) -> None:
 
 
 @run.command()
-@click.option(
-    "--profile",
-    required=True,
-    type=click.Choice(list(profiles.PROFILES)),
-    help="Stress profile to run.",
-)
+@click.argument("profile", type=click.Choice(list(profiles.PROFILES)))
 @click.option("--duration", required=True, help="Measured window, e.g. 30m or 1h.")
 @access_options
-@click.option("--sender", help="Sender hypervisor (short hostname).")
-@click.option("--target", help="Target hypervisor (short hostname).")
-@click.option("--network", help="VLAN provider network name or ID.")
+@click.option("--sender", help="Nova hypervisor for the TRex sender (short hostname).")
+@click.option("--target", help="Nova hypervisor for the target guest (short hostname).")
+@click.option(
+    "--provider-network",
+    "network",
+    help="Neutron VLAN provider network name or ID for the stress traffic.",
+)
 @click.option(
     "--ip-version",
     type=click.Choice(["4", "6"]),
-    help="Target address family; default IPv6 when the network has it.",
+    help="IP version on the provider network; default 6 when it has an IPv6 subnet.",
 )
-@click.option("--mgmt-network", help="Overlay network name or ID for guest access.")
-@click.option("--image", help="Guest image name or ID.")
-@click.option("--flavor", help="Guest flavor name or ID.")
+@click.option(
+    "--network",
+    "mgmt_network",
+    help="Neutron network name or ID for guest access; needs DHCP and DNS.",
+)
+@click.option("--image", help="Glance image name or ID for the guest.")
+@click.option("--flavor", help="Nova flavor name or ID for the guest.")
 @click.option("--volume-type", help="Cinder volume type name or ID.")
 @click.option("--yes", is_flag=True, help="Start without asking for confirmation.")
 @click.option(
@@ -303,7 +310,10 @@ def start(
     )
     readiness = next(item for item in result.readiness if item.profile == profile)
     if not readiness.ready:
+        issues = [n for n in result.notices if n.reason != "not-queried"]
         click.echo(f"{profile} cannot start:", err=True)
+        for issue in issues:
+            click.echo(f"  - {issue.message}", err=True)
         for blocker in readiness.blockers:
             click.echo(f"  - {blocker}", err=True)
         raise SystemExit(2)

@@ -27,7 +27,7 @@ description: |
 
   How to start a run:
 
-      cloud-stress run start --profile host-network --duration 30m --juju-model <model>
+      cloud-stress run start host-network --duration 30m --juju-model <model>
 
   How to follow, stop, or export a run:
 
@@ -51,9 +51,9 @@ description: |
   * Optional: MAAS URL (`--maas-url`) and API key (`MAAS_TOKEN`).
   * An overlay network with an IPv4 subnet for guest management.
 
-  Placement is chosen automatically; override it with `--sender`, `--target`,
-  `--network`, `--ip-version`, `--mgmt-network`, `--image`, `--flavor` and
-  `--volume-type`.
+  Placement is chosen automatically; override it with the OpenStack values
+  `--sender`, `--target`, `--provider-network`, `--ip-version`, `--network`,
+  `--image`, `--flavor` and `--volume-type`.
 
   Results report measured SLO indicators without a verdict. Exit codes:
   `0` completed, `20` failed, interrupted or not cleaned up, `30` cancelled.

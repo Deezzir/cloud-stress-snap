@@ -1,7 +1,7 @@
 """TRex flood, run on the sender with the trex-generator snap's Python."""
 
-# Every packet carries a new source address and UDP source port, so megaflow
-# wildcarding cannot fold packets together. Ports are acquired without force:
+# Every packet carries a new source address and UDP source port, so the flood
+# spreads over many flows. Ports are acquired without force:
 # a port owned by another session makes the run fail instead of taking it over.
 
 import json, signal, sys, time

@@ -12,6 +12,8 @@ def _fmt(value: object) -> str:
     """Format a value for a table cell; "-" for missing values."""
     if value is None:
         return "-"
+    if isinstance(value, bool):
+        return "yes" if value else "no"
     if isinstance(value, float):
         return f"{value:.3g}" if abs(value) < 1000 else f"{value:,.0f}"
     if isinstance(value, int) and not isinstance(value, bool):
@@ -72,6 +74,7 @@ def _placement(result: dict[str, object]) -> list[list[object]]:
     run = _dict(result.get("run"))
     datapath = _dict(result.get("datapath"))
     trex = _dict(result.get("tools")).get("trex")
+    floods = bool(_dict(result.get("sender")).get("planned_pps"))
 
     def join(*parts: object) -> str | None:
         text = ", ".join(str(x) for x in parts if x)
@@ -86,7 +89,10 @@ def _placement(result: dict[str, object]) -> list[list[object]]:
     rows: list[list[object]] = [
         [
             "Sender",
-            join(link(p.get("sender"), p.get("sender_link")), trex and f"TRex {trex}"),
+            floods
+            and join(
+                link(p.get("sender"), p.get("sender_link")), trex and f"TRex {trex}"
+            ),
         ],
         [
             "Target",

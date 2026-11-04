@@ -35,13 +35,16 @@ def probe_juju(
             )
         ]
     except jubilant.CLIError as error:
-        log.debug("juju status failed: %s", (error.stderr or "").strip())
+        stderr = (error.stderr or "").strip()
+        log.debug("juju status failed: %s", stderr)
+        detail = stderr.splitlines()[-1].removeprefix("ERROR ") if stderr else ""
         return juju, [
             ProbeNotice(
                 source="juju",
                 reason="unavailable",
-                message="Could not read the selected Juju model. Verify its name, "
-                "Juju authentication, and controller access.",
+                message=f"Could not read Juju model {model}"
+                + (f": {detail}" if detail else "")
+                + ". Verify its name, Juju authentication, and controller access.",
             )
         ]
     except (KeyError, TypeError, ValueError, AttributeError):

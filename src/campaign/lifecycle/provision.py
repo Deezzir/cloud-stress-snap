@@ -282,11 +282,19 @@ FIND: dict[str, Callable[[Connection, str], Any]] = {
 
 
 def cleanup(conn: Connection, state: RunState) -> list[str]:
-    """Delete outstanding run-owned cloud resources; return what is left."""
+    """Delete outstanding run-owned cloud resources; return what is left.
+
+    Deleting the server detaches its volume, so attachments are settled after
+    the server instead of through a separate detach call.
+    """
     left = []
-    for entry in reversed(run_state.outstanding(state.id)):
-        if entry.where != "openstack":
-            continue
+    entries = [
+        e for e in reversed(run_state.outstanding(state.id)) if e.where == "openstack"
+    ]
+    attachments = [e for e in entries if e.kind == "attachment"]
+    others = [e for e in entries if e.kind != "attachment"]
+    after_server = next((i + 1 for i, e in enumerate(others) if e.kind == "server"), 0)
+    for entry in others[:after_server] + attachments + others[after_server:]:
         try:
             if entry.kind == "attachment":
                 server = FIND["server"](conn, name(state, "server"))
@@ -305,6 +313,12 @@ def cleanup(conn: Connection, state: RunState) -> list[str]:
                     FIND[entry.kind](conn, entry.name), "id", None
                 )
                 if found:
+                    if entry.kind == "volume":
+                        conn.block_storage.wait_for_status(
+                            conn.block_storage.get_volume(found),
+                            "available",
+                            wait=BUILD_TIMEOUT,
+                        )
                     DELETE[entry.kind](conn, found)
                     if entry.kind == "server":
                         conn.compute.wait_for_delete(
