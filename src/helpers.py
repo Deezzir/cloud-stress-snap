@@ -22,6 +22,7 @@ from probe.models import (
     RunPlan,
 )
 from probe.openstack_probe import (
+    CACERT_UNREADABLE,
     configured_clouds,
     probe_openstack,
     resolve_cloud,
@@ -71,6 +72,7 @@ def discover_cloud(
         if str(error) in (
             "TLS certificate verification must remain enabled",
             "Password authentication requires an HTTPS auth URL",
+            CACERT_UNREADABLE,
         ):
             raise click.UsageError(str(error)) from None
         raise click.UsageError("Invalid OpenStack access configuration") from None

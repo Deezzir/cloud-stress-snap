@@ -1,6 +1,7 @@
 """Read scoped OpenStack inventory without modifying the deployment."""
 
 import logging
+import os
 from collections.abc import Iterable
 from itertools import islice
 from typing import Any
@@ -29,6 +30,11 @@ from probe.models import (
 )
 
 MAX_RECORDS = 10000
+CACERT_UNREADABLE = (
+    "CA certificate (OS_CACERT/cacert) is not readable; the snap cannot read "
+    "hidden files or other snaps' directories, so copy it to a regular "
+    "file under your home directory"
+)
 # Flavor extra specs that tie instances to particular hosts or devices.
 RESTRICTING_SPECS = (
     "aggregate_instance_extra_specs:",
@@ -50,6 +56,9 @@ def resolve_cloud(name: str) -> CloudRegion:
     config = OpenStackConfig().get_one_cloud(name)
     if config.config.get("verify") is False:
         raise ValueError("TLS certificate verification must remain enabled")
+    cacert = config.config.get("cacert")
+    if cacert and not os.access(cacert, os.R_OK):
+        raise ValueError(CACERT_UNREADABLE)
     auth = config.config.get("auth", {})
     if any(auth.get(key) for key in ("password", "application_credential_secret")):
         if urlsplit(str(auth.get("auth_url", ""))).scheme != "https":
