@@ -175,8 +175,8 @@ def datapath_notices(result: CheckResult) -> list[ProbeNotice]:
             ProbeNotice(
                 source="datapath",
                 reason="not-queried",
-                message="Traffic was not mapped to physical links; add "
-                "--juju-model and --maas-url.",
+                message="Traffic was not mapped to physical links; MAAS "
+                "interfaces were not read.",
             )
         )
     mtus: dict[str, set[int]] = {}

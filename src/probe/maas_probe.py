@@ -9,6 +9,9 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
+import jubilant
+
+from probe.juju_probe import juju_read
 from probe.models import MaasInterface, MaasMachine, MaasResult, ProbeNotice
 
 MAX_RESPONSE_BYTES = 32 * 1024 * 1024
@@ -42,6 +45,44 @@ def _machines_request(url: str, token: str) -> Request:
         f"{base}/machines/",
         headers={"Authorization": f"OAuth {header}", "Accept": "application/json"},
     )
+
+
+def _find(data: object, key: str) -> Any:
+    """The first value of `key` anywhere in nested Juju JSON output."""
+    if isinstance(data, dict):
+        if key in data:
+            return data[key]
+        data = list(data.values())
+    if isinstance(data, list):
+        for item in data:
+            found = _find(item, key)
+            if found is not None:
+                return found
+    return None
+
+
+def _maas_access(model: str) -> tuple[str, str]:
+    """MAAS endpoint and OAuth key of the model's cloud credential, from Juju."""
+    juju = jubilant.Juju(model=model)
+    info = juju.show_model()
+    if info.type != "maas" or info.credential is None:
+        raise LookupError(f"model {model} is not on a MAAS cloud")
+    scope = ["--controller", info.controller_name, "--format", "json"]
+    cloud = json.loads(juju.cli("show-cloud", info.cloud, *scope, include_model=False))
+    credential = json.loads(
+        juju.cli(
+            "show-credential",
+            info.cloud,
+            info.credential.name,
+            "--show-secrets",
+            *scope,
+            include_model=False,
+        )
+    )
+    endpoint, key = _find(cloud, "endpoint"), _find(credential, "maas-oauth")
+    if not endpoint or not key:
+        raise LookupError(f"Juju has no MAAS endpoint or key for cloud {info.cloud}")
+    return str(endpoint), str(key)
 
 
 def _interface(item: dict[str, Any]) -> MaasInterface:
@@ -85,19 +126,29 @@ def _interfaces(items: list[dict[str, Any]]) -> list[MaasInterface]:
 
 
 def probe_maas(
-    url: str | None, token: str | None, selected_ids: set[str]
+    model: str, selected_ids: set[str]
 ) -> tuple[MaasResult, list[ProbeNotice]]:
-    """Select only machines whose system IDs occur in the chosen Juju model."""
+    """Select only machines whose system IDs occur in the chosen Juju model.
+
+    The MAAS endpoint and key come from the model's Juju cloud credential.
+    """
     maas: MaasResult = MaasResult(machines=[])
-    if url is None or token is None:
+    notices: list[ProbeNotice] = []
+    try:
+        access = juju_read(
+            "maas", "MAAS credential from Juju", notices, lambda: _maas_access(model)
+        )
+    except LookupError as error:
         return maas, [
             ProbeNotice(
                 source="maas",
                 reason="not-queried",
-                message="MAAS was not queried; add --maas-url and --maas-token "
-                "to match Juju machines to hypervisors.",
+                message=f"MAAS was not queried; {error}.",
             )
         ]
+    if access is None:
+        return maas, notices
+    url, token = access
     if not selected_ids:
         return maas, [
             ProbeNotice(

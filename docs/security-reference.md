@@ -20,8 +20,6 @@ snap connections cloud-stress
 | `shared-memory` | Shared memory private to this snap. |
 | `home` | Non-hidden files in your home directory, such as CA certificates. |
 | `dot-local-share-juju` | Juju client configuration and credentials in `~/.local/share/juju`. |
-| `dot-config-openstack` | OpenStack configuration in `~/.config/openstack`. |
-| `etc-openstack` | OpenStack configuration in `/etc/openstack`. |
 
 Juju access needs a manual connection:
 
@@ -37,8 +35,10 @@ Run cloud-stress as the user whose client configuration it should use.
   tokens and keys. Keep them out of bug reports.
 - OpenStack configurations that disable TLS verification are rejected, and
   password authentication requires HTTPS.
-- Pass the MAAS API key in `MAAS_TOKEN`, not `--maas-token`. Use an `https://`
-  MAAS URL; over `http://` the key is sent unencrypted.
+- The MAAS endpoint and API key are read from the Juju model's cloud
+  credential (`juju show-credential --show-secrets`), so the Juju user must own
+  it. The key is used in memory only; over an `http://` endpoint it is sent
+  unencrypted.
 
 ## Juju access
 

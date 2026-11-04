@@ -47,9 +47,9 @@ description: |
 
   Requirements:
 
-  * OpenStack credentials in `OS_*` variables or `clouds.yaml` with a single cloud (or `OS_CLOUD`).
+  * OpenStack credentials in `OS_*` variables, or a single-cloud `clouds.yaml` in the current directory or at `OS_CLIENT_CONFIG_FILE` under your home (`OS_CLOUD` selects one of several).
   * A Juju login with admin access to the OpenStack model.
-  * Optional: MAAS URL (`--maas-url`) and API key (`MAAS_TOKEN`).
+  * Optional: a MAAS cloud credential on the Juju model, read for MAAS records.
   * An overlay network with an IPv4 subnet for guest management.
 
   Placement is chosen automatically; override it with the OpenStack values
@@ -72,18 +72,10 @@ platforms:
 plugs:
   shared-memory:
     private: true
-  dot-config-openstack:
-    interface: personal-files
-    read:
-      - $HOME/.config/openstack
   dot-local-share-juju:
     interface: personal-files
     write:
       - $HOME/.local/share/juju
-  etc-openstack:
-    interface: system-files
-    read:
-      - /etc/openstack
 
 apps:
   cloud-stress:
@@ -95,8 +87,6 @@ apps:
       - home
       - shared-memory
       - dot-local-share-juju
-      - dot-config-openstack
-      - etc-openstack
   worker:
     command: bin/cloud-stress-worker
     daemon: simple

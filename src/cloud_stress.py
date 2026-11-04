@@ -36,22 +36,13 @@ from probe.plan import profile_readiness, resolve_plan
 
 
 def access_options[F: Callable[..., object]](func: F) -> F:
-    """Options that select the Juju model and optional MAAS."""
+    """Options that select the Juju model and diagnostics."""
     for option in reversed(
         [
             click.option(
                 "--juju-model",
                 help="Read membership from this Juju model.",
                 default="openstack",
-            ),
-            click.option(
-                "--maas-url", help="Read MAAS records for scoped Juju machines."
-            ),
-            click.option(
-                "--maas-token",
-                envvar="MAAS_TOKEN",
-                help="MAAS API key (consumer:token:secret).",
-                show_envvar=True,
             ),
             click.option(
                 "-v", "--verbose", is_flag=True, help="Print diagnostic details."
@@ -64,8 +55,6 @@ def access_options[F: Callable[..., object]](func: F) -> F:
 
 def discover(
     juju_model: str,
-    maas_url: str | None,
-    maas_token: str | None,
     verbose: bool,
     overrides: dict[str, str] | None = None,
     allow_recovering: bool = False,
@@ -79,8 +68,6 @@ def discover(
             logging.getLogger(name).setLevel(logging.DEBUG)
     if not juju_model:
         raise click.UsageError("--juju-model must not be empty")
-    if maas_url and not maas_token:
-        raise click.UsageError("--maas-url requires --maas-token or MAAS_TOKEN")
     with ThreadPoolExecutor(max_workers=3) as pool:
         juju_future = pool.submit(probe_juju, juju_model)
         cloud, openstack, openstack_notices = discover_cloud()
@@ -88,7 +75,7 @@ def discover(
         scoped_ids = {
             machine.instance_id for machine in juju.machines if machine.instance_id
         }
-        maas, maas_notices = probe_maas(maas_url, maas_token, scoped_ids)
+        maas, maas_notices = probe_maas(juju_model, scoped_ids)
         link_notices = link_juju_to_hypervisors(juju, maas, openstack.hosts)
         infra_future = pool.submit(probe_infra, juju_model, juju, openstack.hosts)
         ceph_future = pool.submit(probe_ceph, juju_model, juju)
@@ -134,13 +121,11 @@ def app() -> None:
 @click.option("--json", "as_json", is_flag=True, help="Print live results as JSON.")
 def check(
     juju_model: str,
-    maas_url: str | None,
-    maas_token: str | None,
     verbose: bool,
     as_json: bool,
 ) -> None:
     """Check access and print live, read-only infrastructure observations."""
-    result = discover(juju_model, maas_url, maas_token, verbose)
+    result = discover(juju_model, verbose)
     print_check_result(result, as_json)
     if not result.openstack.hosts:
         click.echo("No compute hosts were discovered", err=True)
@@ -262,8 +247,6 @@ def start(
     profile: str,
     duration: str,
     juju_model: str,
-    maas_url: str | None,
-    maas_token: str | None,
     verbose: bool,
     yes: bool,
     allow_recovering: bool,
@@ -282,8 +265,6 @@ def start(
     overrides = {key: value for key, value in choices.items() if value}
     result = discover(
         juju_model,
-        maas_url,
-        maas_token,
         verbose,
         overrides,
         allow_recovering=allow_recovering,
