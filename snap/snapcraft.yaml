@@ -20,6 +20,7 @@ description: |
 
       sudo snap connect cloud-stress:dot-local-share-juju
       sudo snap connect cloud-stress:dot-config-openstack
+      sudo snap connect cloud-stress:etc-openstack
 
   How to check a cloud (read-only):
 
@@ -46,7 +47,7 @@ description: |
 
   Requirements:
 
-  * OpenStack credentials in `OS_*` variables or `clouds.yaml` (`--cloud`).
+  * OpenStack credentials in `OS_*` variables or `clouds.yaml` with a single cloud (or `OS_CLOUD`).
   * A Juju login with admin access to the OpenStack model.
   * Optional: MAAS URL (`--maas-url`) and API key (`MAAS_TOKEN`).
   * An overlay network with an IPv4 subnet for guest management.

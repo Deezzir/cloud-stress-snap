@@ -36,10 +36,9 @@ from probe.plan import profile_readiness, resolve_plan
 
 
 def access_options[F: Callable[..., object]](func: F) -> F:
-    """Options that select the cloud, Juju model and optional MAAS."""
+    """Options that select the Juju model and optional MAAS."""
     for option in reversed(
         [
-            click.option("--cloud", help="Select a named cloud in clouds.yaml."),
             click.option(
                 "--juju-model",
                 help="Read membership from this Juju model; defaults to 'openstack'.",
@@ -63,7 +62,6 @@ def access_options[F: Callable[..., object]](func: F) -> F:
 
 
 def discover(
-    cloud: str | None,
     juju_model: str,
     maas_url: str | None,
     maas_token: str | None,
@@ -84,7 +82,7 @@ def discover(
         raise click.UsageError("--maas-url requires --maas-token or MAAS_TOKEN")
     with ThreadPoolExecutor(max_workers=3) as pool:
         juju_future = pool.submit(probe_juju, juju_model)
-        cloud, openstack, openstack_notices = discover_cloud(cloud)
+        cloud, openstack, openstack_notices = discover_cloud()
         juju, juju_notices = juju_future.result()
         scoped_ids = {
             machine.instance_id for machine in juju.machines if machine.instance_id
@@ -131,7 +129,6 @@ def app() -> None:
 @access_options
 @click.option("--json", "as_json", is_flag=True, help="Print live results as JSON.")
 def check(
-    cloud: str | None,
     juju_model: str,
     maas_url: str | None,
     maas_token: str | None,
@@ -139,7 +136,7 @@ def check(
     as_json: bool,
 ) -> None:
     """Check access and print live, read-only infrastructure observations."""
-    result = discover(cloud, juju_model, maas_url, maas_token, verbose)
+    result = discover(juju_model, maas_url, maas_token, verbose)
     print_check_result(result, as_json)
     if not result.openstack.hosts:
         click.echo("No compute hosts were discovered", err=True)
@@ -260,7 +257,6 @@ def show_result(state: run_state.RunState) -> None:
 def start(
     profile: str,
     duration: str,
-    cloud: str | None,
     juju_model: str,
     maas_url: str | None,
     maas_token: str | None,
@@ -281,7 +277,6 @@ def start(
         )
     overrides = {key: value for key, value in choices.items() if value}
     result = discover(
-        cloud,
         juju_model,
         maas_url,
         maas_token,
@@ -336,13 +331,12 @@ def start(
 
 @run.command()
 @click.argument("run_id", required=False)
-@click.option("--cloud", help="Select a named cloud in clouds.yaml.")
 @click.option(
     "--abandon-evidence",
     is_flag=True,
     help="Clean up even when evidence on an unreachable host or guest is lost.",
 )
-def stop(run_id: str | None, cloud: str | None, abandon_evidence: bool) -> None:
+def stop(run_id: str | None, abandon_evidence: bool) -> None:
     """Stop the active run, or finish cleanup of an interrupted one."""
     pending = run_state.unfinished()
     if pending is None:
@@ -354,7 +348,7 @@ def stop(run_id: str | None, cloud: str | None, abandon_evidence: bool) -> None:
     }
     reply = request(payload, check=False)
     if reply.get("needs_access"):
-        payload["access"] = operator_access(cloud or pending.cloud).model_dump()
+        payload["access"] = operator_access(pending.cloud).model_dump()
         reply = request(payload)
     elif not reply.get("ok"):
         click.echo(f"Error: {reply.get('error')}", err=True)

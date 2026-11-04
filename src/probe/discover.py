@@ -2,7 +2,6 @@
 
 import logging
 import os
-import sys
 
 import click
 
@@ -30,7 +29,7 @@ log = logging.getLogger(__name__)
 
 
 def get_cloud_name() -> str:
-    """Determine the cloud name from environment variables or user input."""
+    """The single cloud visible from OS_* variables or clouds.yaml."""
     if os.environ.get("OS_CLOUD"):
         return os.environ["OS_CLOUD"]
     if os.environ.get("OS_AUTH_URL"):
@@ -40,17 +39,15 @@ def get_cloud_name() -> str:
         return names[0]
     if not names:
         raise click.UsageError("No OS_* credentials or clouds.yaml found")
-    if not sys.stdin.isatty():
-        raise click.UsageError("Multiple clouds found; specify --cloud")
-    return str(click.prompt("Cloud", type=click.Choice(names)))
+    raise click.UsageError(
+        f"Multiple clouds in clouds.yaml ({', '.join(names)}); set OS_CLOUD"
+    )
 
 
-def discover_cloud(
-    cloud: str | None,
-) -> tuple[str, OpenstackResult, list[ProbeNotice]]:
+def discover_cloud() -> tuple[str, OpenstackResult, list[ProbeNotice]]:
     """Resolve the cloud and collect inventory without exposing access details."""
     try:
-        cloud = cloud or get_cloud_name()
+        cloud = get_cloud_name()
         selected = resolve_cloud(cloud)
         log.debug(
             "OpenStack: cloud %r, auth URL %s, region %s",
