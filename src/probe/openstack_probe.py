@@ -93,8 +93,7 @@ def _collect(
                 ProbeNotice(
                     source=source,
                     reason="permission-denied",
-                    message=f"{description}: access denied. Check read permissions "
-                    "for the selected OpenStack identity.",
+                    message=f"{description}: OpenStack access denied.",
                 )
             )
         else:
@@ -102,8 +101,7 @@ def _collect(
                 ProbeNotice(
                     source=source,
                     reason="unavailable",
-                    message=f"{description} could not be read. "
-                    "Check service availability and OpenStack authentication.",
+                    message=f"{description}: OpenStack request failed.",
                 )
             )
         return []

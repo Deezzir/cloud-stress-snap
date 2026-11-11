@@ -3,6 +3,9 @@
 from datetime import UTC, datetime
 from typing import cast
 
+from campaign.model.profiles import format_duration
+from constants import MAX_OUTPUT_ITEMS
+
 Row = dict[str, object]
 
 
@@ -21,6 +24,8 @@ def _fmt(value: object) -> str:
 
 def _table(rows: list[list[object]]) -> list[str]:
     """Format rows, header first, as indented two-space columns."""
+    if not rows:
+        return []
     cells = [[_fmt(c) for c in row] for row in rows]
     widths = [max(len(row[i]) for row in cells) for i in range(len(cells[0]))]
     return [
@@ -47,20 +52,19 @@ def _fleet_lines(result: Row) -> list[str]:
     """Hosts, VM counts and roles."""
     fleet = _dict(result.get("fleet"))
     vms = _list(fleet.get("vms"))
+    if not vms:
+        return []
     rows: list[list[object]] = [["HOST", "ARCH", "VMS", "ROLES"]]
     for host in _list(fleet.get("hosts")):
-        roles = sorted(
-            {
-                str(v.get("role") or "-")
-                for v in vms
-                if v.get("host") == host.get("name")
-            }
-        )
+        placed = [v for v in vms if v.get("host") == host.get("name")]
+        if not placed:
+            continue
+        roles = sorted({str(v.get("role") or "-") for v in placed})
         name = f"{host.get('name')}{' (focus)' if host.get('focus') else ''}"
-        rows.append([name, host.get("architecture"), host.get("vms"), ", ".join(roles)])
+        rows.append([name, host.get("architecture"), len(placed), ", ".join(roles)])
     lines = ["", "Fleet:", *_table(rows)] if len(rows) > 1 else []
     resources = [
-        ["Network", fleet.get("network")],
+        ["TRex network", fleet.get("network")],
         ["Management", fleet.get("mgmt_network")],
         ["Flavor", fleet.get("flavor")],
         ["Volume type", fleet.get("volume_type")],
@@ -78,7 +82,7 @@ def _timeline_lines(result: Row) -> list[str]:
     when = datetime.fromtimestamp(start, UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
     lines = [
         "",
-        f"Measured from {when}, after a {_fmt(timeline.get('warmup_s'))}s warm-up.",
+        f"Scheduled measurement start: {when}",
     ]
     steps = _dict(_dict(result.get("network")).get("step_starts"))
     for step, item in steps.items():
@@ -124,9 +128,7 @@ def _network_lines(result: Row) -> list[str]:
         f"Network ({network.get('mode')}, focus {network.get('focus')}, "
         f"{network.get('senders')} senders, {network.get('receivers')} receivers):",
         *_table(rows),
-        "  TX: TRex packets per sender. RX: packets counted per receiver. Each rate",
-        "  covers that VM's samples inside the window; the count before the range",
-        "  is VMs with samples out of VMs.",
+        "  TX/RX: reporting/total VMs, then min/median/max packets/s per VM.",
     ]
 
 
@@ -171,44 +173,63 @@ def _storage_lines(result: Row) -> list[str]:
             )
     return [
         "",
-        f"Storage (fio, {storage.get('numjobs')} job(s) per VM, per job over its "
-        "own runtime):",
+        f"fio (jobs per VM: {storage.get('numjobs')}; per-job results):",
         *_table(rows),
     ]
 
 
-def summary_text(result: Row) -> str:
+def summary_text(result: Row, verbose: bool = False) -> str:
     """Human summary of a result with titled, aligned sections."""
     run = _dict(result.get("run"))
-    workloads = ", ".join(
-        str(w) for w in cast(list[object], run.get("workloads") or [])
-    )
-    lines = [
-        f"Run {run.get('id')} ({workloads}, {_fmt(run.get('duration_s'))}s measured)",
-        *_table(
-            [
-                ["Outcome", f"{run.get('execution')}, exit {run.get('code')}"],
-                ["Cleanup", run.get("finalization")],
-            ]
-        ),
+    status: list[list[object]] = [
+        ["Status", f"{run.get('execution')} (exit {run.get('code')})"],
+        ["Cleanup", run.get("finalization")],
     ]
-    lines += _fleet_lines(result)
-    lines += _timeline_lines(result)
-    lines += _network_lines(result)
-    lines += _storage_lines(result)
-    issues = [
+    if not result.get("timeline"):
+        status.append(["Measurement", "not started"])
+    lines = [f"Run {run.get('id')}", *_table(status)]
+    errors = [
         *[
             str(c)
             for c in cast(list[object], run.get("causes") or [])
             if not str(c).startswith("cleanup:")
         ],
         *[str(e) for e in cast(list[object], result.get("errors") or [])],
-        *[f"gap: {g}" for g in cast(list[object], result.get("gaps") or [])],
-        *[
-            f"not cleaned up: {r.get('kind')} {r.get('name')} ({r.get('action')})"
-            for r in _list(result.get("cleanup"))
-        ],
     ]
-    if issues:
-        lines += ["", "Issues:", *[f"  {i}" for i in dict.fromkeys(issues)]]
+    if errors:
+        lines += ["", "Errors:", *[f"  {e}" for e in dict.fromkeys(errors)]]
+    cleanup = _list(result.get("cleanup"))
+    if cleanup:
+        lines += [
+            "",
+            "Cleanup pending:",
+            *[
+                f"  {r.get('kind')} {r.get('name')} ({r.get('action')})"
+                for r in cleanup
+            ],
+            f"Retry: cloud-stress run stop {run.get('id')}",
+        ]
+    if verbose:
+        workloads = ", ".join(
+            str(w) for w in cast(list[object], run.get("workloads") or [])
+        )
+        duration = run.get("duration_s")
+        lines += ["", f"Workloads: {workloads}"]
+        if isinstance(duration, int):
+            lines.append(f"Planned duration: {format_duration(duration)}")
+        lines += _fleet_lines(result)
+        lines += _timeline_lines(result)
+    lines += _network_lines(result)
+    lines += _storage_lines(result)
+    gaps = list(
+        dict.fromkeys(str(g) for g in cast(list[object], result.get("gaps") or []))
+    )
+    if gaps:
+        shown = gaps if verbose else gaps[:MAX_OUTPUT_ITEMS]
+        lines += ["", f"Data gaps ({len(gaps)}):", *[f"  {g}" for g in shown]]
+        if len(shown) < len(gaps):
+            lines += [
+                f"  {len(gaps) - len(shown)} more; "
+                f"cloud-stress run status {run.get('id')} --verbose"
+            ]
     return "\n".join(lines) + "\n"

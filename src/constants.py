@@ -65,6 +65,7 @@ FIO_PLAT_VAL = 64
 # Reports.
 MAX_REPORT_FILE_BYTES = 64 * 1024**2
 MAX_CLOCK_OFFSET_S = 2.0
+MAX_OUTPUT_ITEMS = 5
 
 # Graphs.
 PLOT_FAINT = {"linewidth": 0.6, "alpha": 0.35}

@@ -26,6 +26,7 @@ from probe.discover import (
 from probe.display import (
     print_check_result,
     print_fleet,
+    print_notices,
     print_resources,
     print_table,
 )
@@ -51,7 +52,10 @@ def access_options[F: Callable[..., object]](func: F) -> F:
                 default="openstack",
             ),
             click.option(
-                "-v", "--verbose", is_flag=True, help="Print diagnostic details."
+                "-v",
+                "--verbose",
+                is_flag=True,
+                help="Show full details and diagnostics.",
             ),
         ]
     ):
@@ -131,7 +135,7 @@ def discover(
     context_settings={"help_option_names": ["-h", "--help"], "show_default": True},
 )
 def app() -> None:
-    """Stress test Prodstack network, storage, and compute infrastructure."""
+    """Run TRex network and fio storage workloads on a Prodstack cloud."""
 
 
 @app.command()
@@ -142,9 +146,9 @@ def check(
     verbose: bool,
     as_json: bool,
 ) -> None:
-    """Check access and print live, read-only infrastructure observations."""
+    """Check cloud access, infrastructure and workload readiness."""
     result = discover(juju_model, verbose)
-    print_check_result(result, as_json)
+    print_check_result(result, as_json, verbose)
     if not result.openstack.hosts:
         click.echo("No compute hosts were discovered", err=True)
         raise SystemExit(2)
@@ -194,7 +198,7 @@ def operator_access(cloud: str) -> access.Access:
         raise click.UsageError(str(error)) from None
 
 
-def follow(run_id: str, after_attempt: int = 0) -> None:
+def follow(run_id: str, after_attempt: int = 0, verbose: bool = False) -> None:
     """Print progress until a finalize attempt after `after_attempt` ends.
 
     Ctrl+C only detaches; the run continues in the worker.
@@ -203,33 +207,43 @@ def follow(run_id: str, after_attempt: int = 0) -> None:
     try:
         while True:
             state = run_state.load(run_id)
-            line = state.phase + (f": {state.detail}" if state.detail else "")
-            if line != shown:
-                click.echo(f"{datetime.now(UTC):%H:%M:%S}  {line}")
-                shown = line
             if state.code is not None and state.finalize_attempts > after_attempt:
                 break
+            line = state.detail or state.phase
+            if line != shown and state.phase != "accepted":
+                click.echo(f"{datetime.now(UTC):%H:%M:%S}  {line}")
+                shown = line
             time.sleep(2)
     except KeyboardInterrupt:
         click.echo(
-            f'\nDetached. The run continues; follow it with "cloud-stress run '
-            f'status {run_id}" or stop it with "cloud-stress run stop".',
+            f"\nRun continues.\n"
+            f"Status: cloud-stress run status {run_id}\n"
+            f"Stop:   cloud-stress run stop {run_id}",
             err=True,
         )
         raise SystemExit(130) from None
     click.echo()
-    show_result(state)
+    show_result(state, verbose)
     raise SystemExit(state.code or 0)
 
 
-def show_result(state: run_state.RunState) -> None:
+def show_result(state: run_state.RunState, verbose: bool = False) -> None:
     """Print a run's summary, or its outcome when no result was written."""
     result_file = run_state.run_dir(state.id) / "report.json"
     if result_file.is_file():
-        click.echo(summary_text(json.loads(result_file.read_text())))
+        click.echo(summary_text(json.loads(result_file.read_text()), verbose), nl=False)
     else:
+        click.echo(f"Run {state.id}")
+        print_table(
+            [
+                ["Status", f"{state.execution or state.phase} (exit {state.code})"],
+                ["Cleanup", state.finalization or "pending"],
+            ]
+        )
         for cause in state.causes:
-            click.echo(f"  - {cause}")
+            click.echo(f"  {cause}")
+        if state.finalization == "incomplete":
+            click.echo(f"Retry: cloud-stress run stop {state.id}")
     click.echo(f"Results: {run_state.run_dir(state.id)}")
 
 
@@ -258,7 +272,7 @@ def show_result(state: run_state.RunState) -> None:
 @click.option(
     "--network",
     "mgmt_network",
-    help="Neutron network name or ID for guest access; needs DHCP and DNS.",
+    help="IPv4 overlay network for guest management (SSH, DHCP and DNS).",
 )
 @click.option("--image", help="Glance image name or ID for the guests.")
 @click.option("--flavor", help="Nova flavor name or ID for the guests.")
@@ -294,19 +308,20 @@ def start(
     )
     blockers = [b for item in result.readiness for b in item.blockers]
     if blockers:
-        issues = [n for n in result.notices if n.reason != "not-queried"]
-        click.echo("The run cannot start:", err=True)
-        for issue in issues:
-            click.echo(f"  - {issue.message}", err=True)
+        click.echo("Cannot start:", err=True)
         for blocker in dict.fromkeys(blockers):
-            click.echo(f"  - {blocker}", err=True)
+            click.echo(f"  {blocker}", err=True)
+        if verbose:
+            print_notices(result.notices, verbose=True)
         raise SystemExit(2)
-    click.echo(f"{len(result.plan.vms)} VMs on model {juju_model}\n\nResources:")
-    print_resources(result.plan)
+    click.echo(f"Run plan ({juju_model})\n\nResources:")
+    print_resources(result.plan, verbose)
     click.echo("\nFleet:")
-    print_fleet(result.plan)
+    print_fleet(result.plan, verbose)
     click.echo("\nSchedule:")
-    print_table(schedule_rows(config, schedule))
+    print_table(schedule_rows(config, schedule, verbose))
+    if verbose:
+        print_notices(result.notices, verbose=True)
     click.echo()
     reply = request(
         {
@@ -319,16 +334,16 @@ def start(
         }
     )
     click.echo(f"Run {reply['run_id']} accepted.")
-    follow(str(reply["run_id"]))
+    follow(str(reply["run_id"]), verbose=verbose)
 
 
 def schedule_rows(
-    config: profiles.RunConfig, schedule: profiles.Schedule
+    config: profiles.RunConfig, schedule: profiles.Schedule, verbose: bool = False
 ) -> list[list[str]]:
     """Warm-up and each workload's profile windows on the measured timeline."""
     fmt = profiles.format_duration
     rows = [
-        ["Warm-up", f"{fmt(schedule.warmup_s)} with the first profiles, not measured"],
+        ["Warm-up", f"{fmt(schedule.warmup_s)} before measurement"],
         ["Measured", fmt(schedule.duration_s)],
     ]
     trex_config, fio_config = config.workloads.trex, config.workloads.fio
@@ -350,20 +365,22 @@ def schedule_rows(
                 f"{fmt(window.start_s)}-{end}  {name}",
             ]
         )
-    rows.append(
-        ["Ends within", f"{fmt(schedule.max_elapsed_s)}, with setup and cleanup"]
-    )
+    if verbose:
+        rows.append(
+            ["Timeout", f"{fmt(schedule.max_elapsed_s)} including setup and cleanup"]
+        )
     return rows
 
 
 @run.command()
 @click.argument("run_id", required=False)
+@click.option("-v", "--verbose", is_flag=True, help="Show full result details.")
 @click.option(
     "--abandon-evidence",
     is_flag=True,
     help="Clean up even when evidence on an unreachable host or guest is lost.",
 )
-def stop(run_id: str | None, abandon_evidence: bool) -> None:
+def stop(run_id: str | None, abandon_evidence: bool, verbose: bool) -> None:
     """Stop the active run, or finish cleanup of an interrupted one."""
     pending = run_state.unfinished()
     if pending is None:
@@ -381,11 +398,14 @@ def stop(run_id: str | None, abandon_evidence: bool) -> None:
         click.echo(f"Error: {reply.get('error')}", err=True)
         raise SystemExit(2)
     click.echo(f"Stopping run {reply['run_id']}.")
-    follow(str(reply["run_id"]), pending.finalize_attempts)
+    follow(str(reply["run_id"]), pending.finalize_attempts, verbose)
 
 
 @run.command()
 @click.argument("run_id", required=False)
+@click.option(
+    "-v", "--verbose", is_flag=True, help="Show full fleet and result details."
+)
 @click.option("--json", "as_json", is_flag=True, help="Print the run result as JSON.")
 @click.option(
     "--html",
@@ -393,7 +413,9 @@ def stop(run_id: str | None, abandon_evidence: bool) -> None:
     type=click.Path(dir_okay=False, path_type=Path),
     help="Write the run's HTML report to this file.",
 )
-def status(run_id: str | None, as_json: bool, html_file: Path | None) -> None:
+def status(
+    run_id: str | None, as_json: bool, html_file: Path | None, verbose: bool
+) -> None:
     """Show the active run, or a retained run (the latest by default)."""
     if html_file and str(html_file.resolve()).startswith(("/tmp/", "/var/tmp/")):
         raise click.UsageError(
@@ -422,30 +444,25 @@ def status(run_id: str | None, as_json: bool, html_file: Path | None) -> None:
             else state.model_dump_json(indent=2)
         )
         return
-    if state.phase == "finished":
-        show_result(state)
+    if state.code is not None or state.phase == "finished":
+        show_result(state, verbose)
         return
     end = datetime.now(UTC)
     elapsed = int((end - state.created_at).total_seconds())
-    print_table(
-        [
-            ["Run", state.id],
-            ["Workloads", ", ".join(_workloads(state))],
-            ["VMs", str(len(state.plan.vms))],
-            ["Duration", profiles.format_duration(state.duration_s)],
-            [
-                "Status",
-                state.detail
-                if state.phase == "running" and state.detail
-                else state.phase,
-            ],
-            ["Outcome", _outcome(state)],
-            ["Started", state.created_at.strftime("%Y-%m-%d %H:%M:%S UTC")],
-            ["Elapsed", profiles.format_duration(elapsed)],
-        ]
-    )
-    click.echo("\nFleet:")
-    print_fleet(state.plan)
+    rows = [
+        ["Run", state.id],
+        ["Status", state.detail or state.phase],
+        ["Workloads", ", ".join(_workloads(state))],
+        ["VMs", f"{len(state.targets)}/{len(state.plan.vms)} created"],
+        ["Planned duration", profiles.format_duration(state.duration_s)],
+        ["Elapsed", profiles.format_duration(elapsed)],
+    ]
+    if verbose:
+        rows.append(["Started", state.created_at.strftime("%Y-%m-%d %H:%M:%S UTC")])
+    print_table(rows)
+    if verbose:
+        click.echo("\nPlanned fleet:")
+        print_fleet(state.plan)
     pending = run_state.outstanding(state.id)
     if state.finalization == "incomplete" and pending:
         click.echo(f"\nCleanup pending: {len(pending)} item(s).")
@@ -453,18 +470,11 @@ def status(run_id: str | None, as_json: bool, html_file: Path | None) -> None:
             click.echo(
                 f"  - {entry.kind} {entry.name} on {entry.where}: {entry.action}"
             )
-        click.echo('Log in again if needed, then run "cloud-stress run stop".')
+        click.echo(f"Retry: cloud-stress run stop {state.id}")
 
 
 def _workloads(state: run_state.RunState) -> list[str]:
     return [w for w in WORKLOADS if getattr(state.config.workloads, w) is not None]
-
-
-def _outcome(state: run_state.RunState) -> str:
-    if state.code is None:
-        return "-"
-    parts = [state.execution, f"exit {state.code}"]
-    return ", ".join(part for part in parts if part)
 
 
 if __name__ == "__main__":

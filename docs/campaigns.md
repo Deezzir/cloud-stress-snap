@@ -4,12 +4,17 @@ A run executes the workloads selected in a configuration file on a fixed fleet
 of VMs and records time-series measurements of the workloads, hosts and Ceph.
 One run is active at a time.
 
+`cloud-stress check` shows workload readiness, resource choices and warnings.
+Use `cloud-stress check --verbose` for the full host, network and Ceph inventories,
+or `--json` for structured output.
+
 ```bash
 cp /snap/cloud-stress/current/share/cloud-stress/config.yaml ~/stress.yaml
 cloud-stress run start --config ~/stress.yaml
 ```
 
-The run prints its resources, fleet and schedule, then starts. The
+The run prints its resources, VM counts and schedule, then starts. Add `--verbose`
+to show every host, the selected image and timeout. The
 [configuration reference](configuration.md) describes every setting, placement
 and how the duration is divided; [`config.yaml`](../config.yaml) is the
 example.
@@ -82,9 +87,13 @@ Each run writes a bundle to `/var/snap/cloud-stress/common/runs/<run-id>/`:
 
 ```bash
 cloud-stress run status [<run-id>]
+cloud-stress run status [<run-id>] --verbose
 cloud-stress run status [<run-id>] --json
 cloud-stress run status [<run-id>] --html report.html
 ```
+
+The terminal summary shows errors, cleanup status and measurements. `--verbose`
+includes the fleet and all data gaps; HTML and JSON reports include full details.
 
 How values are computed:
 

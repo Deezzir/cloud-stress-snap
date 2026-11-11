@@ -514,6 +514,8 @@ def _collectors(
         f"guest-{t.name}": f"raw/{t.name}/sampler/samples.jsonl" for t in state.targets
     }
     for name, rel in sources.items():
+        if start is None and not (bundle / rel).is_file():
+            continue
         raw = _jsonl(bundle, rel, gaps)
         try:
             rows = collect.normalize(raw)

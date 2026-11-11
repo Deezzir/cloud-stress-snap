@@ -75,19 +75,33 @@ def check_quota(
     problems = []
     compute = conn.compute.get_limits().absolute
     if compute.instances_used + count > compute.instances >= 0:
-        problems.append(f"the instance quota has no room for {count} servers")
+        problems.append(
+            f"Instance quota: {count:,} needed, "
+            f"{compute.instances - compute.instances_used:,} available"
+        )
     if compute.total_cores_used + count * vcpus > compute.total_cores >= 0:
-        problems.append(f"the core quota has no room for {count * vcpus} vCPUs")
+        problems.append(
+            f"vCPU quota: {count * vcpus:,} needed, "
+            f"{compute.total_cores - compute.total_cores_used:,} available"
+        )
     if compute.total_ram_used + count * ram_mb > compute.total_ram >= 0:
-        problems.append(f"the RAM quota has no room for {count * ram_mb} MiB")
+        problems.append(
+            f"RAM quota: {count * ram_mb:,} MiB needed, "
+            f"{compute.total_ram - compute.total_ram_used:,} MiB available"
+        )
     if volume_gb:
         volume = conn.block_storage.get_limits().absolute
         used, limit = volume.total_gigabytes_used, volume.max_total_volume_gigabytes
         if used + count * volume_gb > limit >= 0:
-            problems.append(f"the volume quota has no room for {count * volume_gb} GB")
+            problems.append(
+                f"Volume quota: {count * volume_gb:,} GiB needed, "
+                f"{limit - used:,} GiB available"
+            )
         used, limit = volume.total_volumes_used, volume.max_total_volumes
         if used + count > limit >= 0:
-            problems.append(f"the volume quota has no room for {count} volumes")
+            problems.append(
+                f"Volume count quota: {count:,} needed, {limit - used:,} available"
+            )
     return problems
 
 

@@ -24,7 +24,7 @@ def juju_read[T](
             ProbeNotice(
                 source=source,
                 reason="missing-tool",
-                message="The juju CLI is missing. Install it to read Ceph and OVS.",
+                message="juju command not found; Ceph and OVS were not queried.",
             )
         )
     except (jubilant.CLIError, jubilant.TaskError) as error:
@@ -36,11 +36,7 @@ def juju_read[T](
                 source=source,
                 reason="permission-denied" if denied else "unavailable",
                 message=f"{description}: "
-                + (
-                    "access denied. Check the Juju user's access to the model."
-                    if denied
-                    else "failed. Check the unit and its charm revision."
-                ),
+                + ("access to the Juju model denied." if denied else "probe failed."),
             )
         )
     except TimeoutError:
