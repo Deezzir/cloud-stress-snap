@@ -45,7 +45,7 @@ def print_ovs(result: CheckResult) -> None:
 
 
 def print_readiness(
-    readiness: list[WorkloadReadiness], plan: RunPlan, verbose: bool = False
+    readiness: list[WorkloadReadiness], plan: RunPlan, full: bool = False
 ) -> None:
     """Print each workload's status and the resources a run would use."""
     if not readiness:
@@ -58,10 +58,10 @@ def print_readiness(
     print_table(rows)
     if any(item.ready for item in readiness):
         click.echo("\nResources:")
-        print_resources(plan, verbose)
+        print_resources(plan, full)
 
 
-def print_resources(plan: RunPlan, verbose: bool = True) -> None:
+def print_resources(plan: RunPlan, full: bool = True) -> None:
     """Print the networks, images, flavor and volume type of a run."""
     network = plan.network
     if network:
@@ -74,14 +74,14 @@ def print_resources(plan: RunPlan, verbose: bool = True) -> None:
         ["Flavor", plan.flavor or "-"],
         ["Volume type", plan.volume_type or "-"],
     ]
-    if verbose:
+    if full:
         rows.append(["Images", images or "-"])
     print_table(rows)
 
 
-def print_fleet(plan: RunPlan, verbose: bool = True) -> None:
+def print_fleet(plan: RunPlan, full: bool = True) -> None:
     """Print the fleet's hosts, VM counts and network roles."""
-    if not verbose:
+    if not full:
         rows = [["VMs", f"{len(plan.vms)} on {len(plan.hosts)} hosts"]]
         if plan.focus:
             rows.append(["Focus", plan.focus])
@@ -154,9 +154,7 @@ def print_hypervisors(result: CheckResult) -> None:
     print_table(rows)
 
 
-def print_juju_result(
-    result: JujuResult, maas: MaasResult, verbose: bool = True
-) -> None:
+def print_juju_result(result: JujuResult, maas: MaasResult, full: bool = True) -> None:
     """Print Juju machines with their MAAS hostname and deployed applications."""
     physical = [m for m in result.machines if m.parent_id is None]
     click.echo(
@@ -164,7 +162,7 @@ def print_juju_result(
         f"{len(result.machines) - len(physical)} containers, "
         f"{sum(unit.principal is None for unit in result.units)} units"
     )
-    if not verbose:
+    if not full:
         return
     names = {record.system_id: record.hostname for record in maas.machines}
     rows = [["MACHINE", "HOST", "APPLICATIONS"]]
@@ -251,14 +249,14 @@ def print_network(result: CheckResult) -> None:
         click.echo(f"  Geneve tenant network MTU: {', '.join(map(str, geneve))}")
 
 
-def print_ceph(ceph: CephResult, verbose: bool = True) -> None:
+def print_ceph(ceph: CephResult, full: bool = True) -> None:
     """Print Ceph health, OSD placement per host and pool redundancy."""
     if ceph.health is None and not ceph.osds and not ceph.pools:
         return
     pgs = sum(ceph.pg_states.values())
     clean = ceph.pg_states.get("active+clean", 0)
     click.echo(f"\nCeph: {ceph.health or '?'}, {clean}/{pgs} PGs active+clean")
-    if not verbose:
+    if not full:
         return
     click.echo(f"  Quorum: {', '.join(ceph.quorum) or '?'}")
     if ceph.versions:
@@ -311,7 +309,7 @@ def print_ceph(ceph: CephResult, verbose: bool = True) -> None:
         print_table(rows)
 
 
-def print_notices(notices: list[ProbeNotice], verbose: bool = False) -> None:
+def print_notices(notices: list[ProbeNotice], full: bool = False) -> None:
     """Print probe-owned messages, separating issues from skipped checks."""
     issues = list(
         dict.fromkeys(n.message for n in notices if n.reason != "not-queried")
@@ -323,16 +321,14 @@ def print_notices(notices: list[ProbeNotice], verbose: bool = False) -> None:
         if not entries:
             continue
         click.echo(f"\n{title} ({len(entries)}):")
-        shown = entries if verbose else entries[:MAX_OUTPUT_ITEMS]
+        shown = entries if full else entries[:MAX_OUTPUT_ITEMS]
         for message in shown:
             click.echo(f"  {message}")
         if len(shown) < len(entries):
-            click.echo(f"  {len(entries) - len(shown)} more; use --verbose.")
+            click.echo(f"  {len(entries) - len(shown)} more; use --full.")
 
 
-def print_check_result(
-    result: CheckResult, as_json: bool, verbose: bool = False
-) -> None:
+def print_check_result(result: CheckResult, as_json: bool, full: bool = False) -> None:
     """Print structured JSON or a compact human-readable summary."""
     if as_json:
         click.echo(result.model_dump_json(indent=2))
@@ -346,7 +342,7 @@ def print_check_result(
     )
     if result.maas.machines:
         click.echo(f"MAAS: {len(result.maas.machines)} machines")
-    if verbose:
+    if full:
         print_hypervisors(result)
     else:
         probes = result.infra.host_probes
@@ -357,12 +353,12 @@ def print_check_result(
             f"Host probes: {len(probes)}/{len(openstack.hosts)} hosts; "
             f"{complete} complete, {partial} partial, {failed} failed"
         )
-    print_juju_result(result.juju, result.maas, verbose)
-    if verbose:
+    print_juju_result(result.juju, result.maas, full)
+    if full:
         print_network(result)
         print_ovs(result)
-    print_ceph(result.ceph, verbose)
-    print_readiness(result.readiness, result.plan, verbose)
-    print_notices(result.notices, verbose)
-    if not verbose:
-        click.echo("\nFull inventory: cloud-stress check --verbose")
+    print_ceph(result.ceph, full)
+    print_readiness(result.readiness, result.plan, full)
+    print_notices(result.notices, full)
+    if not full:
+        click.echo("\nFull inventory: cloud-stress check --full")

@@ -33,7 +33,7 @@ def render_html(run_id: str) -> str | None:
         "body{font-family:sans-serif;margin:2em;max-width:1100px}"
         "pre{background:#f6f6f6;padding:1em;overflow-x:auto}"
         "figure{margin:1em 0}img{max-width:100%}</style></head><body>"
-        f"<pre>{html_lib.escape(summary_text(result, verbose=True))}</pre>"
+        f"<pre>{html_lib.escape(summary_text(result, full=True))}</pre>"
         f"{''.join(figures)}"
         f"<p>Raw outputs, metric series and graphs: {html_lib.escape(str(bundle))}</p>"
         "</body></html>\n"

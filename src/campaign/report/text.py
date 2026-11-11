@@ -178,7 +178,7 @@ def _storage_lines(result: Row) -> list[str]:
     ]
 
 
-def summary_text(result: Row, verbose: bool = False) -> str:
+def summary_text(result: Row, full: bool = False) -> str:
     """Human summary of a result with titled, aligned sections."""
     run = _dict(result.get("run"))
     status: list[list[object]] = [
@@ -209,7 +209,7 @@ def summary_text(result: Row, verbose: bool = False) -> str:
             ],
             f"Retry: cloud-stress run stop {run.get('id')}",
         ]
-    if verbose:
+    if full:
         workloads = ", ".join(
             str(w) for w in cast(list[object], run.get("workloads") or [])
         )
@@ -225,11 +225,11 @@ def summary_text(result: Row, verbose: bool = False) -> str:
         dict.fromkeys(str(g) for g in cast(list[object], result.get("gaps") or []))
     )
     if gaps:
-        shown = gaps if verbose else gaps[:MAX_OUTPUT_ITEMS]
+        shown = gaps if full else gaps[:MAX_OUTPUT_ITEMS]
         lines += ["", f"Data gaps ({len(gaps)}):", *[f"  {g}" for g in shown]]
         if len(shown) < len(gaps):
             lines += [
                 f"  {len(gaps) - len(shown)} more; "
-                f"cloud-stress run status {run.get('id')} --verbose"
+                f"cloud-stress run status {run.get('id')} --full"
             ]
     return "\n".join(lines) + "\n"

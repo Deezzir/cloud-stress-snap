@@ -40,22 +40,46 @@ from probe.plan import resolve_plan, workload_readiness
 
 WORKLOADS: tuple[Workload, ...] = ("trex", "fio")
 DEFAULT_CONFIG = "/snap/cloud-stress/current/share/cloud-stress/config.yaml"
+log = logging.getLogger(__name__)
 
 
-def access_options[F: Callable[..., object]](func: F) -> F:
-    """Options that select the Juju model and diagnostics."""
+def debug_logging(ctx: click.Context, param: click.Parameter, value: bool) -> None:
+    """Enable CLI and probe debug logs for this command, on stderr."""
+    if not value or ctx.resilient_parsing:
+        return
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("debug: %(message)s"))
+    loggers = [logging.getLogger(name) for name in (__name__, "probe")]
+    levels = [logger.level for logger in loggers]
+    for logger in loggers:
+        logger.addHandler(handler)
+        logger.setLevel(logging.DEBUG)
+
+    def restore() -> None:
+        for logger, level in zip(loggers, levels, strict=True):
+            logger.removeHandler(handler)
+            logger.setLevel(level)
+        handler.close()
+
+    ctx.call_on_close(restore)
+
+
+def output_options[F: Callable[..., object]](func: F) -> F:
+    """Independent controls for expanded output and debug logs."""
     for option in reversed(
         [
             click.option(
-                "--juju-model",
-                help="Read membership from this Juju model.",
-                default="openstack",
+                "--full",
+                is_flag=True,
+                help="Show full inventory, fleet and result details.",
             ),
             click.option(
                 "-v",
                 "--verbose",
                 is_flag=True,
-                help="Show full details and diagnostics.",
+                expose_value=False,
+                callback=debug_logging,
+                help="Print debug logs to stderr.",
             ),
         ]
     ):
@@ -65,7 +89,6 @@ def access_options[F: Callable[..., object]](func: F) -> F:
 
 def discover(
     juju_model: str,
-    verbose: bool,
     overrides: dict[str, str] | None = None,
     allow_recovering: bool = False,
     config: profiles.RunConfig | None = None,
@@ -74,12 +97,6 @@ def discover(
 
     With a configuration, the plan includes the fleet for its workloads.
     """
-    if verbose:
-        handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter("debug: %(message)s"))
-        for name in ("probe",):
-            logging.getLogger(name).addHandler(handler)
-            logging.getLogger(name).setLevel(logging.DEBUG)
     if not juju_model:
         raise click.UsageError("--juju-model must not be empty")
     with ThreadPoolExecutor(max_workers=3) as pool:
@@ -139,16 +156,19 @@ def app() -> None:
 
 
 @app.command()
-@access_options
+@click.option(
+    "--juju-model", default="openstack", help="Read membership from this Juju model."
+)
+@output_options
 @click.option("--json", "as_json", is_flag=True, help="Print live results as JSON.")
 def check(
     juju_model: str,
-    verbose: bool,
+    full: bool,
     as_json: bool,
 ) -> None:
     """Check cloud access, infrastructure and workload readiness."""
-    result = discover(juju_model, verbose)
-    print_check_result(result, as_json, verbose)
+    result = discover(juju_model)
+    print_check_result(result, as_json, full)
     if not result.openstack.hosts:
         click.echo("No compute hosts were discovered", err=True)
         raise SystemExit(2)
@@ -166,6 +186,7 @@ def run() -> None:
 
 def request(payload: dict[str, object], check: bool = True) -> dict[str, object]:
     """Send one request to the worker and return its reply."""
+    log.debug("Worker: %s request via %s", payload.get("op"), run_state.SOCKET)
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
             conn.connect(str(run_state.SOCKET))
@@ -198,7 +219,7 @@ def operator_access(cloud: str) -> access.Access:
         raise click.UsageError(str(error)) from None
 
 
-def follow(run_id: str, after_attempt: int = 0, verbose: bool = False) -> None:
+def follow(run_id: str, after_attempt: int = 0, full: bool = False) -> None:
     """Print progress until a finalize attempt after `after_attempt` ends.
 
     Ctrl+C only detaches; the run continues in the worker.
@@ -223,15 +244,15 @@ def follow(run_id: str, after_attempt: int = 0, verbose: bool = False) -> None:
         )
         raise SystemExit(130) from None
     click.echo()
-    show_result(state, verbose)
+    show_result(state, full)
     raise SystemExit(state.code or 0)
 
 
-def show_result(state: run_state.RunState, verbose: bool = False) -> None:
+def show_result(state: run_state.RunState, full: bool = False) -> None:
     """Print a run's summary, or its outcome when no result was written."""
     result_file = run_state.run_dir(state.id) / "report.json"
     if result_file.is_file():
-        click.echo(summary_text(json.loads(result_file.read_text()), verbose), nl=False)
+        click.echo(summary_text(json.loads(result_file.read_text()), full), nl=False)
     else:
         click.echo(f"Run {state.id}")
         print_table(
@@ -258,7 +279,10 @@ def show_result(state: run_state.RunState, verbose: bool = False) -> None:
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     help="Run configuration (YAML).",
 )
-@access_options
+@click.option(
+    "--juju-model", default="openstack", help="Read membership from this Juju model."
+)
+@output_options
 @click.option(
     "--provider-network",
     "network",
@@ -283,7 +307,7 @@ def show_result(state: run_state.RunState, verbose: bool = False) -> None:
 def start(
     config_file: Path,
     juju_model: str,
-    verbose: bool,
+    full: bool,
     allow_recovering: bool,
     **choices: str | None,
 ) -> None:
@@ -301,7 +325,6 @@ def start(
     overrides = {key: value for key, value in choices.items() if value}
     result = discover(
         juju_model,
-        verbose,
         overrides,
         allow_recovering=allow_recovering,
         config=config,
@@ -311,17 +334,17 @@ def start(
         click.echo("Cannot start:", err=True)
         for blocker in dict.fromkeys(blockers):
             click.echo(f"  {blocker}", err=True)
-        if verbose:
-            print_notices(result.notices, verbose=True)
+        if full:
+            print_notices(result.notices, full=True)
         raise SystemExit(2)
     click.echo(f"Run plan ({juju_model})\n\nResources:")
-    print_resources(result.plan, verbose)
+    print_resources(result.plan, full)
     click.echo("\nFleet:")
-    print_fleet(result.plan, verbose)
+    print_fleet(result.plan, full)
     click.echo("\nSchedule:")
-    print_table(schedule_rows(config, schedule, verbose))
-    if verbose:
-        print_notices(result.notices, verbose=True)
+    print_table(schedule_rows(config, schedule, full))
+    if full:
+        print_notices(result.notices, full=True)
     click.echo()
     reply = request(
         {
@@ -334,11 +357,11 @@ def start(
         }
     )
     click.echo(f"Run {reply['run_id']} accepted.")
-    follow(str(reply["run_id"]), verbose=verbose)
+    follow(str(reply["run_id"]), full=full)
 
 
 def schedule_rows(
-    config: profiles.RunConfig, schedule: profiles.Schedule, verbose: bool = False
+    config: profiles.RunConfig, schedule: profiles.Schedule, full: bool = False
 ) -> list[list[str]]:
     """Warm-up and each workload's profile windows on the measured timeline."""
     fmt = profiles.format_duration
@@ -365,7 +388,7 @@ def schedule_rows(
                 f"{fmt(window.start_s)}-{end}  {name}",
             ]
         )
-    if verbose:
+    if full:
         rows.append(
             ["Timeout", f"{fmt(schedule.max_elapsed_s)} including setup and cleanup"]
         )
@@ -374,13 +397,13 @@ def schedule_rows(
 
 @run.command()
 @click.argument("run_id", required=False)
-@click.option("-v", "--verbose", is_flag=True, help="Show full result details.")
+@output_options
 @click.option(
     "--abandon-evidence",
     is_flag=True,
     help="Clean up even when evidence on an unreachable host or guest is lost.",
 )
-def stop(run_id: str | None, abandon_evidence: bool, verbose: bool) -> None:
+def stop(run_id: str | None, abandon_evidence: bool, full: bool) -> None:
     """Stop the active run, or finish cleanup of an interrupted one."""
     pending = run_state.unfinished()
     if pending is None:
@@ -398,14 +421,12 @@ def stop(run_id: str | None, abandon_evidence: bool, verbose: bool) -> None:
         click.echo(f"Error: {reply.get('error')}", err=True)
         raise SystemExit(2)
     click.echo(f"Stopping run {reply['run_id']}.")
-    follow(str(reply["run_id"]), pending.finalize_attempts, verbose)
+    follow(str(reply["run_id"]), pending.finalize_attempts, full)
 
 
 @run.command()
 @click.argument("run_id", required=False)
-@click.option(
-    "-v", "--verbose", is_flag=True, help="Show full fleet and result details."
-)
+@output_options
 @click.option("--json", "as_json", is_flag=True, help="Print the run result as JSON.")
 @click.option(
     "--html",
@@ -414,13 +435,14 @@ def stop(run_id: str | None, abandon_evidence: bool, verbose: bool) -> None:
     help="Write the run's HTML report to this file.",
 )
 def status(
-    run_id: str | None, as_json: bool, html_file: Path | None, verbose: bool
+    run_id: str | None, as_json: bool, html_file: Path | None, full: bool
 ) -> None:
     """Show the active run, or a retained run (the latest by default)."""
     if html_file and str(html_file.resolve()).startswith(("/tmp/", "/var/tmp/")):
         raise click.UsageError(
             "The snap has its own /tmp; write the report to your home directory."
         )
+    log.debug("Run: reading %s", run_id or "latest state")
     try:
         state = run_state.load(run_id) if run_id else next(iter(run_state.runs()), None)
     except FileNotFoundError:
@@ -445,7 +467,7 @@ def status(
         )
         return
     if state.code is not None or state.phase == "finished":
-        show_result(state, verbose)
+        show_result(state, full)
         return
     end = datetime.now(UTC)
     elapsed = int((end - state.created_at).total_seconds())
@@ -457,10 +479,10 @@ def status(
         ["Planned duration", profiles.format_duration(state.duration_s)],
         ["Elapsed", profiles.format_duration(elapsed)],
     ]
-    if verbose:
+    if full:
         rows.append(["Started", state.created_at.strftime("%Y-%m-%d %H:%M:%S UTC")])
     print_table(rows)
-    if verbose:
+    if full:
         click.echo("\nPlanned fleet:")
         print_fleet(state.plan)
     pending = run_state.outstanding(state.id)
