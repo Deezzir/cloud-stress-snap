@@ -51,6 +51,7 @@ def start_unit(
     snapd moves a snap app into its own cgroup scope, out of the unit's reach, so
     `timeout` bounds the command too and forwards the unit's stop signal to it.
     """
+    command = command.replace("$", "$$")
     sh(
         juju,
         where,

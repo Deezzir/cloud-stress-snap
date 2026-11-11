@@ -116,6 +116,7 @@ class Guest:
             f"timeout --kill-after=10 {max_s} bash -c {shlex.quote(command)}; "
             f"echo $? > {shlex.quote(rc_path)}"
         )
+        script = script.replace("$", "$$")
         self.run(
             f"systemd-run --unit {unit} --collect "
             f"--property RuntimeMaxSec={max_s + 30} --property KillMode=control-group "
