@@ -109,6 +109,8 @@ How values are computed:
 - fio values come from each job's logs, one value per logged interval, and
   from fio's result for each job over its own runtime. Per profile, the
   report lists the range of per-job IOPS, bandwidth and p99 latency.
+  fio versions without `job_start` have null per-job `start_s` and `end_s`;
+  their runtime, statistics and timestamped log samples are retained.
 - Missing samples, sample gaps, missing coverage at the start or end of the
   measured time, failed reads, counter resets and clock offsets above 2
   seconds are listed as gaps.

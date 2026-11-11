@@ -182,16 +182,17 @@ def parse_log(text: str) -> list[tuple[float, str, int]]:
 def results(text: str) -> list[dict[str, object]]:
     """Per-job results from fio's JSON output, in job order.
 
-    Each job has its error code, start (epoch seconds), runtime and, for each
-    direction with I/O, its IOPS, bandwidth (KiB/s) and p50/p99 latency (ms)
-    over the job's runtime.
+    Each job has its error code, runtime and, for each direction with I/O, its
+    IOPS, bandwidth (KiB/s) and p50/p99 latency (ms) over the job's runtime.
+    The start (epoch seconds) is None when fio does not report job_start.
     """
     data = json.loads(text[text.index("{") :])
     found = []
     for job in data["jobs"]:
+        started = job.get("job_start")
         item: dict[str, object] = {
             "error": job.get("error", 0),
-            "start": job["job_start"] / 1000,
+            "start": started / 1000 if started is not None else None,
             "runtime_s": job["job_runtime"] / 1000,
         }
         for direction in FIO_DIRECTIONS.values():

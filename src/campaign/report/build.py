@@ -387,17 +387,22 @@ def _range(values: list[float | None]) -> Row | None:
 
 
 def _job_result(job: Row, start: float) -> Row:
-    """One job's fio result with its runtime on the measured time axis."""
+    """One job's result, with absolute timing only when fio reports its start."""
     result = job["result"]
     if not isinstance(result, dict):
         return {"vm": job["vm"], "job": job["job"], "result": None}
-    begin = float(str(result["start"]))
+    begin = _num(result.get("start"))
     return {
         "vm": job["vm"],
         "job": job["job"],
         "error": result.get("error"),
-        "start_s": round(begin - start, 3),
-        "end_s": round(begin + float(str(result["runtime_s"])) - start, 3),
+        "runtime_s": result["runtime_s"],
+        "start_s": round(begin - start, 3) if begin is not None else None,
+        "end_s": (
+            round(begin + float(str(result["runtime_s"])) - start, 3)
+            if begin is not None
+            else None
+        ),
         **{d: result[d] for d in DIRECTIONS if d in result},
     }
 
