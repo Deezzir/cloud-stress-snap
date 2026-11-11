@@ -52,7 +52,7 @@ RECEIPT_MIN = 0.8
 # fio.
 PREFILL_JOBS = 4
 FIO_DIRECTIONS = {0: "read", 1: "write"}
-# fio averages each log entry over this period.
+# Requested fio log period; actual entry spacing can vary.
 FIO_LOG_MS = 1000
 # Time fio gets to stop after the end of its window before it is killed.
 FIO_STOP_GRACE_S = 30

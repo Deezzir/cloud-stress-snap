@@ -19,6 +19,7 @@ from constants import (
     FIO_LOG_MS,
     MAX_CLOCK_OFFSET_S,
     MAX_REPORT_FILE_BYTES,
+    SAMPLE_INTERVAL_S,
 )
 
 Row = dict[str, object]
@@ -287,7 +288,7 @@ def _counter_rows(
 
 
 class Interval(NamedTuple):
-    """One fio log entry: the value over (start, end], in epoch seconds."""
+    """One fio log entry with a conservative plotted span, in epoch seconds."""
 
     start: float
     end: float
@@ -297,26 +298,24 @@ class Interval(NamedTuple):
 
 def _intervals_from(
     entries: list[tuple[float, str, object]], job_start: float | None
-) -> tuple[list[Interval], int]:
-    """Turn fio log entries into intervals, and count missing entries.
+) -> list[Interval]:
+    """Turn fio log entries into intervals of at most FIO_LOG_MS each.
 
-    fio averages each entry over the FIO_LOG_MS before its timestamp, so an
-    entry covers at most that period, starting no earlier than the job or the
-    previous entry of its direction.
+    fio can delay entries or skip windows without new IO, so timestamp spacing
+    alone cannot establish lost entries. An entry is shown over
+    at most one log period, starting no earlier than the job or the previous
+    entry of its direction; longer spacing stays a break in the plot.
     """
     period = FIO_LOG_MS / 1000
     found: list[Interval] = []
     previous: dict[str, float] = {}
-    missing = 0
     for end, direction, value in sorted(entries, key=lambda e: e[0]):
         begin = previous.get(direction, job_start)
-        if begin is not None and end - begin > 1.5 * period:
-            missing += round((end - begin) / period) - 1
         if begin is None or end - begin > period:
             begin = end - period
         found.append(Interval(begin, end, direction, value))
         previous[direction] = end
-    return found, missing
+    return found
 
 
 def _fio_run(
@@ -362,14 +361,10 @@ def _fio_run(
             except (ValueError, IndexError):
                 gaps.append(f"{base}: unreadable {kind} log for job {number}")
                 continue
-            job[kind], missing = _intervals_from(
-                [(t, d, v) for t, d, v in entries], job_start
-            )
-            if missing:
-                gaps.append(
-                    f"{base}: about {missing} {kind} log entries missing "
-                    f"for job {number}"
-                )
+            if not entries:
+                gaps.append(f"{base}: empty {kind} log for job {number}")
+                continue
+            job[kind] = _intervals_from([(t, d, v) for t, d, v in entries], job_start)
         jobs.append(job)
     return info, jobs
 
@@ -546,9 +541,10 @@ def _collectors(
                 row["t"] = round(float(str(row["t"])) - start, 3)
             first = float(str(rows[0]["t"])) - float(str(rows[0]["interval_s"]))
             last = float(str(rows[-1]["t"]))
-            if first > 0:
+            cadence = SAMPLE_INTERVAL_S[name.split("-")[0]]
+            if first > cadence:
                 gaps.append(f"{name}: no samples in the first {first:.0f}s")
-            if last < end - start:
+            if end - start - last > cadence:
                 gaps.append(f"{name}: no samples in the last {end - start - last:.0f}s")
         metrics[name] = rows
     for item in evts:

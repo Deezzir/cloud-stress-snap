@@ -516,7 +516,8 @@ class Run:
             self.check_receivers()
         self.note("waiting for the workloads to finish")
         self.each(units, lambda unit: self.wait_guest_unit(*unit))
-        self.wait(max(end + DRAIN_S - time.time(), 0))
+        settle = max(DRAIN_S, *SAMPLE_INTERVAL_S.values())
+        self.wait(max(end + settle - time.time(), 0))
         self.check_receivers()
 
     def check_receivers(self) -> None:

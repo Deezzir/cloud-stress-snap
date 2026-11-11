@@ -111,9 +111,12 @@ How values are computed:
   report lists the range of per-job IOPS, bandwidth and p99 latency.
   fio versions without `job_start` have null per-job `start_s` and `end_s`;
   their runtime, statistics and timestamped log samples are retained.
-- Missing samples, sample gaps, missing coverage at the start or end of the
-  measured time, failed reads, counter resets and clock offsets above 2
-  seconds are listed as gaps.
+  fio can delay or skip log entries without new IO, so wider spacing alone is
+  not reported as lost data; each entry is plotted over at most one log period.
+- Missing samples, sample gaps, uncovered time at the start or end exceeding the
+  source's sample interval (host 5 s, Ceph 10 s, guest 1 s), failed reads,
+  counter resets and clock offsets above 2 seconds are listed as gaps. After
+  the measured time, the run keeps collecting for the slowest sample interval.
 
 Exit codes: `0` completed, `20` failed, interrupted or not cleaned up, `30`
 cancelled.
