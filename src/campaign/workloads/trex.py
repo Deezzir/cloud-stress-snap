@@ -25,10 +25,10 @@ def ip_packet_bytes(trex: TrexConfig, ip_version: int | None) -> int:
     return (40 if ip_version == 6 else 20) + 8 + trex.udp_payload_bytes
 
 
-def config(link: str, mac: str, mtu: int) -> str:
-    """TRex platform config: the guest's data interface through a Linux socket."""
+def config(link: str, mac: str) -> str:
+    """Use the guest's data interface with the AF_PACKET driver's default MTU."""
     octets = ",".join(f"0x{octet}" for octet in mac.split(":"))
-    return (FILES / "trex_cfg.yaml").read_text().format(link=link, mac=octets, mtu=mtu)
+    return (FILES / "trex_cfg.yaml").read_text().format(link=link, mac=octets)
 
 
 def server_command(directory: str) -> str:

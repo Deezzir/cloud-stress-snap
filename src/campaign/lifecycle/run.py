@@ -82,7 +82,6 @@ class Run:
         self.guests: dict[str, Guest] = {}
         self.links: dict[str, str] = {}
         self.devices: dict[str, str] = {}
-        self.mtus: dict[str, int] = {}
 
     def execute(self) -> None:
         """Run the configuration end to end; finalization always follows."""
@@ -246,14 +245,14 @@ class Run:
                 raise PreparationError(f"{target.name} has no interface {target.mac}")
             self.links[target.name] = link
             guest.run(f"ip link set {link} up")
-            self.mtus[target.name] = int(guest.run(f"cat /sys/class/net/{link}/mtu"))
+            mtu = int(guest.run(f"cat /sys/class/net/{link}/mtu"))
             trex_config = self.state.config.workloads.trex
             assert trex_config
             size = trex.ip_packet_bytes(trex_config, self.state.plan.ip_version)
-            if size > self.mtus[target.name]:
+            if size > mtu:
                 raise PreparationError(
                     f"{size}-byte TRex packets exceed the "
-                    f"{self.mtus[target.name]}-byte MTU of {link} in {target.name}"
+                    f"{mtu}-byte MTU of {link} in {target.name}"
                 )
         if target.role == "receiver":
             version = guest.run("nft --version || true").strip()
@@ -291,9 +290,7 @@ class Run:
         for path, text in (
             (
                 "trex_cfg.yaml",
-                trex.config(
-                    self.links[target.name], target.mac or "", self.mtus[target.name]
-                ),
+                trex.config(self.links[target.name], target.mac or ""),
             ),
             ("flood.py", trex.flood_script()),
         ):

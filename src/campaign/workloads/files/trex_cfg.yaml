@@ -1,3 +1,4 @@
+# Omit port_mtu: the AF_PACKET driver limit can be below the kernel interface MTU.
 - version: 2
   interfaces: ["{link}", "dummy"]
   port_info:
@@ -5,4 +6,3 @@
       dest_mac: [{mac}]
     - src_mac: [0x00,0x00,0x00,0x00,0x00,0x01]
       dest_mac: [0x00,0x00,0x00,0x00,0x00,0x02]
-  port_mtu: {mtu}
