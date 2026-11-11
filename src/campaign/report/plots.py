@@ -52,7 +52,8 @@ def _line(rows: list[Row], key: str, scale: float = 1.0) -> Line:
         start = t - interval
         if end is None or abs(start - end) > 0.25 * interval:
             if xs:
-                xs.append(xs[-1])
+                # steps-pre extends the next value backwards to this x.
+                xs.append(start)
                 ys.append(float("nan"))
             xs.append(start)
             ys.append(value * scale)
@@ -126,23 +127,31 @@ def _panel(
     lines = [item for item in lines if _has(item[1])]
     if not lines:
         return None
-    fig, ax = plt.subplots(figsize=(10, 3.2), dpi=100)
+    labels = sum(bool(label) for label, _, _ in lines)
+    legend_rows = (labels + 2) // 3
+    fig, ax = plt.subplots(figsize=(11, 3.8 + 0.25 * legend_rows), dpi=150)
     for label, (xs, ys), style in lines:
         # Each value covers the interval that ends at its time.
         style = {"drawstyle": "steps-pre", **style}
         ax.plot(xs, ys, label=label, **style)  # type: ignore[arg-type]
     _markers(ax, result)
     ax.set_xlim(0, duration)
-    ax.set_title(title, fontsize=10, loc="left")
-    ax.set_xlabel("measured time (s)", fontsize=8)
-    ax.tick_params(labelsize=8)
+    ax.set_title(title, fontsize=11, loc="left")
+    ax.set_xlabel("measured time (s)", fontsize=9)
+    ax.tick_params(labelsize=9)
     ax.grid(True, linewidth=0.3)
     if log:
         ax.set_yscale("log")
-    if any(label for label, _, _ in lines):
-        ax.legend(fontsize=7, loc="upper left", bbox_to_anchor=(1.0, 1.0))
+    if labels:
+        ax.legend(
+            fontsize=8,
+            loc="upper center",
+            bbox_to_anchor=(0.5, -0.2),
+            ncols=min(labels, 3),
+            frameon=False,
+        )
     fig.tight_layout()
-    fig.savefig(out / f"{slug}.png")
+    fig.savefig(out / f"{slug}.png", bbox_inches="tight")
     plt.close(fig)
     return {"title": title, "file": f"{slug}.png"}
 
@@ -301,11 +310,22 @@ def render(
             "drops",
             "Drops (packets/s): host links, guest taps, guest NICs, OVS lost upcalls",
             [
-                (f"{name} {key.removesuffix('_per_s')}", _line(rows, key), {})
-                for name, rows in {**hosts, **guests}.items()
-                for key in sorted({k for r in rows for k in r})
-                if key.endswith(("rx_dropped_per_s", "tx_dropped_per_s"))
-                or key == "ovs.lost_per_s"
+                series
+                for label, sources, color in (
+                    ("host link/tap or OVS counter", hosts, "tab:blue"),
+                    ("guest NIC counter", guests, "tab:orange"),
+                )
+                for series in _labelled(
+                    label,
+                    [
+                        _line(rows, key)
+                        for rows in sources.values()
+                        for key in sorted({k for r in rows for k in r})
+                        if key.endswith(("rx_dropped_per_s", "tx_dropped_per_s"))
+                        or key == "ovs.lost_per_s"
+                    ],
+                    {"color": color, **PLOT_FAINT},
+                )
             ],
             False,
         ),
