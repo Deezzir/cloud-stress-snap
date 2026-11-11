@@ -18,9 +18,9 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from campaign.model.profiles import Schedule
+from campaign.model.profiles import RunConfig, Schedule
 from campaign.model.target import Target
-from probe.models import Profile, RunPlan
+from probe.models import RunPlan
 
 STATE_ROOT = Path(os.environ.get("SNAP_COMMON", ".scratch/state"))
 RUNS = STATE_ROOT / "runs"
@@ -40,17 +40,18 @@ class RunState(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: str
-    profile: Profile
     duration_s: int
     model: str
     cloud: str
+    config: RunConfig
     plan: RunPlan
     schedule: Schedule
-    target: Target | None = None
+    targets: list[Target] = Field(default_factory=list)
     owner_uid: int
     phase: Phase = "accepted"
     detail: str | None = None
     cancel_requested: bool = False
+    warmup_start: datetime | None = None
     measured_start: datetime | None = None
     execution: Execution | None = None
     finalization: Finalization | None = None
@@ -237,6 +238,7 @@ def create(
     *,
     model: str,
     cloud: str,
+    config: RunConfig,
     plan: RunPlan,
     schedule: Schedule,
     owner_uid: int,
@@ -249,10 +251,10 @@ def create(
     created = now()
     state = RunState(
         id=str(uuid.uuid4()),
-        profile=schedule.profile,
         duration_s=schedule.duration_s,
         model=model,
         cloud=cloud,
+        config=config,
         plan=plan,
         schedule=schedule,
         owner_uid=owner_uid,

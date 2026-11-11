@@ -12,12 +12,16 @@ class Record(BaseModel):
 
 
 class Host(Record):
-    """Nova hypervisor identity and Placement scheduler inventory totals."""
+    """Nova hypervisor identity, Placement inventory totals and what is left."""
 
     id: str
     hostname: str | None
     vcpus: int | None
     memory_mb: int | None
+    vcpus_free: int | None = None
+    memory_mb_free: int | None = None
+    vcpus_max_unit: int | None = None
+    memory_mb_max_unit: int | None = None
     host_ip: str | None = None
     state: str | None = None
     status: str | None = None
@@ -327,42 +331,70 @@ class OvsHost(Record):
     physnets: dict[str, str] = Field(default_factory=dict)
 
 
-Profile = Literal["host-network", "ceph-block", "network-ceph"]
+Workload = Literal["trex", "fio"]
 
 
-class ProfileReadiness(Record):
-    """Whether existing foundations allow a profile, and what blocks it."""
+class WorkloadReadiness(Record):
+    """Whether discovered resources allow a workload, and what blocks it."""
 
-    profile: Profile
+    workload: Workload
     ready: bool
     blockers: list[str] = Field(default_factory=list)
 
 
-class RunPlan(Record):
-    """Placement a run would use, resolved from live facts."""
+class HostPlan(Record):
+    """One hypervisor in the run's fleet."""
 
-    sender: str | None = None
-    sender_link: str | None = None
-    target: str | None = None
+    name: str
+    hypervisor: str
+    machine: str
+    architecture: str
+    vms: int
+    focus: bool = False
+    link: str | None = None
+    ovs_unit: str | None = None
+    datapath: str | None = None
+    hw_offload: bool | None = None
+
+
+class VmPlan(Record):
+    """One VM of the fleet, its host, image and network role."""
+
+    name: str
+    host: str
+    image: str
+    image_id: str
+    role: Literal["sender", "receiver"] | None = None
+
+
+class Connection(Record):
+    """Traffic from a sender VM to a receiver VM: a share of the sender's rate."""
+
+    sender: str
+    receiver: str
+    share: float
+
+
+class RunPlan(Record):
+    """Resources and fleet a run would use, resolved from live facts."""
+
     network: str | None = None
-    vlan: int | None = None
-    ip_version: Literal[4, 6] | None = None
-    image: str | None = None
-    flavor: str | None = None
-    volume_type: str | None = None
-    sender_machine: str | None = None
-    target_machine: str | None = None
-    target_hypervisor: str | None = None
-    target_link: str | None = None
-    target_ovs_unit: str | None = None
-    target_datapath: str | None = None
-    target_hw_offload: bool | None = None
     network_id: str | None = None
+    vlan: int | None = None
+    mtu: int | None = None
+    ip_version: Literal[4, 6] | None = None
     mgmt_network: str | None = None
     mgmt_network_id: str | None = None
-    image_id: str | None = None
+    images: dict[str, str] = Field(default_factory=dict)
+    image_ids: dict[str, str] = Field(default_factory=dict)
+    flavor: str | None = None
     flavor_id: str | None = None
+    volume_type: str | None = None
     ceph_mon: str | None = None
+    focus: str | None = None
+    hosts: list[HostPlan] = Field(default_factory=list)
+    vms: list[VmPlan] = Field(default_factory=list)
+    connections: list[Connection] = Field(default_factory=list)
 
 
 class CheckResult(Record):
@@ -376,6 +408,6 @@ class CheckResult(Record):
     infra: InfraResult
     ceph: CephResult
     ovs: list[OvsHost] = Field(default_factory=list)
-    readiness: list[ProfileReadiness] = Field(default_factory=list)
+    readiness: list[WorkloadReadiness] = Field(default_factory=list)
     plan: RunPlan = Field(default_factory=RunPlan)
     notices: list[ProbeNotice]

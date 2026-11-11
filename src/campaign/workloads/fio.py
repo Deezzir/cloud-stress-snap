@@ -1,96 +1,150 @@
-"""fio on the run-owned Cinder volume inside the target guest."""
+"""fio on each VM's run-owned Cinder volume: device check, prefill, jobs and logs."""
 
 import json
 import shlex
+from importlib import resources
 
-from campaign.model.profiles import FioCell
+from campaign.model.profiles import FioConfig, FioProfile
 from campaign.transport.guest import Guest
+from constants import (
+    FIO_DEADLINE_EXIT_CODES,
+    FIO_DIRECTIONS,
+    FIO_LOG_MS,
+    FIO_PLAT_BITS,
+    FIO_PLAT_VAL,
+    FIO_STOP_GRACE_S,
+    PREFILL_JOBS,
+)
 
-NUMJOBS = 2
-# fio latency histogram layout (FIO_IO_U_PLAT_BITS/VAL); bins are in ns.
-PLAT_BITS, PLAT_VAL = 6, 64
+GIB = 1024**3
+
+RUNNER = (resources.files("campaign.workloads") / "files" / "fio_run.py").read_text()
 
 
-def find_device(guest: Guest, volume_id: str, size_gb: int) -> tuple[str | None, str]:
+def find_device(guest: Guest, volume_id: str, fio: FioConfig) -> tuple[str | None, str]:
     """Resolve the run's volume in the guest, or say why it is not safe to use."""
     link = f"/dev/disk/by-id/virtio-{volume_id[:20]}"
     out = guest.run(
         f"test -e {link} || exit 0; dev=$(readlink -f {link}); echo $dev; "
-        "blockdev --getsize64 $dev; lsblk -nr -o NAME $dev | wc -l; "
+        "blockdev --getsize64 $dev; blockdev --getss $dev; "
+        "lsblk -nr -o NAME $dev | wc -l; "
         "lsblk -ndo PKNAME $(findmnt -nvo SOURCE /)"
     ).split()
     if not out:
         return None, f"the volume is not visible in the guest at {link}"
-    device, size, nodes = out[0], int(out[1]), int(out[2])
-    if out[3:] and device == f"/dev/{out[3]}":
+    device, size, sector, nodes = out[0], int(out[1]), int(out[2]), int(out[3])
+    size_gib = fio.volume_size_gib
+    if out[4:] and device == f"/dev/{out[4]}":
         return None, f"{device} is the guest's root disk"
-    if size != size_gb * 1024**3:
-        return None, f"{device} is {size} bytes, not {size_gb} GiB"
+    if size != size_gib * GIB:
+        return None, f"{device} is {size} bytes, not {size_gib} GiB"
     if nodes != 1:
         return None, f"{device} has partitions"
+    for profile in fio.profiles:
+        if profile.block_bytes % sector:
+            return None, (
+                f"{profile.name}: bs {profile.bs} is not a multiple of the "
+                f"{sector}-byte sectors of {device}, required for direct I/O"
+            )
     return device, ""
 
 
-def prefill_command(device: str, out_dir: str) -> str:
-    """Sequentially write the whole device once before measured reads."""
-    return (
-        f"mkdir -p {out_dir} && fio --name=prefill --filename={device} "
-        "--ioengine=libaio --direct=1 --rw=write --bs=1m --iodepth=32 "
-        f"--output-format=json --output={out_dir}/prefill.json"
+def prefill_job(device: str, size_gib: int) -> str:
+    """Write the whole device once with four writers on disjoint quarters."""
+    region = size_gib * GIB // PREFILL_JOBS
+    return "\n".join(
+        [
+            "[global]",
+            "ioengine=libaio",
+            "direct=1",
+            f"filename={device}",
+            "rw=write",
+            "bs=1M",
+            "iodepth=64",
+            f"numjobs={PREFILL_JOBS}",
+            f"size={region}",
+            f"offset_increment={region}",
+            "[prefill]",
+            "",
+        ]
     )
 
 
-def job_file(cell: FioCell, device: str, size_gb: int, rate_iops: int | None) -> str:
-    """io-kitchen-style libaio job: direct I/O, nonoverlapping regions per job."""
-    region = size_gb * 1024 // NUMJOBS
+def prefill_command(job: str, out_dir: str) -> str:
+    """Write the prefill job and run it with a JSON result."""
+    return (
+        f"mkdir -p {out_dir} && printf %s {shlex.quote(job)} > {out_dir}/prefill.fio"
+        f" && fio {out_dir}/prefill.fio --output-format=json "
+        f"--output={out_dir}/prefill.json"
+    )
+
+
+def prefill_complete(text: str, size_gib: int) -> bool:
+    """Whether the prefill writers wrote the whole volume without errors."""
+    data = json.loads(text[text.index("{") :])
+    jobs = data.get("jobs", [])
+    return (
+        len(jobs) == PREFILL_JOBS
+        and not any(job.get("error") for job in jobs)
+        and sum(job["write"]["io_bytes"] for job in jobs) >= size_gib * GIB
+    )
+
+
+def job_file(profile: FioProfile, fio: FioConfig, device: str) -> str:
+    """Time-based libaio job; fio reads the runtime from $RUNTIME at start.
+
+    One job covers the whole device; several jobs get equal, disjoint regions
+    aligned to 1 MiB.
+    """
     lines = [
         "[global]",
         "ioengine=libaio",
         "direct=1",
         f"filename={device}",
-        f"rw={cell.rw}",
-        f"bs={cell.bs}",
-        f"iodepth={cell.iodepth}",
-        f"numjobs={NUMJOBS}",
-        f"size={region}m",
-        f"offset_increment={region}m",
+        f"rw={profile.rw}",
+        f"bs={profile.bs}",
+        f"iodepth={profile.iodepth}",
+        f"numjobs={fio.numjobs}",
         "time_based=1",
-        f"runtime={cell.length_s}",
-        "log_avg_msec=1000",
-        "log_hist_msec=1000",
+        "runtime=${RUNTIME}",
+        f"log_avg_msec={FIO_LOG_MS}",
+        f"log_hist_msec={FIO_LOG_MS}",
         "log_hist_coarseness=0",
+        "log_unix_epoch=1",
         "per_job_logs=1",
     ]
-    if cell.rwmixread is not None:
-        lines.append(f"rwmixread={cell.rwmixread}")
-    if rate_iops:
-        per_job = max(rate_iops // NUMJOBS, 1)
-        if cell.rwmixread is not None:
-            reads = per_job * cell.rwmixread // 100
-            lines.append(f"rate_iops={reads},{per_job - reads}")
-        else:
-            lines.append(f"rate_iops={per_job}")
-    return "\n".join([*lines, f"[{cell.label}]", ""])
+    if fio.numjobs > 1:
+        region = fio.region_bytes
+        lines += [f"size={region}", f"offset_increment={region}"]
+    if profile.rwmixread is not None:
+        lines.append(f"rwmixread={profile.rwmixread}")
+    return "\n".join([*lines, f"[{profile.name}]", ""])
 
 
-def run_command(cell: FioCell, job: str, out_dir: str) -> str:
-    """Write the job and run fio with JSON, IOPS and latency-histogram logs."""
-    base = f"{out_dir}/{cell.label}"
+def run_command(jobs: list[dict[str, object]], out_dir: str) -> str:
+    """Run jobs in order, each from its start until its end time (epoch seconds).
+
+    Each job is a dict with name, file (job text), numjobs, start and end.
+    """
+    args = {
+        "out": out_dir,
+        "jobs": jobs,
+        "grace_s": FIO_STOP_GRACE_S,
+        "deadline_exit_codes": FIO_DEADLINE_EXIT_CODES,
+    }
     return (
-        f"mkdir -p {out_dir} && printf %s {shlex.quote(job)} > {base}.fio && "
-        f"date +%s.%N > {base}.start && "
-        f"fio {base}.fio --output-format=json --output={base}.json "
-        f"--write_iops_log={base} --write_hist_log={base}"
+        f"mkdir -p {out_dir} && printf %s {shlex.quote(RUNNER)} > {out_dir}/run.py"
+        f" && python3 {out_dir}/run.py {shlex.quote(json.dumps(args))}"
     )
 
 
 def bin_value_ns(index: int) -> float:
     """Latency represented by a fio histogram bin."""
-    if index < PLAT_VAL << 1:
+    if index < FIO_PLAT_VAL << 1:
         return float(index)
-    error_bits = (index >> PLAT_BITS) - 1
-    base = 1 << (error_bits + PLAT_BITS)
-    return base + (index % PLAT_VAL + 0.5) * (1 << error_bits)
+    error_bits = (index >> FIO_PLAT_BITS) - 1
+    base = 1 << (error_bits + FIO_PLAT_BITS)
+    return base + (index % FIO_PLAT_VAL + 0.5) * (1 << error_bits)
 
 
 def percentile(bins: list[int], fraction: float) -> float | None:
@@ -106,55 +160,55 @@ def percentile(bins: list[int], fraction: float) -> float | None:
     return bin_value_ns(len(bins) - 1) / 1e6
 
 
-def add_histograms(total: list[int] | None, bins: list[int]) -> list[int]:
-    """Bin-wise sum of two latency histograms; an empty total takes `bins`."""
-    return [a + b for a, b in zip(total, bins, strict=False)] if total else bins
+def parse_hist(text: str) -> list[tuple[float, str, list[int]]]:
+    """(epoch seconds, direction, bins) per interval of a fio hist log."""
+    return [
+        (fields[0] / 1000, FIO_DIRECTIONS.get(fields[1], str(fields[1])), fields[3:])
+        for fields in ([int(f) for f in line.split(",")] for line in text.splitlines())
+    ]
 
 
-def parse_hist(text: str) -> dict[int, list[int]]:
-    """Per-second histogram from a fio hist log: {second: bins}."""
-    seconds: dict[int, list[int]] = {}
+def parse_log(text: str) -> list[tuple[float, str, int]]:
+    """(epoch seconds, direction, value) per interval of a fio IOPS or bw log."""
+    found = []
     for line in text.splitlines():
         fields = [int(f) for f in line.split(",")]
-        bins = fields[3:]
-        second = fields[0] // 1000
-        seconds[second] = add_histograms(seconds.get(second), bins)
-    return seconds
+        found.append(
+            (fields[0] / 1000, FIO_DIRECTIONS.get(fields[2], str(fields[2])), fields[1])
+        )
+    return found
 
 
-def parse_iops(text: str) -> dict[int, int]:
-    """Completed I/Os per second from a fio IOPS log."""
-    seconds: dict[int, int] = {}
-    for line in text.splitlines():
-        fields = line.split(",")
-        second = int(fields[0]) // 1000
-        seconds[second] = seconds.get(second, 0) + int(fields[1])
-    return seconds
+def results(text: str) -> list[dict[str, object]]:
+    """Per-job results from fio's JSON output, in job order.
 
-
-def prefill_complete(text: str, size_gb: int) -> bool:
-    """Whether the prefill job wrote the whole volume without errors."""
+    Each job has its error code, start (epoch seconds), runtime and, for each
+    direction with I/O, its IOPS, bandwidth (KiB/s) and p50/p99 latency (ms)
+    over the job's runtime.
+    """
     data = json.loads(text[text.index("{") :])
-    jobs = data.get("jobs", [])
-    return (
-        len(jobs) == 1
-        and not jobs[0].get("error")
-        and jobs[0]["write"]["io_bytes"] >= size_gb * 1024**3
-    )
+    found = []
+    for job in data["jobs"]:
+        item: dict[str, object] = {
+            "error": job.get("error", 0),
+            "start": job["job_start"] / 1000,
+            "runtime_s": job["job_runtime"] / 1000,
+        }
+        for direction in FIO_DIRECTIONS.values():
+            stats = job[direction]
+            if not stats["total_ios"]:
+                continue
+            percentiles = stats.get("clat_ns", {}).get("percentile", {})
+            item[direction] = {
+                "ios": stats["total_ios"],
+                "iops": stats["iops"],
+                "bw_kib_s": stats["bw"],
+                "p50_ms": _ns_ms(percentiles.get("50.000000")),
+                "p99_ms": _ns_ms(percentiles.get("99.000000")),
+            }
+        found.append(item)
+    return found
 
 
-def summary(text: str) -> dict[str, object]:
-    """Check every fio job finished cleanly; keep totals and errors."""
-    data = json.loads(text[text.index("{") :])
-    jobs = data.get("jobs", [])
-    errors = [job["jobname"] for job in jobs if job.get("error")]
-    total_ios = sum(job[d]["total_ios"] for job in jobs for d in ("read", "write"))
-    iops = sum(job[d]["iops"] for job in jobs for d in ("read", "write"))
-    return {
-        "version": data.get("fio version"),
-        "jobs": len(jobs),
-        "failed_jobs": errors,
-        "total_ios": total_ios,
-        "iops": round(iops, 1),
-        "complete": len(jobs) == NUMJOBS and not errors,
-    }
+def _ns_ms(value: object) -> float | None:
+    return value / 1e6 if isinstance(value, int | float) else None

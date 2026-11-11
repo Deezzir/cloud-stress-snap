@@ -13,6 +13,7 @@ requires-python = ">=3.12,<3.13"
 dependencies = [
     "click>=8.1,<9",
     "jubilant>=1.14,<2",
+    "matplotlib>=3.10,<4",
     "openstacksdk>=4.0,<5",
     "pydantic>=2.14.1,<3",
     "PyYAML>=6.0.3,<7",
@@ -36,11 +37,14 @@ required-version = ">=0.12,<0.14"
 default-groups = []
 
 [tool.hatch.build.targets.wheel]
-only-include = ["src/cloud_stress.py", "src/probe", "src/campaign"]
+only-include = ["src/cloud_stress.py", "src/constants.py", "src/probe", "src/campaign"]
 sources = ["src"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"config.yaml" = "campaign/config.yaml"
+
 [tool.hatch.build.targets.sdist]
-include = ["/src", "/snap", "/docs", "/README.md", "/LICENSE", "/CONTRIBUTING.md", "/SECURITY.md", "/pyproject.toml", "/tox.ini", "/uv.lock"]
+include = ["/src", "/config.yaml", "/snap", "/docs", "/README.md", "/LICENSE", "/CONTRIBUTING.md", "/SECURITY.md", "/pyproject.toml", "/tox.ini", "/uv.lock"]
 
 [tool.ruff]
 target-version = "py312"

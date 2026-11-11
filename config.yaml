@@ -1,0 +1,60 @@
+# cloud-stress run configuration. Reference: docs/configuration.md
+#
+# Copy this file into your home directory, edit it, then start a run:
+#   cloud-stress run start --config ~/stress.yaml
+#
+# Omit a workload section to disable that workload. Settings omitted from an
+# enabled section take the values shown here; a profiles list replaces the
+# default list as a whole.
+
+# Total measured time. Each workload divides it equally among its own profiles.
+duration: 10m
+
+placement:
+  # Total VM count, spread automatically. With trex, half of the VMs (rounded
+  # up) run on the focus host and the rest are spread over the other hosts.
+  vms: 4
+  # Or exact counts per Nova hypervisor, instead of vms:
+  # hosts:
+  #   node-a: 2
+  #   node-b: 2
+  # Hypervisor architectures to use; [] removes the filter.
+  architectures: [amd64]
+
+workloads:
+  # UDP traffic between guests, sent with TRex.
+  trex:
+    # fan-in: VMs on the other hosts send to VMs on the focus host.
+    # fan-out: VMs on the focus host send to VMs on the other hosts.
+    mode: fan-in
+    # Hypervisor to focus on; chosen automatically when omitted.
+    # focus_host: node-a
+    udp_payload_bytes: 18
+    udp_dst_port: 33434
+    udp_src_ports: [1024, 65535]
+    profiles:
+      # Total rate of each sender, shared among its receivers.
+      - pps_per_sender: 100000
+
+  # fio on one Ceph-backed Cinder volume per VM, written in full before use.
+  fio:
+    volume_size_gib: 100
+    # Jobs per VM; more than one splits the volume into separate regions.
+    numjobs: 1
+    profiles:
+      - name: 4k-random-read
+        rw: randread
+        bs: 4k
+        iodepth: 4
+      - name: 4k-random-write
+        rw: randwrite
+        bs: 4k
+        iodepth: 4
+      - name: 1m-random-read
+        rw: randread
+        bs: 1M
+        iodepth: 64
+      - name: 1m-random-write
+        rw: randwrite
+        bs: 1M
+        iodepth: 64

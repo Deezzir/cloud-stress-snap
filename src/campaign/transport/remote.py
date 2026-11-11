@@ -6,11 +6,10 @@ import shlex
 
 import jubilant
 
-EXEC_TIMEOUT = 120
-MAX_FETCH = 64 * 1024 * 1024
+from constants import EXEC_TIMEOUT_S, MAX_FETCH_BYTES
 
 
-def sh(juju: jubilant.Juju, where: str, script: str, wait: int = EXEC_TIMEOUT) -> str:
+def sh(juju: jubilant.Juju, where: str, script: str, wait: int = EXEC_TIMEOUT_S) -> str:
     """Run a shell script as root on a machine or unit and return stdout."""
     command = f"bash -c {shlex.quote(script)}"
     if "/" in where:
@@ -36,8 +35,10 @@ def fetch(juju: jubilant.Juju, where: str, path: str) -> str | None:
     size = sh(juju, where, f"stat -c %s {quoted} 2>/dev/null || true").strip()
     if not size:
         return None
-    if int(size) > MAX_FETCH:
-        raise ValueError(f"{path} is {size} bytes, over the {MAX_FETCH} byte limit")
+    if int(size) > MAX_FETCH_BYTES:
+        raise ValueError(
+            f"{path} is {size} bytes, over the {MAX_FETCH_BYTES} byte limit"
+        )
     out = sh(juju, where, f"gzip -c {quoted} | base64 -w0", wait=300).strip()
     return gzip.decompress(base64.b64decode(out)).decode(errors="replace")
 

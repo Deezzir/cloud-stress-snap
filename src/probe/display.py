@@ -16,11 +16,9 @@ from probe.models import (
     JujuResult,
     MaasResult,
     ProbeNotice,
-    Profile,
-    ProfileReadiness,
     RunPlan,
+    WorkloadReadiness,
 )
-from probe.plan import PROFILE_NEEDS
 
 
 def print_ovs(result: CheckResult) -> None:
@@ -45,48 +43,55 @@ def print_ovs(result: CheckResult) -> None:
     print_table(rows)
 
 
-def print_readiness(readiness: list[ProfileReadiness], plan: RunPlan) -> None:
-    """Print each profile's status and the placement a run would use."""
+def print_readiness(readiness: list[WorkloadReadiness], plan: RunPlan) -> None:
+    """Print each workload's status and the resources a run would use."""
     if not readiness:
         return
-    click.echo("\nProfiles:")
-    rows = [["PROFILE", "STATUS"]]
+    click.echo("\nWorkloads:")
+    rows = [["WORKLOAD", "STATUS"]]
     for item in readiness:
         status = "ready" if item.ready else "blocked: " + ", ".join(item.blockers)
-        rows.append([item.profile, status])
+        rows.append([item.workload, status])
     print_table(rows)
     if any(item.ready for item in readiness):
-        click.echo("\nRun plan:")
-        print_plan(plan)
+        click.echo("\nResources:")
+        print_resources(plan)
 
 
-def print_plan(plan: RunPlan, profile: Profile | None = None) -> None:
-    """Print the placement of a run; with a profile, only what it uses."""
-    needs = PROFILE_NEEDS[profile] if profile else None
+def print_resources(plan: RunPlan) -> None:
+    """Print the networks, images, flavor and volume type of a run."""
     network = plan.network
     if network:
         network += f", VLAN {plan.vlan}" if plan.vlan else ""
         network += f", IPv{plan.ip_version}" if plan.ip_version else ""
-    guest = ", ".join(x for x in (plan.flavor, plan.image) if x)
+    images = ", ".join(f"{name} ({arch})" for arch, name in plan.images.items())
     rows = [
-        (
-            "sender",
-            "Sender",
-            f"{plan.sender} ({plan.sender_link})" if plan.sender else None,
-        ),
-        ("target", "Target", plan.target),
-        ("network", "Network", network),
-        ("mgmt_network", "Management", plan.mgmt_network),
-        ("image", "Guest", guest),
-        ("volume_type", "Volume type", plan.volume_type),
+        ["Network", network or "-"],
+        ["Management", plan.mgmt_network or "-"],
+        ["Images", images or "-"],
+        ["Flavor", plan.flavor or "-"],
+        ["Volume type", plan.volume_type or "-"],
     ]
-    print_table(
-        [
-            [label, value or "-"]
-            for need, label, value in rows
-            if needs is None or need in needs
-        ]
-    )
+    print_table(rows)
+
+
+def print_fleet(plan: RunPlan) -> None:
+    """Print the fleet's hosts, VM counts and network roles."""
+    rows = [["HOST", "ARCH", "VMS", "ROLE", "LINK"]]
+    for host in plan.hosts:
+        roles = sorted({vm.role or "-" for vm in plan.vms if vm.host == host.name})
+        name = host.name + (" (focus)" if host.focus else "")
+        rows.append(
+            [name, host.architecture, str(host.vms), ", ".join(roles), host.link or "-"]
+        )
+    print_table(rows)
+    if plan.connections:
+        senders = {c.sender for c in plan.connections}
+        receivers = {c.receiver for c in plan.connections}
+        click.echo(
+            f"  {len(plan.connections)} connections from {len(senders)} senders "
+            f"to {len(receivers)} receivers"
+        )
 
 
 def print_table(rows: list[list[str]]) -> None:

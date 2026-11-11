@@ -1,8 +1,6 @@
-"""Human summary of a run result: aligned tables, no verdict.
+"""Human summary of a run result: aligned tables of what was measured."""
 
-The report states what was measured; the operator compares it with their SLOs.
-"""
-
+from datetime import UTC, datetime
 from typing import cast
 
 Row = dict[str, object]
@@ -41,188 +39,152 @@ def _list(value: object) -> list[Row]:
     return [v for v in value if isinstance(v, dict)] if isinstance(value, list) else []
 
 
-def _dicts(value: object) -> dict[str, Row]:
-    """Dict-valued entries of value when it is a dict."""
-    return {k: v for k, v in _dict(value).items() if isinstance(v, dict)}
+def _window(item: Row) -> str:
+    return f"{_fmt(item.get('start_s'))}-{_fmt(item.get('end_s'))}s"
 
 
-def _pct(value: object, digits: int = 0) -> str:
-    """Fraction as a percentage."""
-    return f"{value:.{digits}%}" if isinstance(value, int | float) else "-"
-
-
-def ceiling(steps: list[Row]) -> str | None:
-    """Plain sentence when TRex delivered less than requested at the top step."""
-    if not steps:
-        return None
-    top = steps[-1]
-    requested, sent = top.get("requested_pps"), top.get("tx_pps")
-    if not isinstance(requested, int | float) or not isinstance(sent, int | float):
-        return None
-    if sent >= 0.95 * requested:
-        return None
-    return (
-        f"TRex delivered {sent:,.0f} of {requested:,.0f} pps at the top step "
-        f"({sent / requested:.0%}); the target was not measured above "
-        f"{sent:,.0f} pps."
-    )
-
-
-def _placement(result: dict[str, object]) -> list[list[object]]:
-    """Where the run ran, one readable row per participant."""
-    p = _dict(result.get("placement"))
-    run = _dict(result.get("run"))
-    datapath = _dict(result.get("datapath"))
-    trex = _dict(result.get("tools")).get("trex")
-    floods = bool(_dict(result.get("sender")).get("planned_pps"))
-
-    def join(*parts: object) -> str | None:
-        text = ", ".join(str(x) for x in parts if x)
-        return text or None
-
-    def link(host: object, iface: object) -> str | None:
-        return f"{host} ({iface})" if host and iface else join(host)
-
-    offload = "offload on" if datapath.get("hw_offload") else "offload off"
-    family = f"IPv{p['ip_version']}" if p.get("ip_version") else None
-    volume = p.get("volume_size_gb")
-    rows: list[list[object]] = [
-        [
-            "Sender",
-            floods
-            and join(
-                link(p.get("sender"), p.get("sender_link")), trex and f"TRex {trex}"
-            ),
-        ],
-        [
-            "Target",
-            join(
-                link(p.get("target"), p.get("target_link")),
-                datapath.get("kind") and f"{datapath['kind']} datapath",
-                datapath and offload,
-            ),
-        ],
-        [
-            "Network",
-            join(
-                p.get("network"),
-                p.get("vlan") and f"VLAN {p['vlan']}",
-                family,
-                p.get("address"),
-            ),
-        ],
-        ["Management", join(p.get("mgmt_network"), p.get("mgmt_address"))],
-        ["Guest", join(p.get("flavor"), p.get("image"))],
-        [
-            "Volume",
-            join(p.get("volume_type"), volume and f"{volume} GB")
-            if p.get("volume_id")
-            else None,
-        ],
-        ["Model", run.get("model")],
+def _fleet_lines(result: Row) -> list[str]:
+    """Hosts, VM counts and roles."""
+    fleet = _dict(result.get("fleet"))
+    vms = _list(fleet.get("vms"))
+    rows: list[list[object]] = [["HOST", "ARCH", "VMS", "ROLES"]]
+    for host in _list(fleet.get("hosts")):
+        roles = sorted(
+            {
+                str(v.get("role") or "-")
+                for v in vms
+                if v.get("host") == host.get("name")
+            }
+        )
+        name = f"{host.get('name')}{' (focus)' if host.get('focus') else ''}"
+        rows.append([name, host.get("architecture"), host.get("vms"), ", ".join(roles)])
+    lines = ["", "Fleet:", *_table(rows)] if len(rows) > 1 else []
+    resources = [
+        ["Network", fleet.get("network")],
+        ["Management", fleet.get("mgmt_network")],
+        ["Flavor", fleet.get("flavor")],
+        ["Volume type", fleet.get("volume_type")],
     ]
-    return [row for row in rows if row[1]]
+    lines += _table([row for row in resources if row[1]])
+    return lines
 
 
-def _network_lines(result: dict[str, object]) -> list[str]:
-    """Sender steps against target receipt, and the receipt check."""
-    lines: list[str] = []
-    sender = _dict(result.get("sender"))
-    target = _dict(result.get("target"))
-    sent = {s.get("step"): s for s in _list(sender.get("steps"))}
-    received = _list(target.get("steps"))
-    if sent:
-        rows: list[list[object]] = [
-            ["STEP", "REQUESTED", "SENT", "DELIVERED", "RECEIVED", "LOSS"]
-        ]
-        for step in received or [{"step": k} for k in sent]:
-            s = sent.get(step.get("step"), {})
-            rows.append(
-                [
-                    step.get("step"),
-                    s.get("requested_pps"),
-                    s.get("tx_pps"),
-                    _pct(s.get("delivered")),
-                    step.get("rx_pps"),
-                    _pct(step.get("loss"), 1),
-                ]
-            )
-        lines += ["", "Network load (pps, sender to target):", *_table(rows)]
-        note = ceiling(list(sent.values()))
-        if note:
-            lines.append(f"  {note}")
-    receipt = _dict(target.get("receipt"))
-    if receipt:
-        if not sent:
-            lines += ["", "Network load:"]
+def _timeline_lines(result: Row) -> list[str]:
+    """When the measured time started and how far workers started from schedule."""
+    timeline = _dict(result.get("timeline"))
+    start = timeline.get("measured_start")
+    if not isinstance(start, int | float):
+        return []
+    when = datetime.fromtimestamp(start, UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+    lines = [
+        "",
+        f"Measured from {when}, after a {_fmt(timeline.get('warmup_s'))}s warm-up.",
+    ]
+    steps = _dict(_dict(result.get("network")).get("step_starts"))
+    for step, item in steps.items():
+        if step == "0":
+            continue
+        first, last = _dict(item).get("first"), _dict(item).get("last")
         lines.append(
-            f"  receipt check: target received {_pct(receipt.get('ratio'))} "
-            f"of a {_fmt(receipt.get('sent_pps'))} pps burst"
+            f"  TRex profile {int(step) + 1} started at {_fmt(first)}-{_fmt(last)}s "
+            f"in {_fmt(_dict(item).get('senders'))} senders"
         )
     return lines
 
 
-def _fio_lines(result: dict[str, object]) -> list[str]:
-    """Guest fio cells and measured phases."""
-    lines: list[str] = []
-    fio_result = _dict(_dict(result.get("guest")).get("fio"))
-    rows: list[list[object]] = [["CELL", "IOS", "IOPS", "P50 MS", "P99 MS", "COMPLETE"]]
-    keys = ("total_ios", "iops", "p50_ms", "p99_ms", "complete")
-    rows += [
-        [c.get("name"), *(c.get(k) for k in keys)]
-        for c in _list(fio_result.get("cells"))
-        if "iops" in c and c.get("name") not in ("prefill", "calibration", "measured")
-    ]
-    rows += [
-        [name, p.get("ios"), p.get("iops"), p.get("p50_ms"), p.get("p99_ms"), ""]
-        for name, p in _dicts(fio_result.get("phases")).items()
-    ]
-    if len(rows) > 1:
-        lines += ["", "Guest fio:", *_table(rows)]
-    if fio_result.get("offered_iops") is not None:
-        lines.append(f"  offered {_fmt(fio_result.get('offered_iops'))} IOPS")
-    return lines
+def _rates(values: Row) -> str:
+    """Reporting count and min/median/max of per-VM rates."""
+    if not values.get("reporting"):
+        return f"0/{_fmt(values.get('of'))}"
+    spread = "/".join(_fmt(values.get(f"pps_{k}")) for k in ("min", "median", "max"))
+    return f"{_fmt(values.get('reporting'))}/{_fmt(values.get('of'))}  {spread}"
 
 
-def _host_lines(result: dict[str, object]) -> list[str]:
-    """Target host and guest drops and CPU per phase, with Ceph slow ops."""
-    target = _dict(result.get("target"))
-    host = _dicts(target.get("host"))
-    ceph = _dicts(result.get("ceph"))
-    if not host:
+def _network_lines(result: Row) -> list[str]:
+    """Requested and per-VM transmitted and received rates per TRex profile."""
+    network = _dict(result.get("network"))
+    profiles = _list(network.get("profiles"))
+    if not profiles:
         return []
-    columns = {
-        "CPU BUSY %": "cpu_busy_pct",
-        "SOFTIRQ %": "cpu_softirq_pct",
-        "IOWAIT %": "cpu_iowait_pct",
-        "LINK DROPS": "host_drops",
-        "RING DROPS": "nic_ring_drops",
-        "LOST UPCALLS": "lost_upcalls",
-        "TAP DROPS": "tap_drops",
-        "GUEST DROPS": "guest_drops",
-    }
-    table = {
-        phase: {
-            **{label: h.get(key) for label, key in columns.items()},
-            "CEPH SLOW OPS": ceph.get(phase, {}).get("slow_ops_max"),
-        }
-        for phase, h in host.items()
-    }
-    shown = [
-        label
-        for label in [*columns, "CEPH SLOW OPS"]
-        if any(values[label] is not None for values in table.values())
+    rows: list[list[object]] = [
+        ["PROFILE", "WINDOW", "PPS/SENDER", "TX PPS MIN/MED/MAX", "RX PPS MIN/MED/MAX"]
     ]
-    rows: list[list[object]] = [["PHASE", *shown]]
-    rows += [[p, *(v[label] for label in shown)] for p, v in table.items()]
-    return ["", "Target host and guest:", *_table(rows)]
+    for item in profiles:
+        rows.append(
+            [
+                int(cast(int, item.get("profile"))) + 1,
+                _window(item),
+                item.get("pps_per_sender"),
+                _rates(_dict(item.get("tx"))),
+                _rates(_dict(item.get("rx"))),
+            ]
+        )
+    return [
+        "",
+        f"Network ({network.get('mode')}, focus {network.get('focus')}, "
+        f"{network.get('senders')} senders, {network.get('receivers')} receivers):",
+        *_table(rows),
+        "  TX: TRex packets per sender. RX: packets counted per receiver. Each rate",
+        "  covers that VM's samples inside the window; the count before the range",
+        "  is VMs with samples out of VMs.",
+    ]
 
 
-def summary_text(result: dict[str, object]) -> str:
+def _storage_lines(result: Row) -> list[str]:
+    """Per-job fio results per profile, as a range over jobs."""
+    storage = _dict(result.get("storage"))
+    profiles = _list(storage.get("profiles"))
+    if not profiles:
+        return []
+    rows: list[list[object]] = [
+        [
+            "PROFILE",
+            "DIR",
+            "JOBS",
+            "IOPS MIN/MED/MAX",
+            "MIB/S MIN/MED/MAX",
+            "P99 MS MIN/MED/MAX",
+        ]
+    ]
+
+    def spread(value: object, scale: float = 1.0) -> str:
+        found = _dict(value)
+        return "/".join(
+            _fmt(v * scale if isinstance(v := found.get(k), int | float) else None)
+            for k in ("min", "median", "max")
+        )
+
+    for item in profiles:
+        for d in ("read", "write"):
+            values = _dict(item.get(d))
+            if not values:
+                continue
+            rows.append(
+                [
+                    item.get("name"),
+                    d,
+                    f"{_fmt(values.get('jobs'))}/{_fmt(item.get('jobs_expected'))}",
+                    spread(values.get("iops")),
+                    spread(values.get("bw_kib_s"), 1 / 1024),
+                    spread(values.get("p99_ms")),
+                ]
+            )
+    return [
+        "",
+        f"Storage (fio, {storage.get('numjobs')} job(s) per VM, per job over its "
+        "own runtime):",
+        *_table(rows),
+    ]
+
+
+def summary_text(result: Row) -> str:
     """Human summary of a result with titled, aligned sections."""
     run = _dict(result.get("run"))
+    workloads = ", ".join(
+        str(w) for w in cast(list[object], run.get("workloads") or [])
+    )
     lines = [
-        f"Run {run.get('id')} ({run.get('profile')}, {run.get('duration')})",
+        f"Run {run.get('id')} ({workloads}, {_fmt(run.get('duration_s'))}s measured)",
         *_table(
             [
                 ["Outcome", f"{run.get('execution')}, exit {run.get('code')}"],
@@ -230,23 +192,10 @@ def summary_text(result: dict[str, object]) -> str:
             ]
         ),
     ]
-    rows = _placement(result)
-    if rows:
-        lines += ["", "Placement:", *_table(rows)]
-
-    indicators = _list(result.get("indicators"))
-    if indicators:
-        rows = [["INDICATOR", "WHERE", "VALUE"]]
-        rows += [
-            [i.get("name"), i.get("where"), f"{_fmt(i.get('value'))} {i.get('unit')}"]
-            for i in indicators
-        ]
-        lines += ["", "SLO indicators (compare with your targets):", *_table(rows)]
-
+    lines += _fleet_lines(result)
+    lines += _timeline_lines(result)
     lines += _network_lines(result)
-    lines += _fio_lines(result)
-    lines += _host_lines(result)
-
+    lines += _storage_lines(result)
     issues = [
         *[
             str(c)

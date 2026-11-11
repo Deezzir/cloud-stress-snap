@@ -11,24 +11,24 @@ source-code: https://github.com/Deezzir/cloud-stress-snap
 description: |
   Stress test a Prodstack cloud.
 
-  cloud-stress checks that the cloud is ready, runs network and storage load
-  against it, and reports the achieved load and how the cloud degraded.
+  cloud-stress checks that the cloud is ready, runs TRex network traffic and fio
+  storage load on a fleet of VMs, and reports time-series measurements of the
+  workloads, hosts and Ceph.
 
   **How-To**
 
-  How to connect your Juju and OpenStack credentials:
+  How to connect your Juju credentials:
 
       sudo snap connect cloud-stress:dot-local-share-juju
-      sudo snap connect cloud-stress:dot-config-openstack
-      sudo snap connect cloud-stress:etc-openstack
 
   How to check a cloud (read-only):
 
-      cloud-stress check --juju-model <model>
+      cloud-stress check
 
-  How to start a run:
+  How to start a run from the example configuration:
 
-      cloud-stress run start host-network --duration 30m --juju-model <model>
+      cp /snap/cloud-stress/current/share/cloud-stress/config.yaml ~/stress.yaml
+      cloud-stress run start --config ~/stress.yaml
 
   How to follow, stop, or export a run:
 
@@ -39,11 +39,10 @@ description: |
 
   **Reference**
 
-  Profiles:
+  Workloads, enabled by sections of the run configuration:
 
-  * `host-network`: UDP flood from one hypervisor to a guest on another.
-  * `ceph-block`: fio sweep on a Ceph volume attached to a guest.
-  * `network-ceph`: host-network and fio together.
+  * `trex`: UDP traffic between guests, fanned in to or out of one hypervisor.
+  * `fio`: fio on a Ceph-backed Cinder volume attached to every guest.
 
   Requirements:
 
@@ -52,11 +51,15 @@ description: |
   * Optional: a MAAS cloud credential on the Juju model, read for MAAS records.
   * An overlay network with an IPv4 subnet for guest management.
 
-  Placement is chosen automatically; override it with the OpenStack values
-  `--sender`, `--target`, `--provider-network`, `--ip-version`, `--network`,
-  `--image`, `--flavor` and `--volume-type`.
+  The configuration file, kept in your home directory, sets the workloads, VM
+  placement and duration. Networks, images, flavor and volume type are chosen
+  automatically; override them with `--provider-network`, `--ip-version`,
+  `--network`, `--image`, `--flavor` and `--volume-type`.
+  Configuration reference:
+  https://github.com/Deezzir/cloud-stress-snap/blob/main/docs/configuration.md
 
-  Results report measured SLO indicators without a verdict. Exit codes:
+  Results include measurements, graphs and raw tool output.
+  Exit codes:
   `0` completed, `20` failed, interrupted or not cleaned up, `30` cancelled.
 
   Run results are stored in `/var/snap/cloud-stress/common/runs/`.
@@ -128,3 +131,5 @@ parts:
       # Frozen sync alone does not check whether declarations match the lock.
       UV_FROZEN=false uv lock --check
       craftctl default
+      install -D -m 0644 config.yaml \
+        "$CRAFT_PART_INSTALL/share/cloud-stress/config.yaml"

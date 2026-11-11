@@ -3,13 +3,11 @@
 import json
 import logging
 import socket
-import sys
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
 
 import click
 
@@ -25,14 +23,22 @@ from probe.discover import (
     link_juju_to_hypervisors,
     nova_state_notices,
 )
-from probe.display import print_check_result, print_plan, print_table
+from probe.display import (
+    print_check_result,
+    print_fleet,
+    print_resources,
+    print_table,
+)
 from probe.infra_probe import probe_infra
 from probe.juju_probe import probe_juju
 from probe.maas_probe import probe_maas
-from probe.models import CheckResult, Profile
+from probe.models import CheckResult, Workload
 from probe.openstack_probe import resolve_cloud
 from probe.ovs_probe import probe_ovs
-from probe.plan import profile_readiness, resolve_plan
+from probe.plan import resolve_plan, workload_readiness
+
+WORKLOADS: tuple[Workload, ...] = ("trex", "fio")
+DEFAULT_CONFIG = "/snap/cloud-stress/current/share/cloud-stress/config.yaml"
 
 
 def access_options[F: Callable[..., object]](func: F) -> F:
@@ -58,8 +64,12 @@ def discover(
     verbose: bool,
     overrides: dict[str, str] | None = None,
     allow_recovering: bool = False,
+    config: profiles.RunConfig | None = None,
 ) -> CheckResult:
-    """Run live, read-only discovery and resolve the run plan."""
+    """Run live, read-only discovery and resolve the run plan.
+
+    With a configuration, the plan includes the fleet for its workloads.
+    """
     if verbose:
         handler = logging.StreamHandler()
         handler.setFormatter(logging.Formatter("debug: %(message)s"))
@@ -101,8 +111,16 @@ def discover(
             *ovs_notices,
         ],
     )
-    result.plan, missing = resolve_plan(result, overrides)
-    result.readiness = profile_readiness(result, missing, allow_recovering)
+    missing: dict[Workload, dict[str, str]] = {}
+    if config:
+        enabled = {w for w in WORKLOADS if getattr(config.workloads, w) is not None}
+        result.plan, found = resolve_plan(result, overrides, enabled, config)
+        missing = {name: found for name in WORKLOADS if name in enabled}
+    else:
+        result.plan, _ = resolve_plan(result, overrides, set(WORKLOADS))
+        for name in WORKLOADS:
+            missing[name] = resolve_plan(result, overrides, {name})[1]
+    result.readiness = workload_readiness(result, missing, allow_recovering)
     result.notices[:0] = nova_state_notices(result)
     result.notices.extend(datapath_notices(result))
     return result
@@ -215,16 +233,22 @@ def show_result(state: run_state.RunState) -> None:
     click.echo(f"Results: {run_state.run_dir(state.id)}")
 
 
-@run.command()
-@click.argument("profile", type=click.Choice(list(profiles.PROFILES)))
-@click.option("--duration", required=True, help="Measured window, e.g. 30m or 1h.")
+@run.command(
+    help="Start a stress run from a configuration file.\n\n"
+    f"Copy the example configuration from {DEFAULT_CONFIG} and edit it."
+)
+@click.option(
+    "--config",
+    "config_file",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Run configuration (YAML).",
+)
 @access_options
-@click.option("--sender", help="Nova hypervisor for the TRex sender (short hostname).")
-@click.option("--target", help="Nova hypervisor for the target guest (short hostname).")
 @click.option(
     "--provider-network",
     "network",
-    help="Neutron VLAN provider network name or ID for the stress traffic.",
+    help="Neutron VLAN provider network name or ID for TRex traffic.",
 )
 @click.option(
     "--ip-version",
@@ -236,27 +260,25 @@ def show_result(state: run_state.RunState) -> None:
     "mgmt_network",
     help="Neutron network name or ID for guest access; needs DHCP and DNS.",
 )
-@click.option("--image", help="Glance image name or ID for the guest.")
-@click.option("--flavor", help="Nova flavor name or ID for the guest.")
+@click.option("--image", help="Glance image name or ID for the guests.")
+@click.option("--flavor", help="Nova flavor name or ID for the guests.")
 @click.option("--volume-type", help="Cinder volume type name or ID.")
-@click.option("--yes", is_flag=True, help="Start without asking for confirmation.")
 @click.option(
     "--allow-recovering", is_flag=True, help="Allow active Ceph recovery/backfill PGs."
 )
 def start(
-    profile: str,
-    duration: str,
+    config_file: Path,
     juju_model: str,
     verbose: bool,
-    yes: bool,
     allow_recovering: bool,
     **choices: str | None,
 ) -> None:
-    """Start a stress run with a selected profile and duration."""
+    """Start a stress run from a configuration file."""
     try:
-        schedule = profiles.resolve(profile, profiles.parse_duration(duration))  # type: ignore[arg-type]
-    except ValueError as error:
-        raise click.UsageError(str(error)) from None
+        config = profiles.load_config(config_file.read_text())
+        schedule = profiles.resolve_schedule(config)
+    except (OSError, ValueError) as error:
+        raise click.UsageError(f"{config_file}: {error}") from None
     if pending := run_state.unfinished():
         raise click.UsageError(
             f"Run {pending.id} is not finished; "
@@ -268,42 +290,28 @@ def start(
         verbose,
         overrides,
         allow_recovering=allow_recovering,
+        config=config,
     )
-    readiness = next(item for item in result.readiness if item.profile == profile)
-    if not readiness.ready:
+    blockers = [b for item in result.readiness for b in item.blockers]
+    if blockers:
         issues = [n for n in result.notices if n.reason != "not-queried"]
-        click.echo(f"{profile} cannot start:", err=True)
+        click.echo("The run cannot start:", err=True)
         for issue in issues:
             click.echo(f"  - {issue.message}", err=True)
-        for blocker in readiness.blockers:
+        for blocker in dict.fromkeys(blockers):
             click.echo(f"  - {blocker}", err=True)
         raise SystemExit(2)
-    click.echo(f"{profile} for {duration} on model {juju_model}\n\nPlacement:")
-    print_plan(result.plan, cast(Profile, profile))
-    fmt = profiles.format_duration
-    rows = [
-        ["Phases", ", ".join(f"{p.name} {fmt(p.length_s)}" for p in schedule.phases)]
-    ]
-    if schedule.trex_steps_pps:
-        stress = next(p for p in schedule.phases if p.name == "stress")
-        step = fmt(stress.length_s // len(schedule.trex_steps_pps))
-        steps = " / ".join(f"{pps:,}" for pps in schedule.trex_steps_pps)
-        rows.append(["Flood", f"{steps} pps, {step} each"])
-    rows.append(
-        ["Ends within", f"{fmt(schedule.max_elapsed_s)}, with setup and cleanup"]
-    )
+    click.echo(f"{len(result.plan.vms)} VMs on model {juju_model}\n\nResources:")
+    print_resources(result.plan)
+    click.echo("\nFleet:")
+    print_fleet(result.plan)
     click.echo("\nSchedule:")
-    print_table(rows)
+    print_table(schedule_rows(config, schedule))
     click.echo()
-    if not yes:
-        if not sys.stdin.isatty():
-            raise click.UsageError("Confirmation needed; pass --yes to start.")
-        click.confirm("Start this run?", abort=True)
     reply = request(
         {
             "op": "start",
-            "profile": profile,
-            "duration_s": schedule.duration_s,
+            "config": config.model_dump(),
             "model": juju_model,
             "cloud": result.cloud,
             "plan": result.plan.model_dump(),
@@ -312,6 +320,40 @@ def start(
     )
     click.echo(f"Run {reply['run_id']} accepted.")
     follow(str(reply["run_id"]))
+
+
+def schedule_rows(
+    config: profiles.RunConfig, schedule: profiles.Schedule
+) -> list[list[str]]:
+    """Warm-up and each workload's profile windows on the measured timeline."""
+    fmt = profiles.format_duration
+    rows = [
+        ["Warm-up", f"{fmt(schedule.warmup_s)} with the first profiles, not measured"],
+        ["Measured", fmt(schedule.duration_s)],
+    ]
+    trex_config, fio_config = config.workloads.trex, config.workloads.fio
+    for window in schedule.trex if trex_config else []:
+        pps = trex_config.profiles[window.profile].pps_per_sender if trex_config else 0
+        rows.append(
+            [
+                "TRex" if window.profile == 0 else "",
+                f"{fmt(window.start_s)}-{fmt(window.start_s + window.length_s)}  "
+                f"{pps:,} pps per sender",
+            ]
+        )
+    for window in schedule.fio if fio_config else []:
+        name = fio_config.profiles[window.profile].name if fio_config else ""
+        end = fmt(window.start_s + window.length_s)
+        rows.append(
+            [
+                "fio" if window.profile == 0 else "",
+                f"{fmt(window.start_s)}-{end}  {name}",
+            ]
+        )
+    rows.append(
+        ["Ends within", f"{fmt(schedule.max_elapsed_s)}, with setup and cleanup"]
+    )
+    return rows
 
 
 @run.command()
@@ -388,7 +430,8 @@ def status(run_id: str | None, as_json: bool, html_file: Path | None) -> None:
     print_table(
         [
             ["Run", state.id],
-            ["Profile", state.profile],
+            ["Workloads", ", ".join(_workloads(state))],
+            ["VMs", str(len(state.plan.vms))],
             ["Duration", profiles.format_duration(state.duration_s)],
             [
                 "Status",
@@ -401,8 +444,8 @@ def status(run_id: str | None, as_json: bool, html_file: Path | None) -> None:
             ["Elapsed", profiles.format_duration(elapsed)],
         ]
     )
-    click.echo("\nPlacement:")
-    print_plan(state.plan, state.profile)
+    click.echo("\nFleet:")
+    print_fleet(state.plan)
     pending = run_state.outstanding(state.id)
     if state.finalization == "incomplete" and pending:
         click.echo(f"\nCleanup pending: {len(pending)} item(s).")
@@ -411,6 +454,10 @@ def status(run_id: str | None, as_json: bool, html_file: Path | None) -> None:
                 f"  - {entry.kind} {entry.name} on {entry.where}: {entry.action}"
             )
         click.echo('Log in again if needed, then run "cloud-stress run stop".')
+
+
+def _workloads(state: run_state.RunState) -> list[str]:
+    return [w for w in WORKLOADS if getattr(state.config.workloads, w) is not None]
 
 
 def _outcome(state: run_state.RunState) -> str:

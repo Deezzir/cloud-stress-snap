@@ -30,12 +30,13 @@ from campaign.lifecycle.finalize import finalize
 from campaign.lifecycle.run import Run
 from campaign.model import profiles
 from campaign.model import state as run_state
+from constants import (
+    IDLE_EXIT_S,
+    MAX_CONNECTIONS,
+    MAX_REQUEST_BYTES,
+    READ_TIMEOUT_S,
+)
 from probe.models import RunPlan
-
-IDLE_EXIT_S = 60
-MAX_REQUEST = 4 * 1024 * 1024
-MAX_CONNECTIONS = 8
-READ_TIMEOUT_S = 30
 
 
 class Worker:
@@ -82,11 +83,11 @@ class Worker:
         """Verify access with the run's own copy, then accept the run."""
         if self.busy():
             raise run_state.RunActiveError("A run is active.")
-        schedule = profiles.resolve(
-            str(request["profile"]),  # type: ignore[arg-type]
-            int(str(request["duration_s"])),
-        )
+        config = profiles.RunConfig.model_validate(request["config"])
+        schedule = profiles.resolve_schedule(config)
         plan = RunPlan.model_validate(request["plan"])
+        if len(plan.vms) != config.placement.total:
+            return {"ok": False, "error": "the plan does not place every VM"}
         model, cloud = str(request["model"]), str(request["cloud"])
         given = access.Access.model_validate(request["access"])
         until = run_state.now() + timedelta(seconds=schedule.max_elapsed_s)
@@ -105,6 +106,7 @@ class Worker:
             state = run_state.create(
                 model=model,
                 cloud=cloud,
+                config=config,
                 plan=plan,
                 schedule=schedule,
                 owner_uid=uid,
@@ -217,7 +219,7 @@ def read_line(conn: socket.socket) -> bytes:
         if not chunk:
             break
         data += chunk
-        if len(data) > MAX_REQUEST:
+        if len(data) > MAX_REQUEST_BYTES:
             raise ValueError("request too large")
     return data
 

@@ -1,4 +1,4 @@
-"""Host or Ceph sampler; appends one JSON line per interval."""
+"""Host, guest or Ceph sampler; appends one JSON line per interval."""
 
 import json, re, subprocess, sys, time
 
@@ -25,6 +25,19 @@ def read(path):
         return open(path).read()
     except OSError:
         return ""
+
+
+def nft(table):
+    try:
+        data = json.loads(run("nft", "-j", "list", "counters", "table", "inet", table))
+    except ValueError:
+        return {"nft.error": "nft did not return counters"}
+    found = {}
+    for item in data.get("nftables", []):
+        if counter := item.get("counter"):
+            found[f"nft.{counter['name']}.packets"] = counter["packets"]
+            found[f"nft.{counter['name']}.bytes"] = counter["bytes"]
+    return found
 
 
 def nic(link):
@@ -66,18 +79,20 @@ def ceph():
     try:
         status = json.loads(run("ceph", "status", "-f", "json"))
     except ValueError:
-        return {}
+        return {"ceph.error": "ceph status did not return JSON"}
     checks = status.get("health", {}).get("checks", {})
     slow = checks.get("SLOW_OPS", {}).get("summary", {}).get("message", "")
     pgmap = status.get("pgmap", {})
-    return {
+    found = {
         "ceph.health": status.get("health", {}).get("status"),
         "ceph.slow_ops": int(m[1]) if (m := re.match(r"(\d+)", slow)) else 0,
         "ceph.pgs_unclean": sum(s["count"] for s in pgmap.get("pgs_by_state", [])
                                 if s["state_name"] != "active+clean"),
-        "ceph.read_ops": pgmap.get("read_op_per_sec", 0),
-        "ceph.write_ops": pgmap.get("write_op_per_sec", 0),
     }
+    for key, name in (("read_op_per_sec", "read_ops"), ("write_op_per_sec", "write_ops")):
+        if key in pgmap:
+            found[f"ceph.{name}"] = pgmap[key]
+    return found
 
 
 seq = 0
@@ -87,14 +102,21 @@ while True:
         sample = ceph()
     else:
         sample = {f"cpu.{k}": v for k, v in cpu().items()}
-        sample.update(nic(args["link"]))
-        if tap := args.get("tap"):
-            # The guest's tap: tx_dropped counts packets the guest did not take.
+        if args.get("link"):
+            sample.update(nic(args["link"]))
+        for tap in args.get("taps", []):
+            # A guest's tap: tx_dropped counts packets the guest did not take.
             for counter in ("tx_packets", "tx_dropped"):
                 value = read(f"/sys/class/net/{tap}/statistics/{counter}").strip()
                 if value.isdigit():
-                    sample[f"tap.{counter}"] = int(value)
-        sample.update(ovs(args.get("offload")))
+                    sample[f"{tap}.{counter}"] = int(value)
+        if mode == "host":
+            sample.update(ovs(args.get("offload")))
+        if args.get("nft"):
+            sample.update(nft(args["nft"]))
     out.write(json.dumps({"t": started, "seq": seq, **sample}) + "\n")
+    if "nft.error" in sample:
+        # Receive counters are required: stop so the failure stays visible.
+        sys.exit(1)
     seq += 1
     time.sleep(max(interval - (time.time() - started), 0))

@@ -1,28 +1,26 @@
 # cloud-stress
 
 A stress-testing tool for Prodstack infrastructure, distributed as a snap.
-Run coordinated network, storage, and compute workloads to measure performance
-under load, identify shared-resource bottlenecks, and evaluate isolation and QoS
-before production.
+Run TRex network traffic and fio storage workloads on VMs, and view network,
+storage and host measurements.
 
-Infrastructure discovery informs workload placement and reporting. Each run
-reports achieved load and its effect on the tested deployment.
-
-Usage is in the snap description in `snap/snapcraft.yaml`.
+Usage is in the snap description in `snap/snapcraft.yaml`. Runs are configured
+with a YAML file; [`config.yaml`](config.yaml) is the example.
 
 ## Layout
 
 | Path | Contents |
 | --- | --- |
 | `src/cloud_stress.py` | CLI |
-| `src/probe/` | Read-only discovery, run plan, readiness and `check` output |
-| `src/campaign/model/` | Run state, journal, profiles, target |
+| `src/probe/` | Read-only discovery, fleet placement, readiness and `check` output |
+| `src/campaign/model/` | Run configuration, schedule, state and journal |
 | `src/campaign/transport/` | `juju exec` and guest SSH |
-| `src/campaign/workloads/` | TRex, fio and samplers |
+| `src/campaign/workloads/` | TRex, fio, receive counters and samplers |
 | `src/campaign/lifecycle/` | Worker, preparation, measurement, finalization |
-| `src/campaign/report/` | Result model, text and HTML |
+| `src/campaign/report/` | Result model, graphs, text and HTML |
 
-- [Campaigns](docs/campaigns.md)
+- [Runs](docs/campaigns.md)
+- [Configuration](docs/configuration.md)
 - [Security](docs/security-reference.md)
 - [Contributing](CONTRIBUTING.md)
 

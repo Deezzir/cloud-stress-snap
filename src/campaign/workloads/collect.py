@@ -1,4 +1,4 @@
-"""Remote samplers: host CPU, NIC and OVS counters, and Ceph health.
+"""Remote samplers: host and guest CPU, NIC, OVS and nftables counters; Ceph health.
 
 The sampler runs as a run-owned transient unit and writes JSONL locally; the
 worker fetches the file once after the run. Missing counters are left out of a
@@ -40,7 +40,7 @@ def normalize(samples: list[dict[str, Any]]) -> list[dict[str, object]]:
         for key, value in cur.items():
             if key in ("t", "seq") or key.startswith("cpu."):
                 continue
-            if key.startswith("ceph.") or key in GAUGES:
+            if key.startswith("ceph.") or key in GAUGES or isinstance(value, str):
                 row[key] = value
             elif key in prev and elapsed > 0:
                 delta = value - prev[key]
@@ -52,6 +52,13 @@ def normalize(samples: list[dict[str, Any]]) -> list[dict[str, object]]:
     return rows
 
 
-def start_args(link: str | None, offload: bool | None, tap: str | None) -> str:
+def start_args(
+    link: str | None,
+    offload: bool | None = None,
+    taps: list[str] | None = None,
+    nft: str | None = None,
+) -> str:
     """Sampler arguments as a JSON string."""
-    return json.dumps({"link": link, "offload": bool(offload), "tap": tap})
+    return json.dumps(
+        {"link": link, "offload": bool(offload), "taps": taps or [], "nft": nft}
+    )

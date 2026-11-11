@@ -1,117 +1,111 @@
-"""TRex changing-tuple UDP flood on the sender hypervisor's provider bond."""
+"""TRex in sender guests: the trex-generator snap, its server and a scheduled flood."""
 
 import json
 import shlex
 from importlib import resources
 
-import jubilant
-
-from campaign.model.profiles import FLOOD_PORT, FLOOD_SOURCE
-from campaign.model.target import Target
-from campaign.transport import remote
-
-SNAP = "trex-generator"
-CHANNEL = "latest/edge"
-PLUGS = ("network-control", "hardware-observe", "process-control", "system-observe")
-RPC_PORT = 4501
+from campaign.model.profiles import TrexConfig
+from constants import TREX_CHANNEL, TREX_PLUGS, TREX_RPC_PORT, TREX_SNAP
 
 FILES = resources.files("campaign.workloads") / "files"
 
 
-class Sender:
-    """The run-owned TRex snap, server and flood on one sender machine."""
+def install_command() -> str:
+    """Install the snap, hold refreshes for the run and connect its plugs."""
+    connect = "; ".join(f"snap connect {TREX_SNAP}:{plug}" for plug in TREX_PLUGS)
+    return (
+        f"set -e; snap install {TREX_SNAP} --channel={TREX_CHANNEL}; "
+        f"snap refresh --hold {TREX_SNAP}; {connect}; "
+        f"snap list {TREX_SNAP} | awk 'NR==2 {{print $2 \" rev \" $3}}'"
+    )
 
-    def __init__(self, juju: jubilant.Juju, machine: str, run_id: str) -> None:
-        """Remember where the run's TRex units and files live."""
-        self.juju = juju
-        self.machine = machine
-        self.dir = f"/var/snap/{SNAP}/common/{run_id}"
-        self.server_unit = f"cloud-stress-{run_id[:8]}-trex"
-        self.flood_unit = f"cloud-stress-{run_id[:8]}-flood"
-        self.log = f"{self.dir}/trex.log"
-        self.version = ""
 
-    def preflight(self) -> list[str]:
-        """Refuse a TRex snap the run would not own, or a busy TRex server or port."""
-        out = remote.sh(
-            self.juju,
-            self.machine,
-            f"snap list {SNAP} >/dev/null 2>&1 && echo installed; "
-            f"ss -Hltn 'sport = :{RPC_PORT}' | grep -q . && echo port; "
-            "pgrep -x _t-rex-64 >/dev/null && echo process; "
-            f"snap info {SNAP} >/dev/null 2>&1 || echo unreachable; true",
-        ).split()
-        problems = []
-        if "installed" in out:
-            problems.append(f"the {SNAP} snap is already installed on the sender")
-        if "process" in out:
-            problems.append("a _t-rex-64 process is already running on the sender")
-        if "port" in out:
-            problems.append(f"TCP port {RPC_PORT} is already in use on the sender")
-        if "unreachable" in out:
-            problems.append(f"the sender cannot reach the Snap Store for {SNAP}")
-        return problems
+def ip_packet_bytes(trex: TrexConfig, ip_version: int | None) -> int:
+    """IP packet size of the TRex traffic: IP and UDP headers and the payload."""
+    return (40 if ip_version == 6 else 20) + 8 + trex.udp_payload_bytes
 
-    def install(self) -> None:
-        """Install the snap, hold refreshes for the run and connect its plugs."""
-        connect = "; ".join(f"snap connect {SNAP}:{plug}" for plug in PLUGS)
-        remote.sh(
-            self.juju,
-            self.machine,
-            f"set -e; snap install {SNAP} --channel={CHANNEL}; "
-            f"snap refresh --hold {SNAP}; {connect}",
-            wait=600,
-        )
-        self.version = remote.sh(
-            self.juju,
-            self.machine,
-            f"snap list {SNAP} | awk 'NR==2 {{print $2 \" rev \" $3}}'",
-        ).strip()
 
-    def stage(self, link: str) -> None:
-        """Write the TRex config and flood script into the run's directory."""
-        config = (FILES / "trex_cfg.yaml").read_text().format(link=link)
-        remote.push(self.juju, self.machine, f"{self.dir}/trex_cfg.yaml", config)
-        remote.push(
-            self.juju,
-            self.machine,
-            f"{self.dir}/flood.py",
-            (FILES / "trex_flood.py").read_text(),
-        )
+def config(link: str, mac: str, mtu: int) -> str:
+    """TRex platform config: the guest's data interface through a Linux socket."""
+    octets = ",".join(f"0x{octet}" for octet in mac.split(":"))
+    return (FILES / "trex_cfg.yaml").read_text().format(link=link, mac=octets, mtu=mtu)
 
-    def server_command(self) -> str:
-        """Command for the TRex server on the provider link with a raw socket."""
-        return (
-            f"exec /snap/bin/{SNAP}.t-rex-64 -i -c 1 --no-scapy-server "
-            f"--no-ofed-check --cfg {self.dir}/trex_cfg.yaml >> {self.log} 2>&1"
-        )
 
-    def server_ready(self) -> bool:
-        """Whether the run's TRex server accepts RPC connections."""
-        out = remote.sh(self.juju, self.machine, f"ss -Hltn 'sport = :{RPC_PORT}'")
-        return bool(out.strip())
+def server_command(directory: str) -> str:
+    """Command for the TRex server with one traffic core."""
+    return (
+        f"exec /snap/bin/{TREX_SNAP}.t-rex-64 -i -c 1 --no-scapy-server "
+        f"--no-ofed-check --cfg {directory}/trex_cfg.yaml >> {directory}/trex.log 2>&1"
+    )
 
-    def flood_command(
-        self, name: str, target: Target, vlan: int, steps: list[tuple[int, int]]
-    ) -> tuple[str, str, int, str]:
-        """Unit, command, lifetime and stats file of a stepped flood."""
-        ipv6 = ":" in target.address
-        out = f"{self.dir}/{name}.jsonl"
-        total = sum(seconds for _, seconds in steps)
-        args = {
-            "dst": target.address,
-            "mac": target.mac,
-            "vlan": vlan,
-            "ipv6": ipv6,
-            "src": FLOOD_SOURCE[6 if ipv6 else 4],
-            "dport": FLOOD_PORT,
-            "steps": steps,
-            "max_s": total + 5,
-            "out": out,
-        }
-        command = (
-            f"/snap/bin/{SNAP}.python {self.dir}/flood.py "
-            f"{shlex.quote(json.dumps(args))} >> {self.log} 2>&1; "
-            f"echo $? > {out}.rc"
-        )
-        return f"{self.flood_unit}-{name}", command, total + 60, out
+
+def server_ready_command() -> str:
+    """Prints a line once the TRex server accepts RPC connections."""
+    return f"ss -Hltn 'sport = :{TREX_RPC_PORT}'"
+
+
+def flood_command(
+    directory: str,
+    trex: TrexConfig,
+    sender: dict[str, str],
+    peers: list[dict[str, object]],
+    steps: list[tuple[int, float]],
+    end: float,
+    name: str,
+) -> str:
+    """Flood from the sender to its peers, changing rate at each step's start time.
+
+    steps holds (pps_per_sender, epoch seconds); the flood stops at end.
+    """
+    args = {
+        "src": sender["address"],
+        "src_mac": sender["mac"],
+        "ipv6": ":" in sender["address"],
+        "peers": peers,
+        "dport": trex.udp_dst_port,
+        "sports": list(trex.udp_src_ports),
+        "payload": trex.udp_payload_bytes,
+        "steps": steps,
+        "end": end,
+        "out": f"{directory}/{name}.jsonl",
+    }
+    return (
+        f"/snap/bin/{TREX_SNAP}.python {directory}/flood.py "
+        f"{shlex.quote(json.dumps(args))} >> {directory}/trex.log 2>&1"
+    )
+
+
+def flood_script() -> str:
+    """The flood script copied into the sender guest."""
+    return (FILES / "trex_flood.py").read_text()
+
+
+def counter_table(run_id: str) -> str:
+    """Name of the run's nftables table in receiver guests."""
+    return f"cloud_stress_{run_id[:8]}"
+
+
+def counters_command(
+    table: str, address: str, dport: int, senders: dict[str, str]
+) -> str:
+    """Count benchmark packets from each sender, then drop them.
+
+    Rules match the sender and receiver addresses, UDP and the destination port.
+    They run at the raw prerouting hook, before connection tracking, so the guest
+    neither tracks the flows nor answers with port-unreachable messages.
+    senders maps a sender name to its address.
+    """
+    family = "ip6" if ":" in address else "ip"
+    lines = [f"table inet {table} {{"]
+    lines += [f"  counter from_{name} {{ }}" for name in senders]
+    lines += [
+        "  chain prerouting {",
+        "    type filter hook prerouting priority raw; policy accept;",
+    ]
+    lines += [
+        f"    {family} saddr {source} {family} daddr {address} udp dport {dport} "
+        f'counter name "from_{name}" drop'
+        for name, source in senders.items()
+    ]
+    lines += ["  }", "}", ""]
+    return f"printf %s {shlex.quote(chr(10).join(lines))} | nft -f -"

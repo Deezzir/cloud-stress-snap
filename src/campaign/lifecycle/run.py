@@ -1,10 +1,17 @@
-"""Execute one run: prepare, calibrate and measure; finalize.py cleans up."""
+"""Execute one run: prepare the fleet, then run the workloads on a shared timeline.
 
+finalize.py stops and cleans up afterwards.
+"""
+
+import json
 import re
 import shlex
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
+from typing import TypeVar
 
 import jubilant
 from openstack.connection import Connection
@@ -13,18 +20,27 @@ from campaign.lifecycle import provision
 from campaign.lifecycle.finalize import finalize
 from campaign.lifecycle.provision import PreparationError
 from campaign.model import state as run_state
-from campaign.model.profiles import FioCell, uses_fio, uses_trex
 from campaign.model.state import RunState
 from campaign.model.target import Target
 from campaign.transport import remote
 from campaign.transport.guest import Guest, guest_for, keygen
-from campaign.workloads import collect, fio
-from campaign.workloads.trex import SNAP, Sender
+from campaign.workloads import collect, fio, trex
+from constants import (
+    BOOT_TIMEOUT_S,
+    DRAIN_S,
+    LEAD_S,
+    MONITOR_S,
+    PARALLEL,
+    PREFILL_S_PER_GIB,
+    RECEIPT_MIN,
+    RECEIPT_PPS,
+    RECEIPT_S,
+    SAMPLE_INTERVAL_S,
+    TREX_SNAP,
+)
 
-SAMPLE_INTERVAL_S = {"host": 5, "ceph": 10}
-RECEIPT_PPS, RECEIPT_S, RECEIPT_MIN = 1000, 15, 0.8
-CALIBRATE_S = 60
-BOOT_TIMEOUT_S = 600
+T = TypeVar("T")
+
 # One `cloud-init status --long` error: ('module', SomeError("message"))
 CLOUD_INIT_ERROR = re.compile(r"""\('([^']+)', \w+\((['"])(.*)\2\)\)""")
 
@@ -61,19 +77,15 @@ class Run:
         self.short = state.id[:8]
         self.host_dir = f"/var/lib/cloud-stress/{state.id}"
         self.guest_dir = f"/var/lib/cloud-stress/{state.id}"
-        schedule = state.schedule
-        self.prepare_deadline = (
-            time.monotonic() + schedule.prepare_budget_s + schedule.calibrate_budget_s
-        )
-        self.sender: Sender | None = None
-        self.guest: Guest | None = None
-        self.target: Target | None = None
-        self.device = ""
-        self.guest_link = ""
-        self.offered_iops = 0
+        self.trex_dir = f"/var/snap/{TREX_SNAP}/common/cloud-stress-{self.short}"
+        self.prepare_deadline = time.monotonic() + state.schedule.prepare_budget_s
+        self.guests: dict[str, Guest] = {}
+        self.links: dict[str, str] = {}
+        self.devices: dict[str, str] = {}
+        self.mtus: dict[str, int] = {}
 
     def execute(self) -> None:
-        """Run the profile end to end; finalization always follows."""
+        """Run the configuration end to end; finalization always follows."""
         error: str | None = None
         execution: run_state.Execution = "completed"
         try:
@@ -119,219 +131,446 @@ class Run:
                 raise PreparationError(f"{what} timed out after {int(timeout)}s")
             self.wait(5)
 
+    def each(self, items: Iterable[T], work: Callable[[T], object]) -> None:
+        """Apply work to every item in parallel; raise the first failure."""
+        with ThreadPoolExecutor(max_workers=PARALLEL) as pool:
+            futures = [pool.submit(work, item) for item in items]
+        for future in futures:
+            future.result()
+
+    def targets(self, role: str | None = None) -> list[Target]:
+        """The run's VMs, optionally with one network role."""
+        return [t for t in self.state.targets if role in (None, t.role)]
+
     def prepare(self) -> None:
-        """Create owned resources and verify every path before load."""
-        state = self.state
-        self.phase("preparing", "checking quota and prerequisites")
-        self.check_prerequisites()
-        self.note("creating the target guest")
-        self.target = self.create_target()
-        self.note(f"waiting for SSH to {self.target.mgmt_address}")
-        self.guest = self.ready_guest(self.target)
+        """Create the fleet and verify every VM, device and traffic path."""
+        config = self.state.config
+        self.phase("preparing", "checking quota")
+        self.check_quota()
+        self.note(f"creating {len(self.state.plan.vms)} VMs")
+        self.create_fleet()
+        self.note("waiting for the guests")
+        self.each(self.targets(), self.ready_guest)
+        if config.workloads.trex:
+            self.note("adding receive counters")
+            self.each(self.targets("receiver"), self.add_counters)
         self.note("starting collectors")
         self.start_collectors()
-        if uses_fio(state.profile):
-            self.note("prefilling the data volume")
-            self.prefill()
-        if state.profile == "network-ceph":
-            self.note("measuring attainable IOPS")
-            self.calibrate_fio()
-        if self.sender:
-            self.note("starting TRex and checking target receipt")
-            self.start_trex()
+        if config.workloads.trex:
+            self.note("installing TRex in the senders")
+            self.each(self.targets("sender"), self.start_trex)
+            self.note("checking receipt between every sender and receiver")
             self.verify_receipt()
+        if config.workloads.fio:
+            self.note("prefilling the data volumes")
+            self.prefill()
 
-    def check_prerequisites(self) -> None:
-        """Quota and sender checks that need no run-owned resources."""
-        plan, state = self.state.plan, self.state
+    def check_quota(self) -> None:
+        """Quota for the whole fleet, before any run-owned resource exists."""
+        plan, fio_config = self.state.plan, self.state.config.workloads.fio
         flavor = self.conn.compute.get_flavor(plan.flavor_id or "")
         problems = provision.check_quota(
-            self.conn, flavor.vcpus, flavor.ram, state.schedule.volume_gb
+            self.conn,
+            len(plan.vms),
+            flavor.vcpus,
+            flavor.ram,
+            fio_config.volume_size_gib if fio_config else 0,
         )
-        if uses_trex(state.profile):
-            self.sender = Sender(self.juju, plan.sender_machine or "", state.id)
-            problems += self.sender.preflight()
         if problems:
             raise PreparationError("; ".join(problems))
 
-    def create_target(self) -> Target:
-        """Create the run's guest, volume and access keys."""
+    def create_fleet(self) -> None:
+        """Create the VMs, then place the access keys on every host."""
         public_key = keygen(self.private / "id_ed25519")
         host_public = keygen(self.private / "host_ed25519")
         host_private = (self.private / "host_ed25519").read_text()
-        target = provision.provision(
-            self.conn,
-            self.state,
-            public_key,
-            (host_private, host_public),
-            self.wait,
-        )
-        self.state.target = target
-        run_state.save(self.state)
-        run_state.event(self.state.id, "target", **target.model_dump())
-        self.own_host_dir(self.state.plan.target_machine or "")
-        guest = guest_for(self.juju, self.state, target)
-        guest.install_keys((self.private / "id_ed25519").read_text(), host_public)
-        return target
+        try:
+            self.state.targets = provision.provision(
+                self.conn,
+                self.state,
+                public_key,
+                (host_private, host_public),
+                self.wait,
+            )
+        finally:
+            run_state.save(self.state)
+        for target in self.state.targets:
+            run_state.event(self.state.id, "target", **target.model_dump())
+            self.guests[target.name] = guest_for(self.juju, self.state, target)
+        private = (self.private / "id_ed25519").read_text()
+        for host in self.state.plan.hosts:
+            self.own_host_dir(host.machine)
+        first: dict[str, Guest] = {}
+        for guest in self.guests.values():
+            first.setdefault(guest.machine, guest)
+        self.each(first.values(), lambda g: g.install_keys(private, host_public))
+        others = [g for g in self.guests.values() if g not in first.values()]
+        self.each(others, lambda g: g.install_keys(None, host_public))
 
-    def ready_guest(self, target: Target) -> Guest:
+    def ready_guest(self, target: Target) -> None:
         """Wait for SSH and cloud-init; find the data interface and volume."""
-        guest = guest_for(self.juju, self.state, target)
+        guest = self.guests[target.name]
         self.wait_for(
             guest.namespace_ready,
             BOOT_TIMEOUT_S,
-            f"the {guest.namespace} namespace on the target host",
+            f"the {guest.namespace} namespace on {target.host}",
         )
-        self.wait_for(guest.reachable, BOOT_TIMEOUT_S, "SSH to the target guest")
+        self.wait_for(guest.reachable, BOOT_TIMEOUT_S, f"SSH to {target.name}")
         status = guest.run("cloud-init status --wait >/dev/null; echo $?", timeout=900)
         if status.strip() not in ("0", "2"):
             detail = guest.run("cloud-init status --long 2>&1; true")
-            run_state.event(self.state.id, "cloud-init", status=detail.strip())
+            run_state.event(
+                self.state.id, "cloud-init", vm=target.name, status=detail.strip()
+            )
             errors = cloud_init_errors(detail)
             raise PreparationError(
-                "cloud-init failed in the guest"
+                f"cloud-init failed in {target.name}"
                 + (f": {'; '.join(errors)}" if errors else f" ({status.strip()})")
             )
-        self.guest_link = guest.run(
-            "for d in /sys/class/net/*; do "
-            f'[ "$(cat $d/address)" = {target.mac} ] && basename $d; done; true'
-        ).strip()
-        if not self.guest_link:
-            raise PreparationError(f"no guest interface has MAC {target.mac}")
-        if uses_fio(self.state.profile):
-            version = guest.run("fio --version || true").strip()
-            if not version.startswith("fio-"):
-                raise PreparationError("fio is not available in the guest")
-            run_state.event(self.state.id, "tool", name="fio", version=version)
-            device, reason = fio.find_device(
-                guest, target.volume_id or "", self.state.schedule.volume_gb
-            )
-            if not device:
-                raise PreparationError(reason)
-            self.device = device
-        stats = f"/sys/class/net/{self.guest_link}/statistics"
-        self.start_guest_unit(
-            guest,
-            "rx",
-            self.state.schedule.max_elapsed_s,
-            f"while true; do echo $(date +%s.%N) $(cat {stats}/rx_packets) "
-            f"$(cat {stats}/rx_dropped); sleep 1; done "
-            f"> {self.guest_dir}/rx/rx.log",
-        )
-        return guest
-
-    def prefill(self) -> None:
-        """Write the whole volume once and verify it before measured reads."""
-        assert self.guest
-        out = f"{self.guest_dir}/prefill"
-        self.start_guest_unit(
-            self.guest,
-            "prefill",
-            self.state.schedule.calibrate_budget_s,
-            fio.prefill_command(self.device, out),
-        )
-        self.wait_guest_unit("prefill", self.state.schedule.calibrate_budget_s)
-        text = self.guest.run(f"cat {out}/prefill.json 2>/dev/null || true")
-        if not text.strip() or not fio.prefill_complete(
-            text, self.state.schedule.volume_gb
-        ):
-            raise PreparationError("the volume prefill did not complete")
-
-    def calibrate_fio(self) -> None:
-        """Measure attainable IOPS and fix the offered rate for network-ceph."""
-        assert self.guest
-        schedule = self.state.schedule
-        cell = schedule.fio_cells[0].model_copy(update={"length_s": CALIBRATE_S})
-        self.run_fio(cell, "calibration")
-        text = self.guest.run(f"cat {self.guest_dir}/calibration/{cell.label}.json")
-        result = fio.summary(text)
-        if not result["complete"]:
-            raise PreparationError(f"fio calibration did not complete: {result}")
-        measured = float(result["iops"])  # type: ignore[arg-type]
-        self.offered_iops = int(measured * (schedule.fio_rate_fraction or 1))
-        if self.offered_iops <= 0:
-            raise PreparationError("fio calibration completed no I/O")
+        before = time.time()
+        remote_now = float(guest.run("date +%s.%N"))
+        after = time.time()
         run_state.event(
             self.state.id,
-            "calibration",
-            measured_iops=measured,
-            offered_iops=self.offered_iops,
+            "clock",
+            vm=target.name,
+            offset_s=round(remote_now - (before + after) / 2, 3),
+            uncertainty_s=round((after - before) / 2, 3),
+        )
+        if target.mac:
+            link = guest.run(
+                "for d in /sys/class/net/*; do "
+                f'[ "$(cat $d/address)" = {target.mac} ] && basename $d; done; true'
+            ).strip()
+            if not link:
+                raise PreparationError(f"{target.name} has no interface {target.mac}")
+            self.links[target.name] = link
+            guest.run(f"ip link set {link} up")
+            self.mtus[target.name] = int(guest.run(f"cat /sys/class/net/{link}/mtu"))
+            trex_config = self.state.config.workloads.trex
+            assert trex_config
+            size = trex.ip_packet_bytes(trex_config, self.state.plan.ip_version)
+            if size > self.mtus[target.name]:
+                raise PreparationError(
+                    f"{size}-byte TRex packets exceed the "
+                    f"{self.mtus[target.name]}-byte MTU of {link} in {target.name}"
+                )
+        if target.role == "receiver":
+            version = guest.run("nft --version || true").strip()
+            if not version.startswith("nftables"):
+                raise PreparationError(f"nftables is not available in {target.name}")
+            self.tool(target.name, "nftables", version)
+        fio_config = self.state.config.workloads.fio
+        if fio_config:
+            version = guest.run("fio --version || true").strip()
+            if not version.startswith("fio-"):
+                raise PreparationError(f"fio is not available in {target.name}")
+            self.tool(target.name, "fio", version)
+            device, reason = fio.find_device(guest, target.volume_id or "", fio_config)
+            if not device:
+                raise PreparationError(f"{target.name}: {reason}")
+            self.devices[target.name] = device
+
+    def tool(self, vm: str, name: str, version: str) -> None:
+        """Record a tool version used in a guest."""
+        run_state.event(self.state.id, "tool", vm=vm, name=name, version=version)
+
+    def start_trex(self, target: Target) -> None:
+        """Install TRex in a sender and start its server on the data interface."""
+        guest = self.guests[target.name]
+        install = trex.install_command()
+        run_state.event(self.state.id, "command", where=target.name, command=install)
+        try:
+            version = guest.run(install, timeout=900).strip()
+        except RuntimeError as error:
+            raise PreparationError(
+                f"installing the {TREX_SNAP} snap in {target.name} failed: {error}"
+            ) from None
+        self.tool(target.name, "trex", version.splitlines()[-1] if version else "")
+        directory = self.trex_dir
+        for path, text in (
+            (
+                "trex_cfg.yaml",
+                trex.config(
+                    self.links[target.name], target.mac or "", self.mtus[target.name]
+                ),
+            ),
+            ("flood.py", trex.flood_script()),
+        ):
+            if path.endswith(".yaml"):
+                run_state.event(
+                    self.state.id, "file", where=target.name, path=path, text=text
+                )
+            guest.run(
+                f"mkdir -p {directory} && printf %s {shlex.quote(text)} "
+                f"> {directory}/{path}"
+            )
+        self.start_guest_unit(
+            guest,
+            "trex",
+            self.state.schedule.max_elapsed_s,
+            trex.server_command(directory),
+            evidence=directory,
+        )
+        self.wait_for(
+            lambda: bool(guest.run(trex.server_ready_command()).strip()),
+            120,
+            f"TRex server start in {target.name}",
         )
 
-    def start_trex(self) -> None:
-        """Start the run's TRex server on the sender's provider link."""
-        assert self.sender
-        plan = self.state.plan
-        machine = plan.sender_machine or ""
-        self.own_host_dir(machine)
-        run_state.record(self.state.id, "snap", SNAP, "intent", where=machine)
-        self.sender.install()
-        run_state.record(self.state.id, "snap", SNAP, "created", where=machine)
-        run_state.event(self.state.id, "tool", name="trex", version=self.sender.version)
-        self.sender.stage(plan.sender_link or "")
-        self.start_host_unit(
-            machine,
-            self.sender.server_unit,
-            self.state.schedule.max_elapsed_s,
-            self.sender.server_command(),
-            self.sender.log,
+    def add_counters(self, target: Target) -> None:
+        """Count benchmark packets from each assigned sender in a receiver."""
+        trex_config = self.state.config.workloads.trex
+        assert trex_config
+        by_name = {t.name: t for t in self.state.targets}
+        senders = {
+            c.sender: by_name[c.sender].address or ""
+            for c in self.state.plan.connections
+            if c.receiver == target.name
+        }
+        command = trex.counters_command(
+            trex.counter_table(self.state.id),
+            target.address or "",
+            trex_config.udp_dst_port,
+            senders,
         )
-        self.wait_for(self.sender.server_ready, 120, "TRex server start")
+        run_state.event(self.state.id, "command", where=target.name, command=command)
+        self.guests[target.name].run(command)
+
+    def flood(
+        self, target: Target, name: str, steps: list[tuple[int, float]], end: float
+    ) -> None:
+        """Start a scheduled flood from one sender to its receivers."""
+        trex_config = self.state.config.workloads.trex
+        assert trex_config
+        by_name = {t.name: t for t in self.state.targets}
+        peers: list[dict[str, object]] = [
+            {
+                "name": c.receiver,
+                "mac": by_name[c.receiver].mac,
+                "dst": by_name[c.receiver].address,
+            }
+            for c in self.state.plan.connections
+            if c.sender == target.name
+        ]
+        command = trex.flood_command(
+            self.trex_dir,
+            trex_config,
+            {"address": target.address or "", "mac": target.mac or ""},
+            peers,
+            steps,
+            end,
+            name,
+        )
+        lifetime = int(end - time.time()) + 120
+        self.start_guest_unit(
+            self.guests[target.name], name, lifetime, command, evidence=None
+        )
+
+    def counters(self, target: Target) -> dict[str, int]:
+        """A receiver's current packet count from each sender."""
+        out = self.guests[target.name].run(
+            f"nft -j list counters table inet {trex.counter_table(self.state.id)}"
+        )
+        items = json.loads(out).get("nftables", [])
+        return {
+            item["counter"]["name"].removeprefix("from_"): item["counter"]["packets"]
+            for item in items
+            if "counter" in item
+        }
 
     def verify_receipt(self) -> None:
-        """Send a short low-rate burst and check the guest received it."""
-        assert self.guest
-        counter = f"/sys/class/net/{self.guest_link}/statistics/rx_packets"
-        before = int(self.guest.run(f"cat {counter}"))
-        self.flood("receipt", [(RECEIPT_PPS, RECEIPT_S)])
-        self.wait(RECEIPT_S + 5)
-        received = int(self.guest.run(f"cat {counter}")) - before
-        ratio = received / (RECEIPT_PPS * RECEIPT_S)
+        """Send a short low-rate burst on every connection; each must arrive."""
+        start = time.time() + 30
+        end = start + RECEIPT_S
+        self.each(
+            self.targets("sender"),
+            lambda t: self.flood(t, "receipt", [(RECEIPT_PPS, start)], end),
+        )
+        self.wait(end + 5 - time.time())
+        self.each(self.targets("sender"), lambda t: self.wait_guest_unit(t, "receipt"))
+        received: dict[str, dict[str, int]] = {}
+
+        def read(target: Target) -> None:
+            received[target.name] = self.counters(target)
+
+        self.each(self.targets("receiver"), read)
+        short = []
+        for c in self.state.plan.connections:
+            expected = RECEIPT_PPS * RECEIPT_S * c.share
+            got = received.get(c.receiver, {}).get(c.sender, 0)
+            if got < RECEIPT_MIN * expected:
+                short.append(f"{c.sender} to {c.receiver} ({got} of {expected:.0f})")
         run_state.event(
             self.state.id,
             "receipt",
-            sent_pps=RECEIPT_PPS,
+            pps_per_sender=RECEIPT_PPS,
             seconds=RECEIPT_S,
             received=received,
-            ratio=round(ratio, 3),
         )
-        if ratio < RECEIPT_MIN:
+        if short:
             raise PreparationError(
-                f"the target received {received} of {RECEIPT_PPS * RECEIPT_S} "
-                "low-rate packets; check the VLAN, MAC, address and security group"
+                "low-rate packets did not arrive: " + ", ".join(short[:10])
             )
 
+    def prefill(self) -> None:
+        """Write every volume once before the warm-up and verify it."""
+        fio_config = self.state.config.workloads.fio
+        assert fio_config
+        size = fio_config.volume_size_gib
+        budget = size * PREFILL_S_PER_GIB
+
+        def start(target: Target) -> None:
+            job = fio.prefill_job(self.devices[target.name], size)
+            command = fio.prefill_command(job, f"{self.guest_dir}/prefill")
+            self.start_guest_unit(self.guests[target.name], "prefill", budget, command)
+
+        self.each(self.targets(), start)
+        deadline = time.monotonic() + budget + 60
+        pending = list(self.targets())
+        while pending:
+            if time.monotonic() > deadline:
+                raise PreparationError(f"the prefill took longer than {budget}s")
+            self.wait(30)
+            running = self.running([(t, "prefill") for t in pending])
+            pending = [t for t in pending if (t.name, "prefill") in running]
+            self.note(f"prefilling the data volumes, {len(pending)} running")
+
+        def verify(target: Target) -> None:
+            self.wait_guest_unit(target, "prefill")
+            text = self.guests[target.name].run(
+                f"cat {self.guest_dir}/prefill/prefill.json 2>/dev/null || true"
+            )
+            if not text.strip() or not fio.prefill_complete(text, size):
+                raise PreparationError(f"the {target.name} prefill did not complete")
+
+        self.each(self.targets(), verify)
+
     def measure(self) -> None:
-        """Run the measured phases of the profile."""
-        state, schedule = self.state, self.state.schedule
-        self.phase("running")
-        state.measured_start = run_state.now()
-        run_state.save(state)
-        start = time.time()
-        if state.profile == "ceph-block":
-            run_state.event(state.id, "measured-phase", phase="sweep")
-            for cell in schedule.fio_cells:
-                self.note(f"fio {cell.label}")
-                run_state.event(state.id, "fio-cell", cell=cell.label)
-                self.run_fio(cell, cell.label)
-            return
-        if state.profile == "network-ceph":
-            self.start_fio(schedule.fio_cells[0], self.offered_iops, "measured")
-        for item in schedule.phases:
-            self.wait(start + item.start_s - time.time())
-            run_state.event(state.id, "measured-phase", phase=item.name)
-            self.note(item.name)
-            if item.name == "stress" and self.sender:
-                count = len(schedule.trex_steps_pps)
-                step_s = item.length_s // count
-                steps = [(pps, step_s) for pps in schedule.trex_steps_pps]
-                steps[-1] = (steps[-1][0], item.length_s - step_s * (count - 1))
-                self.flood("stress", steps)
-        self.wait(start + schedule.duration_s - time.time())
-        if any(item.name == "stress" for item in schedule.phases) and self.sender:
-            self.wait_flood("stress")
-        if state.profile == "network-ceph":
-            self.wait_guest_unit("measured", 300)
+        """Start every workload on the shared timeline and watch it to the end."""
+        state, schedule, config = self.state, self.state.schedule, self.state.config
+        warm = time.time() + LEAD_S
+        start = warm + schedule.warmup_s
+        end = start + schedule.duration_s
+        state.warmup_start = datetime.fromtimestamp(warm, UTC)
+        state.measured_start = datetime.fromtimestamp(start, UTC)
+        self.phase("running", "starting workloads")
+        run_state.event(
+            state.id,
+            "timeline",
+            warmup_start=warm,
+            measured_start=start,
+            measured_end=end,
+        )
+        units: list[tuple[Target, str]] = []
+        trex_config, fio_config = config.workloads.trex, config.workloads.fio
+        if trex_config:
+            pps = [p.pps_per_sender for p in trex_config.profiles]
+            steps = [(pps[0], warm)] + [
+                (pps[w.profile], start + w.start_s) for w in schedule.trex[1:]
+            ]
+            self.each(
+                self.targets("sender"),
+                lambda t: self.flood(t, "flood", steps, end),
+            )
+            units += [(t, "flood") for t in self.targets("sender")]
+        if fio_config:
+            first = fio_config.profiles[0]
+
+            def start_fio(target: Target) -> None:
+                device = self.devices[target.name]
+                jobs: list[dict[str, object]] = [
+                    {
+                        "name": "warmup",
+                        "file": fio.job_file(first, fio_config, device),
+                        "numjobs": fio_config.numjobs,
+                        "start": warm,
+                        "end": start,
+                    }
+                ]
+                for window in schedule.fio:
+                    profile = fio_config.profiles[window.profile]
+                    jobs.append(
+                        {
+                            "name": f"{window.profile + 1:02d}-{profile.name}",
+                            "file": fio.job_file(profile, fio_config, device),
+                            "numjobs": fio_config.numjobs,
+                            "start": start + window.start_s,
+                            "end": start + window.start_s + window.length_s,
+                        }
+                    )
+                command = fio.run_command(jobs, f"{self.guest_dir}/fio")
+                lifetime = int(end - time.time()) + 300
+                self.start_guest_unit(
+                    self.guests[target.name], "fio", lifetime, command
+                )
+
+            self.each(self.targets(), start_fio)
+            units += [(t, "fio") for t in self.targets()]
+        run_state.event(state.id, "dispatched", late_s=round(time.time() - warm, 1))
+        self.note("warm-up")
+        self.wait(start - time.time())
+        self.check_receivers()
+        while time.time() < end:
+            self.note(f"measuring, {int(end - time.time())}s left")
+            self.wait(min(MONITOR_S, end - time.time()))
+            if time.time() < end - 5:
+                self.check_running(units)
+            self.check_receivers()
+        self.note("waiting for the workloads to finish")
+        self.each(units, lambda unit: self.wait_guest_unit(*unit))
+        self.wait(max(end + DRAIN_S - time.time(), 0))
+        self.check_receivers()
+
+    def check_receivers(self) -> None:
+        """Require every receiver to be counting; its sampler stops on a failed read."""
+        if self.state.config.workloads.trex:
+            receivers = self.targets("receiver")
+            self.check_running([(t, "sampler") for t in receivers])
+            self.each(receivers, self.check_counters)
+
+    def running(self, units: list[tuple[Target, str]]) -> set[tuple[str, str]]:
+        """The (VM, unit) pairs whose guest unit is still running."""
+        found: set[tuple[str, str]] = set()
+
+        def check(unit: tuple[Target, str]) -> None:
+            target, name = unit
+            guest = self.guests[target.name]
+            if guest.unit_active(f"cloud-stress-{self.short}-{name}"):
+                found.add((target.name, name))
+
+        self.each(units, check)
+        return found
+
+    def check_running(self, units: list[tuple[Target, str]]) -> None:
+        """Fail the run as soon as a required workload unit has stopped."""
+        running = self.running(units)
+        stopped = [f"{n} in {t.name}" for t, n in units if (t.name, n) not in running]
+        if stopped:
+            raise RuntimeError(
+                "workloads stopped before the end: " + ", ".join(stopped[:10])
+            )
+
+    def check_counters(self, target: Target) -> None:
+        """Fail the run when a receiver's latest sample lacks fresh counters."""
+        out = self.guests[target.name].run(
+            f"date +%s.%N; tail -n 1 {self.guest_dir}/sampler/samples.jsonl"
+        )
+        now, _, line = out.strip().partition("\n")
+        try:
+            sample = json.loads(line)
+            age = float(now) - float(sample["t"])
+        except (ValueError, KeyError, TypeError):
+            raise RuntimeError(f"no receive counter samples in {target.name}") from None
+        senders = [
+            c.sender for c in self.state.plan.connections if c.receiver == target.name
+        ]
+        missing = [s for s in senders if f"nft.from_{s}.packets" not in sample]
+        if age > 3 * SAMPLE_INTERVAL_S["guest"] + 5 or missing or "nft.error" in sample:
+            raise RuntimeError(
+                f"receive counters in {target.name} are not being read: "
+                + str(sample.get("nft.error") or f"latest sample {age:.0f}s old")
+            )
 
     def own_host_dir(self, where: str) -> None:
         """Journal the run's directory on a machine or unit before writing it."""
@@ -342,103 +581,67 @@ class Run:
     ) -> None:
         """Start a host transient unit, journaled before and after."""
         run_state.record(self.state.id, "unit", unit, "intent", id=output, where=where)
+        run_state.event(
+            self.state.id, "command", unit=unit, where=where, command=command
+        )
         remote.start_unit(self.juju, where, unit, lifetime, command)
         run_state.record(self.state.id, "unit", unit, "created", id=output, where=where)
 
     def start_guest_unit(
-        self, guest: Guest, name: str, lifetime: int, command: str
+        self,
+        guest: Guest,
+        name: str,
+        lifetime: int,
+        command: str,
+        evidence: str | None = "",
     ) -> None:
-        """Start a guest transient unit with its own output directory."""
+        """Start a guest transient unit, journaled with the directory it writes.
+
+        By default the unit writes its own directory under the run's guest
+        directory; evidence names another directory, or None for none.
+        """
         unit = f"cloud-stress-{self.short}-{name}"
         out = f"{self.guest_dir}/{name}"
-        record = {"id": out, "where": "guest"}
+        evidence = out if evidence == "" else evidence
+        record = {"id": evidence, "where": guest.name}
         run_state.record(self.state.id, "guest-unit", unit, "intent", **record)
+        run_state.event(
+            self.state.id, "command", unit=unit, where=guest.name, command=command
+        )
         guest.start_unit(
-            unit, lifetime, f"mkdir -p {shlex.quote(out)} && {command}", f"{out}.rc"
+            unit,
+            lifetime,
+            f"mkdir -p {shlex.quote(out)} && {command}",
+            f"{out}.rc",
         )
         run_state.record(self.state.id, "guest-unit", unit, "created", **record)
 
-    def wait_guest_unit(self, name: str, timeout: int) -> None:
+    def wait_guest_unit(self, target: Target, name: str, timeout: int = 120) -> None:
         """Wait for a guest unit to finish and require a zero exit code."""
-        assert self.guest
-        guest, unit = self.guest, f"cloud-stress-{self.short}-{name}"
-        self.wait_for(lambda: not guest.unit_active(unit), timeout + 60, name)
+        guest, unit = self.guests[target.name], f"cloud-stress-{self.short}-{name}"
+        self.wait_for(
+            lambda: not guest.unit_active(unit), timeout, f"{name} in {target.name}"
+        )
         code = guest.exit_code(f"{self.guest_dir}/{name}.rc")
         if code != 0:
-            raise RuntimeError(f"guest job {name} exited with {code}")
-
-    def start_fio(self, cell: FioCell, rate: int | None, name: str) -> None:
-        """Start one fio job in the guest without waiting."""
-        assert self.guest
-        job = fio.job_file(cell, self.device, self.state.schedule.volume_gb, rate)
-        (self.dir / "raw" / f"fio-{name}.fio").write_text(job)
-        command = fio.run_command(cell, job, f"{self.guest_dir}/{name}")
-        self.start_guest_unit(self.guest, name, cell.length_s + 120, command)
-
-    def run_fio(self, cell: FioCell, name: str) -> None:
-        """Run one unthrottled fio job in the guest and wait for it."""
-        self.start_fio(cell, None, name)
-        self.wait_guest_unit(name, cell.length_s + 120)
-
-    def flood(self, name: str, steps: list[tuple[int, int]]) -> None:
-        """Start a TRex flood at the target."""
-        assert self.sender and self.target
-        unit, command, lifetime, out = self.sender.flood_command(
-            name, self.target, self.state.plan.vlan or 0, steps
-        )
-        self.start_host_unit(self.sender.machine, unit, lifetime, command, out)
-        run_state.event(self.state.id, "flood", name=name, steps=steps)
-
-    def wait_flood(self, name: str) -> None:
-        """Wait for a TRex flood to finish and require a zero exit code."""
-        assert self.sender
-        where = self.sender.machine
-        unit = f"{self.sender.flood_unit}-{name}"
-        rc = shlex.quote(f"{self.sender.dir}/{name}.jsonl.rc")
-        self.wait_for(
-            lambda: (
-                remote.sh(
-                    self.juju, where, f"systemctl is-active {unit}.service || true"
-                ).strip()
-                != "active"
-            ),
-            120,
-            f"TRex flood {name}",
-        )
-        code = remote.sh(self.juju, where, f"cat {rc} 2>/dev/null || true").strip()
-        if code != "0":
-            raise RuntimeError(f"TRex flood {name} exited with {code or 'no code'}")
+            raise RuntimeError(f"{name} in {target.name} exited with {code}")
 
     def start_collectors(self) -> None:
-        """Start host and Ceph samplers with a lifetime covering the run."""
-        plan = self.state.plan
-        sources = [
-            (
-                "target-host",
-                "host",
-                plan.target_machine,
-                plan.target_link,
-                plan.target_hw_offload,
+        """Start host, guest and Ceph samplers covering the whole run."""
+        plan, lifetime = self.state.plan, self.state.schedule.max_elapsed_s
+        sources = []
+        for host in plan.hosts:
+            taps = [
                 # Nova names a guest's tap device after its port.
-                f"tap{self.target.port_id[:11]}" if self.target else None,
-            ),
-        ]
-        if uses_trex(self.state.profile):
-            sources.append(
-                (
-                    "sender-host",
-                    "host",
-                    plan.sender_machine,
-                    plan.sender_link,
-                    False,
-                    None,
-                )
-            )
-        if uses_fio(self.state.profile) and plan.ceph_mon:
-            sources.append(("ceph", "ceph", plan.ceph_mon, None, False, None))
-        for name, mode, where, link, offload, tap in sources:
-            if not where:
-                continue
+                f"tap{t.port_id[:11]}"
+                for t in self.state.targets
+                if t.host == host.name and t.port_id
+            ]
+            args = collect.start_args(host.link, host.hw_offload, taps)
+            sources.append((f"host-{host.name}", "host", host.machine, args))
+        if self.state.config.workloads.fio and plan.ceph_mon:
+            sources.append(("ceph", "ceph", plan.ceph_mon, collect.start_args(None)))
+        for name, mode, where, args in sources:
             output = f"{self.host_dir}/{name}.jsonl"
             try:
                 self.own_host_dir(where)
@@ -447,14 +650,13 @@ class Run:
                 )
                 before = time.time()
                 remote_now = float(remote.sh(self.juju, where, "date +%s.%N"))
-                offset = remote_now - (before + time.time()) / 2
+                after = time.time()
                 self.start_host_unit(
                     where,
                     f"cloud-stress-{self.short}-{name}",
-                    self.state.schedule.max_elapsed_s,
+                    lifetime,
                     f"exec python3 {self.host_dir}/sampler.py {mode} {output} "
-                    f"{SAMPLE_INTERVAL_S[mode]} "
-                    f"{shlex.quote(collect.start_args(link, offload, tap))}",
+                    f"{SAMPLE_INTERVAL_S[mode]} {shlex.quote(args)}",
                     output,
                 )
                 run_state.event(
@@ -462,7 +664,8 @@ class Run:
                     "collector",
                     name=name,
                     where=where,
-                    clock_offset_s=round(offset, 3),
+                    clock_offset_s=round(remote_now - (before + after) / 2, 3),
+                    uncertainty_s=round((after - before) / 2, 3),
                 )
             except (
                 jubilant.CLIError,
@@ -478,3 +681,25 @@ class Run:
                     where=where,
                     message=message[:300],
                 )
+        table = trex.counter_table(self.state.id)
+
+        def guest_sampler(target: Target) -> None:
+            guest = self.guests[target.name]
+            path = f"{self.guest_dir}/sampler.py"
+            guest.run(
+                f"mkdir -p {self.guest_dir} && printf %s "
+                f"{shlex.quote(collect.SAMPLER)} > {path}"
+            )
+            args = collect.start_args(
+                self.links.get(target.name),
+                nft=table if target.role == "receiver" else None,
+            )
+            self.start_guest_unit(
+                guest,
+                "sampler",
+                lifetime,
+                f"exec python3 {path} guest {self.guest_dir}/sampler/samples.jsonl "
+                f"{SAMPLE_INTERVAL_S['guest']} {shlex.quote(args)}",
+            )
+
+        self.each(self.targets(), guest_sampler)

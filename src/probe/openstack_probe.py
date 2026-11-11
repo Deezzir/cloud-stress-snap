@@ -116,6 +116,19 @@ def _placement_inventories(
     yield from conn.placement.resource_provider_inventories(provider_id)
 
 
+def _placement_usages(conn: Connection, provider_id: str) -> Iterable[dict[str, int]]:
+    """Defer the usage read so an unavailable service becomes a probe notice."""
+    yield conn.placement.fetch_resource_provider_usages(provider_id).usages or {}
+
+
+def _free(inventory: ResourceProviderInventory, used: int) -> int:
+    """Placement capacity left: (total - reserved) * allocation_ratio - used."""
+    capacity = (inventory.total - (inventory.reserved or 0)) * (
+        inventory.allocation_ratio or 1.0
+    )
+    return int(capacity) - used
+
+
 def probe_openstack(cloud: CloudRegion) -> tuple[OpenstackResult, list[ProbeNotice]]:
     """Collect OpenStack infrastructure details using the provided cloud region."""
     notices: list[ProbeNotice] = []
@@ -147,7 +160,7 @@ def probe_openstack(cloud: CloudRegion) -> tuple[OpenstackResult, list[ProbeNoti
     for host in hosts:
         notice_count = len(notices)
         inventory = {
-            item.resource_class: item.total
+            item.resource_class: item
             for item in _collect(
                 _placement_inventories(conn, host.id),
                 f"placement.inventories:{host.id}",
@@ -155,8 +168,9 @@ def probe_openstack(cloud: CloudRegion) -> tuple[OpenstackResult, list[ProbeNoti
                 notices,
             )
         }
-        host.vcpus = inventory.get("VCPU")
-        host.memory_mb = inventory.get("MEMORY_MB")
+        vcpu, memory = inventory.get("VCPU"), inventory.get("MEMORY_MB")
+        host.vcpus = vcpu.total if vcpu else None
+        host.memory_mb = memory.total if memory else None
         if inventory:
             host.capacity_source = "placement"
         if len(notices) == notice_count and (
@@ -171,6 +185,23 @@ def probe_openstack(cloud: CloudRegion) -> tuple[OpenstackResult, list[ProbeNoti
                     "Missing capacity remains unknown; inspect the provider inventory.",
                 )
             )
+        if vcpu and memory:
+            usages = next(
+                iter(
+                    _collect(
+                        _placement_usages(conn, host.id),
+                        f"placement.usages:{host.id}",
+                        f"Placement usage for host {host.hostname or host.id}",
+                        notices,
+                    )
+                ),
+                None,
+            )
+            if usages is not None:
+                host.vcpus_free = _free(vcpu, usages.get("VCPU", 0))
+                host.memory_mb_free = _free(memory, usages.get("MEMORY_MB", 0))
+                host.vcpus_max_unit = vcpu.max_unit
+                host.memory_mb_max_unit = memory.max_unit
     compute_services = [
         ComputeService(
             id=str(item.id), host=item.host, binary=item.binary, state=item.state

@@ -1,109 +1,105 @@
-# Campaigns
+# Runs
 
-cloud-stress runs one campaign at a time. A campaign is a built-in profile with
-a fixed workload and phase layout; `--duration` sets the measured window and the
-phases are split from it by weight.
+A run executes the workloads selected in a configuration file on a fixed fleet
+of VMs and records time-series measurements of the workloads, hosts and Ceph.
+One run is active at a time.
 
-| Profile | Load | Phases (weight) | Minimum duration |
-| --- | --- | --- | --- |
-| `host-network` | UDP flood, sender host to target guest | baseline 1, stress 4, recovery 1 | 6m |
-| `ceph-block` | fio on a Ceph volume in the target guest | sweep 1 | 6m |
-| `network-ceph` | `host-network` flood and fio together | baseline 1, stress 3, recovery 1 | 10m |
+```bash
+cp /snap/cloud-stress/current/share/cloud-stress/config.yaml ~/stress.yaml
+cloud-stress run start --config ~/stress.yaml
+```
 
-Preparation, calibration and finalization run outside the measured window and
-have their own time budgets.
+The run prints its resources, fleet and schedule, then starts. The
+[configuration reference](configuration.md) describes every setting, placement
+and how the duration is divided; [`config.yaml`](../config.yaml) is the
+example.
 
-## Participants
+Every VM belongs to one fleet: `vms: 50` creates 50 VMs in total. When fio is
+enabled, every VM gets a data volume and runs fio. The run checks that every VM
+landed on its planned hypervisor and fails otherwise.
 
-Every run uses the same placement, chosen by `cloud-stress check` and shown
-before the run starts:
+## TRex
 
-- **Sender**: a hypervisor that generates the flood with TRex. TRex comes from
-  the `trex-generator` snap, installed for the run and removed afterwards.
-- **Target**: a different hypervisor that hosts the run's guest.
-- **Guest**: one instance on the target, attached to the tested provider
-  network (VLAN) and to an overlay network used only for management.
-- **Ceph**: the cluster backing the guest's Cinder volume, sampled for
-  profiles that run fio.
+Each sender is paired with one or more receivers so that every connection
+crosses hypervisors.
 
-All resources are named `cloud-stress-<run-id>-*` and are deleted at the end
-of the run.
+Packets use the guests' own MAC and IP addresses on the provider network; the
+UDP source port changes with each packet and checksums stay valid. A run-owned
+security group admits the destination port only from the run's own ports.
 
-## host-network
+Senders install the `trex-generator` snap and run TRex on their data interface
+through a Linux socket, without binding the device. Receivers count packets
+from each assigned sender with nftables at the raw prerouting hook, matching
+source and destination address, UDP and the destination port, then drop them.
+Counts therefore show benchmark packets that reached the guest's network
+stack, not packets read by an application. Before measuring, the run sends a
+short low-rate burst on every connection and requires it to arrive.
 
-Measures how the target host's network path holds up under packet load from
-another hypervisor.
+Guests must reach the Snap Store and an Ubuntu package mirror.
 
-1. **Calibration**: TRex sends a 1,000 pps burst for 15 s; the run continues
-   only if the target receives it.
-2. **Baseline**: no load; host and guest counters are sampled.
-3. **Stress**: TRex sends UDP to the guest's provider address in four equal
-   steps up to 1,000,000 pps (250k, 500k, 750k, 1M). Each packet has a new
-   source address and source port, so OVS cannot aggregate them into one
-   megaflow. Source addresses come from documentation and benchmarking ranges
-   (`2001:db8:1::/48`, `198.18.0.0/15`), so replies never reach a real host.
-4. **Recovery**: load stops; counters are sampled until the window ends.
+## fio
 
-Reported per step: requested, sent and received pps, and loss. Reported per
-phase on the target: CPU busy, softirq and iowait; link, NIC ring and guest tap
-drops; OVS lost upcalls; guest NIC drops.
+Jobs use libaio, direct I/O and a time-based runtime over the whole device.
+With more than one job, each job gets its own region of equal size.
 
-If TRex cannot send the requested rate, the report says so: the step's
-"delivered" column shows what the sender achieved, and loss is computed against
-what was sent, not what was requested.
+Before the volume is used, the run checks that the device in the guest is the
+run's volume, unpartitioned and not the root disk. It then writes the whole
+volume with four writers on separate quarters.
 
-## ceph-block
+## Timeline
 
-Measures block storage latency and throughput as seen from a guest.
+Each workload divides `duration` among its own profiles; the lists are not
+combined. With `duration: 10m`, two TRex profiles and four fio profiles:
 
-1. **Preparation**: a 20 GiB volume is created and attached. The run checks
-   that the device in the guest is the run's volume, is unpartitioned and is
-   not the root disk.
-2. **Prefill**: the whole volume is written once, so reads hit allocated data.
-3. **Sweep**: 12 cells run one after another, each for an equal share of the
-   window:
+| Measured time | TRex profile | fio profile |
+| --- | --- | --- |
+| 0:00-2:30 | 1 | 1 |
+| 2:30-5:00 | 1 | 2 |
+| 5:00-7:30 | 2 | 3 |
+| 7:30-10:00 | 2 | 4 |
 
-   | Workload | Block size | Queue depths |
-   | --- | --- | --- |
-   | random read | 4k | 1, 16, 64 |
-   | random write | 4k | 1, 16, 64 |
-   | sequential read | 1m | 1, 16, 64 |
-   | sequential write | 1m | 1, 16, 64 |
+Every guest receives the full schedule before it starts and changes profile
+at the planned times; a TRex rate change does not restart fio, and the reverse.
+A 10-second warm-up with the first profiles runs before the measured time and
+is excluded from results. Preparation, prefill and cleanup are outside the
+measured time.
 
-fio uses libaio with direct I/O and two jobs on separate halves of the volume.
-
-Reported per cell: completed I/Os, IOPS, and p50 and p99 latency. Ceph health, slow
-ops, unclean PGs and cluster read/write ops are sampled throughout.
-
-## network-ceph
-
-Measures whether network load on a hypervisor degrades storage on the same
-host.
-
-1. **Calibration**: the receipt check from `host-network`, then a volume prefill,
-   then a 60 s fio run to measure the volume's maximum IOPS.
-2. **Baseline**: fio runs at half the calibrated IOPS (4k random, 70% read,
-   queue depth 16) with no network load.
-3. **Stress**: the `host-network` flood steps run while fio continues at the same
-   rate.
-4. **Recovery**: the flood stops; fio continues.
-
-fio runs at a fixed rate so that latency changes between phases come from the
-flood, not from fio competing with itself. Compare baseline, stress and
-recovery for fio IOPS and p99 latency (also shown as change from baseline),
-target host drops and Ceph slow ops.
+If a workload or a receiver's packet counting stops early in any VM, the run
+stops and is reported as failed. Each fio job is stopped at the end of its
+window.
 
 ## Results
 
-Each run writes a bundle to `/var/snap/cloud-stress/common/runs/<run-id>/`
-with the raw tool output, sampled metrics and a summary. Results list SLO
-indicators without a pass or fail verdict; compare them with your own targets.
+Each run writes a bundle to `/var/snap/cloud-stress/common/runs/<run-id>/`:
+
+| Path | Contents |
+| --- | --- |
+| `report.json` | Resolved configuration, fleet, connections, timeline and summaries |
+| `graphs/` | PNG graphs on the measured time axis, with profile changes marked |
+| `metrics/` | Time series per VM, per fio job, per host and Ceph |
+| `raw/` | TRex statistics, nftables and host samples, fio jobs, logs and JSON |
+| `events.jsonl` | Run events, the commands started, tool versions and clock offsets |
 
 ```bash
 cloud-stress run status [<run-id>]
 cloud-stress run status [<run-id>] --json
 cloud-stress run status [<run-id>] --html report.html
 ```
+
+How values are computed:
+
+- Network rates come from cumulative counters between consecutive samples
+  of each VM: packets and frame bytes sent by TRex in each sender, and IP
+  packets and bytes counted by nftables in each receiver. Graphs show each
+  VM's rates, with the requested rate per sender, and its packets counted
+  since its first sample in the measured time. Per profile, the report lists the
+  range of per-VM rates over each VM's samples inside the window.
+- fio values come from each job's logs, one value per logged interval, and
+  from fio's result for each job over its own runtime. Per profile, the
+  report lists the range of per-job IOPS, bandwidth and p99 latency.
+- Missing samples, sample gaps, missing coverage at the start or end of the
+  measured time, failed reads, counter resets and clock offsets above 2
+  seconds are listed as gaps.
 
 Exit codes: `0` completed, `20` failed, interrupted or not cleaned up, `30`
 cancelled.

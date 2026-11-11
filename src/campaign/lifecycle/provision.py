@@ -10,24 +10,28 @@ from openstack import exceptions
 from openstack.connection import Connection
 
 from campaign.model import state as run_state
-from campaign.model.profiles import FLOOD_PORT, FLOOD_SOURCE_CIDR, uses_trex
 from campaign.model.state import RunState
 from campaign.model.target import Target
-
-BUILD_TIMEOUT = 600
+from constants import BUILD_TIMEOUT_S
 
 
 class PreparationError(Exception):
     """A required capability is missing; no load was applied."""
 
 
-def name(state: RunState, kind: str) -> str:
+def name(state: RunState, kind: str, vm: str | None = None) -> str:
     """Deterministic, run-owned resource name."""
-    return f"cloud-stress-{state.id}-{kind}"
+    return (
+        f"cloud-stress-{state.id}-{vm}-{kind}"
+        if vm
+        else f"cloud-stress-{state.id}-{kind}"
+    )
 
 
-def _create(state: RunState, kind: str, create: Callable[[str], Any]) -> Any:
-    resource_name = name(state, kind)
+def _create(
+    state: RunState, kind: str, create: Callable[[str], Any], vm: str | None = None
+) -> Any:
+    resource_name = name(state, kind, vm)
     run_state.record(state.id, kind, resource_name, "intent", where="openstack")
     try:
         resource = create(resource_name)
@@ -51,23 +55,6 @@ def _create(state: RunState, kind: str, create: Callable[[str], Any]) -> Any:
     return resource
 
 
-def _wait(
-    read: Callable[[], Any],
-    done: Callable[[Any], bool],
-    what: str,
-    sleep: Callable[[float], None],
-) -> Any:
-    deadline = time.monotonic() + BUILD_TIMEOUT
-    while time.monotonic() < deadline:
-        value = read()
-        if done(value):
-            return value
-        if str(getattr(value, "status", "")).lower() == "error":
-            raise PreparationError(f"{what} went into ERROR")
-        sleep(5)
-    raise PreparationError(f"{what} not ready after {BUILD_TIMEOUT}s")
-
-
 def metadata_address(conn: Connection, network_id: str) -> str:
     """IPv4 address of the network's OVN metadata port, the guests' SSH source."""
     for port in conn.network.ports(
@@ -81,21 +68,26 @@ def metadata_address(conn: Connection, network_id: str) -> str:
     )
 
 
-def check_quota(conn: Connection, vcpus: int, ram_mb: int, volume_gb: int) -> list[str]:
-    """Report quota that would block the run's server or volume."""
+def check_quota(
+    conn: Connection, count: int, vcpus: int, ram_mb: int, volume_gb: int
+) -> list[str]:
+    """Report quota that would block the run's servers or volumes."""
     problems = []
     compute = conn.compute.get_limits().absolute
-    if compute.instances_used + 1 > compute.instances >= 0:
-        problems.append("the instance quota is used up")
-    if compute.total_cores_used + vcpus > compute.total_cores >= 0:
-        problems.append(f"the core quota has no room for {vcpus} vCPUs")
-    if compute.total_ram_used + ram_mb > compute.total_ram >= 0:
-        problems.append(f"the RAM quota has no room for {ram_mb} MiB")
+    if compute.instances_used + count > compute.instances >= 0:
+        problems.append(f"the instance quota has no room for {count} servers")
+    if compute.total_cores_used + count * vcpus > compute.total_cores >= 0:
+        problems.append(f"the core quota has no room for {count * vcpus} vCPUs")
+    if compute.total_ram_used + count * ram_mb > compute.total_ram >= 0:
+        problems.append(f"the RAM quota has no room for {count * ram_mb} MiB")
     if volume_gb:
         volume = conn.block_storage.get_limits().absolute
         used, limit = volume.total_gigabytes_used, volume.max_total_volume_gigabytes
-        if used + volume_gb > limit >= 0:
-            problems.append(f"the volume quota has no room for {volume_gb} GB")
+        if used + count * volume_gb > limit >= 0:
+            problems.append(f"the volume quota has no room for {count * volume_gb} GB")
+        used, limit = volume.total_volumes_used, volume.max_total_volumes
+        if used + count > limit >= 0:
+            problems.append(f"the volume quota has no room for {count} volumes")
     return problems
 
 
@@ -105,12 +97,17 @@ def provision(
     public_key: str,
     host_key: tuple[str, str],
     sleep: Callable[[float], None],
-) -> Target:
-    """Create the run's key pair, security group, ports, volume and target guest."""
-    plan, schedule = state.plan, state.schedule
+) -> list[Target]:
+    """Create the run's key pair, security group and VMs with their ports and volumes.
+
+    Calls run one after another; servers and volumes build in parallel in the
+    cloud and are awaited together.
+    """
+    plan, config = state.plan, state.config
+    trex, fio = config.workloads.trex, config.workloads.fio
     source = metadata_address(conn, plan.mgmt_network_id or "")
     volume_type = None
-    if schedule.volume_gb:
+    if fio:
         types = {t.name for t in conn.block_storage.types()}
         if plan.volume_type in types:
             volume_type = plan.volume_type
@@ -128,129 +125,195 @@ def provision(
             name=n, description="cloud-stress run-owned"
         ),
     )
-    port = _create(
-        state,
-        "port",
-        lambda n: conn.network.create_port(
-            name=n, network_id=plan.network_id, security_group_ids=[group.id]
-        ),
+    conn.network.create_security_group_rule(
+        security_group_id=group.id,
+        direction="ingress",
+        ethertype="IPv4",
+        protocol="tcp",
+        port_range_min=22,
+        port_range_max=22,
+        remote_ip_prefix=f"{source}/32",
     )
-    mgmt_port = _create(
-        state,
-        "mgmt-port",
-        lambda n: conn.network.create_port(
-            name=n, network_id=plan.mgmt_network_id, security_group_ids=[group.id]
-        ),
-    )
-    addresses = [item["ip_address"] for item in port.fixed_ips]
-    address = next(
-        (a for a in addresses if (":" in a) == (plan.ip_version == 6)), addresses[0]
-    )
-    mgmt_address = next(
-        a["ip_address"] for a in mgmt_port.fixed_ips if ":" not in a["ip_address"]
-    )
-    rules = [("tcp", 22, f"{source}/32")]
-    if uses_trex(state.profile):
-        rules.append(("udp", FLOOD_PORT, FLOOD_SOURCE_CIDR[plan.ip_version or 6]))
-    for protocol, port_number, cidr in rules:
+    if trex:
         conn.network.create_security_group_rule(
             security_group_id=group.id,
             direction="ingress",
-            ethertype="IPv6" if ":" in cidr else "IPv4",
-            protocol=protocol,
-            port_range_min=port_number,
-            port_range_max=port_number,
-            remote_ip_prefix=cidr,
-        )
-    volume = None
-    if schedule.volume_gb:
-        volume = _create(
-            state,
-            "volume",
-            lambda n: conn.block_storage.create_volume(
-                name=n, size=schedule.volume_gb, volume_type=volume_type
-            ),
+            ethertype=f"IPv{plan.ip_version or 6}",
+            protocol="udp",
+            port_range_min=trex.udp_dst_port,
+            port_range_max=trex.udp_dst_port,
+            remote_group_id=group.id,
         )
     private, public = host_key
     user_data = "#cloud-config\n" + yaml.safe_dump(
         {
             "ssh_keys": {"ed25519_private": private, "ed25519_public": public},
-            "package_update": bool(schedule.fio_cells),
-            "packages": ["fio"] if schedule.fio_cells else [],
+            "package_update": bool(fio or trex),
+            "packages": (["fio"] if fio else []) + (["nftables"] if trex else []),
         }
     )
-    server = _create(
-        state,
-        "server",
-        lambda n: conn.compute.create_server(
-            name=n,
-            image_id=plan.image_id,
-            flavor_id=plan.flavor_id,
-            networks=[{"port": mgmt_port.id}, {"port": port.id}],
-            config_drive=True,
-            key_name=keypair.name,
-            user_data=base64.b64encode(user_data.encode()).decode(),
-            hypervisor_hostname=plan.target_hypervisor,
-        ),
-    )
-    server = _wait(
-        lambda: conn.compute.get_server(server.id),
+    hypervisors = {host.name: host.hypervisor for host in plan.hosts}
+    targets, servers, volumes = [], {}, {}
+    for vm in plan.vms:
+        mgmt_port = _create(
+            state,
+            "mgmt-port",
+            lambda n: conn.network.create_port(
+                name=n, network_id=plan.mgmt_network_id, security_group_ids=[group.id]
+            ),
+            vm.name,
+        )
+        networks = [{"port": mgmt_port.id}]
+        target = Target(
+            name=vm.name,
+            host=vm.host,
+            role=vm.role,
+            server_id="",
+            mgmt_port_id=mgmt_port.id,
+            mgmt_address=next(
+                a["ip_address"]
+                for a in mgmt_port.fixed_ips
+                if ":" not in a["ip_address"]
+            ),
+            security_groups=[group.id],
+        )
+        if trex:
+            port = _create(
+                state,
+                "port",
+                lambda n: conn.network.create_port(
+                    name=n, network_id=plan.network_id, security_group_ids=[group.id]
+                ),
+                vm.name,
+            )
+            addresses = [item["ip_address"] for item in port.fixed_ips]
+            target.port_id, target.mac = port.id, port.mac_address
+            target.address = next(
+                (a for a in addresses if (":" in a) == (plan.ip_version == 6)),
+                addresses[0],
+            )
+            networks.append({"port": port.id})
+        if fio:
+            volumes[vm.name] = _create(
+                state,
+                "volume",
+                lambda n: conn.block_storage.create_volume(
+                    name=n, size=fio.volume_size_gib, volume_type=volume_type
+                ),
+                vm.name,
+            ).id
+        servers[vm.name] = _create(
+            state,
+            "server",
+            # _create calls this at once, inside this iteration.
+            lambda n: conn.compute.create_server(
+                name=n,
+                image_id=vm.image_id,  # noqa: B023
+                flavor_id=plan.flavor_id,
+                networks=networks,  # noqa: B023
+                config_drive=True,
+                key_name=keypair.name,
+                user_data=base64.b64encode(user_data.encode()).decode(),
+                hypervisor_hostname=hypervisors[vm.host],  # noqa: B023
+            ),
+            vm.name,
+        ).id
+        target.server_id = servers[vm.name]
+        targets.append(target)
+
+    built = _wait_all(
+        servers,
+        conn.compute.get_server,
         lambda s: s.status == "ACTIVE",
-        "the target guest",
+        "guest",
         sleep,
     )
-    if server.hypervisor_hostname != plan.target_hypervisor:
-        raise PreparationError(
-            f"the guest landed on {server.hypervisor_hostname}, "
-            f"not {plan.target_hypervisor}"
-        )
-    target = Target(
-        server_id=server.id,
-        port_id=port.id,
-        mac=port.mac_address,
-        address=address,
-        mgmt_port_id=mgmt_port.id,
-        mgmt_address=mgmt_address,
-        binding_host=None,
-        security_groups=[group.id],
-    )
-    if volume:
-        volume_id = volume.id
-        volume = _wait(
-            lambda: conn.block_storage.get_volume(volume_id),
-            lambda v: v.status == "available",
-            "the data volume",
-            sleep,
-        )
-        if volume_type and volume.volume_type != volume_type:
+    for target in targets:
+        landed = built[target.name].hypervisor_hostname
+        if landed != hypervisors[target.host]:
             raise PreparationError(
-                f"the volume was created as {volume.volume_type}, not {volume_type}"
+                f"{target.name} landed on {landed}, not {hypervisors[target.host]}"
             )
-        _create(
-            state,
-            "attachment",
-            lambda _: conn.compute.create_volume_attachment(
-                server.id, volume_id=volume_id
-            ),
-        )
-        volume = _wait(
-            lambda: conn.block_storage.get_volume(volume_id),
-            lambda v: v.status == "in-use",
-            "the volume attachment",
+    if volumes:
+        ready = _wait_all(
+            volumes,
+            conn.block_storage.get_volume,
+            lambda v: v.status == "available",
+            "data volume",
             sleep,
         )
-        target.volume_id = volume.id
-        target.volume_type = volume.volume_type
-        target.volume_size_gb = volume.size
-        target.volume_backend = volume.host
-    observed = conn.network.get_port(port.id)
-    target.binding_host = observed.binding_host_id
-    target.security_groups = list(observed.security_group_ids)
-    if _short(observed.binding_host_id) != _short(plan.target_hypervisor):
-        raise PreparationError(f"the port is bound to {observed.binding_host_id}")
-    if target.security_groups != [group.id]:
-        raise PreparationError("the port has security groups the run does not own")
-    return target
+        for vm_name, volume in ready.items():
+            if volume_type and volume.volume_type != volume_type:
+                raise PreparationError(
+                    f"the {vm_name} volume was created as {volume.volume_type}, "
+                    f"not {volume_type}"
+                )
+            _create(
+                state,
+                "attachment",
+                lambda _: conn.compute.create_volume_attachment(
+                    servers[vm_name],  # noqa: B023
+                    volume_id=volumes[vm_name],  # noqa: B023
+                ),
+                vm_name,
+            )
+        attached = _wait_all(
+            volumes,
+            conn.block_storage.get_volume,
+            lambda v: v.status == "in-use",
+            "volume attachment",
+            sleep,
+        )
+        for target in targets:
+            volume = attached[target.name]
+            target.volume_id = volume.id
+            target.volume_type = volume.volume_type
+            target.volume_size_gb = volume.size
+            target.volume_backend = volume.host
+    for target in targets:
+        if not target.port_id:
+            continue
+        observed = conn.network.get_port(target.port_id)
+        target.binding_host = observed.binding_host_id
+        target.security_groups = list(observed.security_group_ids)
+        if _short(observed.binding_host_id) != _short(hypervisors[target.host]):
+            raise PreparationError(
+                f"the {target.name} port is bound to {observed.binding_host_id}"
+            )
+        if target.security_groups != [group.id]:
+            raise PreparationError(
+                f"the {target.name} port has security groups the run does not own"
+            )
+    return targets
+
+
+def _wait_all(
+    ids: dict[str, str],
+    read: Callable[[str], Any],
+    done: Callable[[Any], bool],
+    what: str,
+    sleep: Callable[[float], None],
+) -> dict[str, Any]:
+    """Poll every resource until all are done, within one shared timeout."""
+    deadline = time.monotonic() + BUILD_TIMEOUT_S
+    finished: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        for key, resource_id in ids.items():
+            if key in finished:
+                continue
+            value = read(resource_id)
+            if done(value):
+                finished[key] = value
+            elif str(getattr(value, "status", "")).lower() == "error":
+                raise PreparationError(f"the {key} {what} went into ERROR")
+        if len(finished) == len(ids):
+            return finished
+        sleep(5)
+    waiting = sorted(set(ids) - set(finished))
+    raise PreparationError(
+        f"{len(waiting)} {what}s not ready after {BUILD_TIMEOUT_S}s: "
+        + ", ".join(waiting)
+    )
 
 
 def _short(host: str | None) -> str:
@@ -283,26 +346,26 @@ FIND: dict[str, Callable[[Connection, str], Any]] = {
 def cleanup(conn: Connection, state: RunState) -> None:
     """Delete outstanding run-owned cloud resources; failures stay in the journal.
 
-    Deleting the server detaches its volume, so attachments are settled after
-    the server instead of through a separate detach call.
+    Deleting a server detaches its volume, so attachments are settled after the
+    servers instead of through a separate detach call.
     """
     entries = [
         e for e in reversed(run_state.outstanding(state.id)) if e.where == "openstack"
     ]
-    attachments = [e for e in entries if e.kind == "attachment"]
-    others = [e for e in entries if e.kind != "attachment"]
-    after_server = next((i + 1 for i, e in enumerate(others) if e.kind == "server"), 0)
-    for entry in others[:after_server] + attachments + others[after_server:]:
+    order = {"server": 0, "attachment": 1}
+    for entry in sorted(entries, key=lambda e: order.get(e.kind, 2)):
         try:
             if entry.kind == "attachment":
-                server = FIND["server"](conn, name(state, "server"))
-                volume = FIND["volume"](conn, name(state, "volume"))
+                prefix = entry.name.removesuffix("attachment")
+                server = FIND["server"](conn, f"{prefix}server")
+                volume = FIND["volume"](conn, f"{prefix}volume")
                 if server and volume:
                     conn.compute.delete_volume_attachment(
                         server.id, volume.id, ignore_missing=True
                     )
+                if volume:
                     conn.block_storage.wait_for_status(
-                        volume, "available", wait=BUILD_TIMEOUT
+                        volume, "available", wait=BUILD_TIMEOUT_S
                     )
             else:
                 # An intent without an ID may still have created the resource;
@@ -315,12 +378,12 @@ def cleanup(conn: Connection, state: RunState) -> None:
                         conn.block_storage.wait_for_status(
                             conn.block_storage.get_volume(found),
                             "available",
-                            wait=BUILD_TIMEOUT,
+                            wait=BUILD_TIMEOUT_S,
                         )
                     DELETE[entry.kind](conn, found)
                     if entry.kind == "server":
                         conn.compute.wait_for_delete(
-                            conn.compute.get_server(found), wait=BUILD_TIMEOUT
+                            conn.compute.get_server(found), wait=BUILD_TIMEOUT_S
                         )
             run_state.transition(state.id, entry, "deleted")
         except exceptions.NotFoundException:

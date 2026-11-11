@@ -1,6 +1,6 @@
 """SSH to run-owned guests from their host's OVN metadata namespace.
 
-The guest's management NIC sits on an overlay network. On the target host, that
+A guest's management NIC sits on an overlay network. On the guest's host, that
 network's `ovnmeta-<network-id>` namespace has an address on the same subnet, so
 SSH runs there through `juju exec`, with the run's key and pinned host key.
 """
@@ -15,8 +15,7 @@ from campaign.model.state import RunState
 from campaign.model.target import Target
 from campaign.transport import remote
 from campaign.transport.remote import STOP
-
-SSH_TIMEOUT = 120
+from constants import SSH_TIMEOUT_S
 
 
 def keygen(path: Path) -> str:
@@ -36,32 +35,38 @@ class Guest:
         network_id: str,
         address: str,
         host_dir: str,
+        name: str,
     ) -> None:
         """Remember the jump host, namespace, guest address and key paths."""
         self.juju = juju
         self.machine = machine
         self.namespace = f"ovnmeta-{network_id}"
         self.address = address
+        self.name = name
         self.key = f"{host_dir}/guest/id_ed25519"
-        self.known_hosts = f"{host_dir}/guest/known_hosts"
+        self.known_hosts = f"{host_dir}/guest/{name}.known_hosts"
 
-    def install_keys(self, private_key: str, host_public_key: str) -> None:
-        """Place the run's key and the guest's pinned host key on the jump host."""
-        remote.push(self.juju, self.machine, self.key, private_key)
+    def install_keys(self, private_key: str | None, host_public_key: str) -> None:
+        """Place the guest's pinned host key, and the run's key if given, on the host.
+
+        Guests on one host share the run's key, so it is placed once per host.
+        """
+        if private_key is not None:
+            remote.push(self.juju, self.machine, self.key, private_key)
+            remote.sh(self.juju, self.machine, f"chmod 600 {shlex.quote(self.key)}")
         remote.push(
             self.juju,
             self.machine,
             self.known_hosts,
             f"{self.address} {host_public_key}\n",
         )
-        remote.sh(self.juju, self.machine, f"chmod 600 {shlex.quote(self.key)}")
 
     def namespace_ready(self) -> bool:
         """Whether the management network's metadata namespace exists on the host."""
         out = remote.sh(self.juju, self.machine, "ip netns list")
         return any(line.split()[:1] == [self.namespace] for line in out.splitlines())
 
-    def run(self, command: str, timeout: int = SSH_TIMEOUT) -> str:
+    def run(self, command: str, timeout: int = SSH_TIMEOUT_S) -> str:
         """Run a command with sudo on the guest and return stdout."""
         options = (
             "BatchMode=yes",
@@ -102,11 +107,18 @@ class Guest:
             return False
 
     def start_unit(self, unit: str, max_s: int, command: str, rc_path: str) -> None:
-        """Start a transient unit that records its exit code in rc_path."""
-        script = f"{command}; echo $? > {shlex.quote(rc_path)}"
+        """Start a transient unit that records its exit code in rc_path.
+
+        snapd moves a snap app into its own cgroup scope, so `timeout` bounds the
+        command too and forwards the unit's stop signal to it.
+        """
+        script = (
+            f"timeout --kill-after=10 {max_s} bash -c {shlex.quote(command)}; "
+            f"echo $? > {shlex.quote(rc_path)}"
+        )
         self.run(
             f"systemd-run --unit {unit} --collect "
-            f"--property RuntimeMaxSec={max_s} --property KillMode=control-group "
+            f"--property RuntimeMaxSec={max_s + 30} --property KillMode=control-group "
             f"bash -c {shlex.quote(script)}"
         )
 
@@ -126,11 +138,13 @@ class Guest:
 
 
 def guest_for(juju: jubilant.Juju, state: RunState, target: Target) -> Guest:
-    """The run's target guest, reached from the target host."""
+    """One of the run's guests, reached from its own host."""
+    machine = next(h.machine for h in state.plan.hosts if h.name == target.host)
     return Guest(
         juju,
-        state.plan.target_machine or "",
+        machine,
         state.plan.mgmt_network_id or "",
         target.mgmt_address,
         f"/var/lib/cloud-stress/{state.id}",
+        target.name,
     )

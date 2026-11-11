@@ -50,11 +50,11 @@ Host commands run through `juju exec`; `run` uses `sudo` on machines, where `juj
 | Command | On | Does |
 | --- | --- | --- |
 | `check` | `ceph-mon`, `ovn-chassis`, hypervisors | Read-only Ceph actions, `ceph`, `ovs-vsctl` and hardware reads. |
-| `run` | Sender, target and `ceph-mon` hosts | Starts run-owned transient units and files under `/var/lib/cloud-stress/<run-id>`. |
-| `run` | Target | Holds the run's guest key and runs SSH to the guest from the management network's OVN metadata namespace. |
-| `run` | Sender | Installs the `trex-generator` snap, then purges it. Needs Snap Store access. |
+| `run` | Hypervisors in the fleet and `ceph-mon` | Starts run-owned transient units and files under `/var/lib/cloud-stress/<run-id>`. |
+| `run` | Hypervisors in the fleet | Hold the run's guest key and run SSH to their guests from the management network's OVN metadata namespace. |
 
-`trex-generator` connections:
+In TRex sender guests, `run` installs the `trex-generator` snap from the Snap
+Store with these connections:
 
 | Connection | What it allows |
 | --- | --- |
@@ -65,9 +65,10 @@ Host commands run through `juju exec`; `run` uses `sudo` on machines, where `juj
 
 ## OpenStack resources
 
-`run` creates a guest, two ports, a security group and a volume in your project,
-and deletes them during finalization. The guest accepts SSH only from the
-management network's metadata address, with a key generated for the run.
+`run` creates a key pair, a security group and, for each VM, a server, its ports
+and, with fio, a volume in your project, and deletes them during finalization.
+Guests accept SSH only from the management network's metadata address, with a
+key generated for the run, and TRex traffic only from the run's own ports.
 
 ## Sharing output
 

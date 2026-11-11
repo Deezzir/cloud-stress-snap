@@ -1,37 +1,29 @@
-"""Run result model: report.json, metric series, and the files built from them.
+"""Run result: report.json, metric series and graphs, built from the run bundle.
 
-Everything is computed from the run bundle, so a partial bundle still produces a
-result with its gaps listed rather than an error.
+Everything is computed from the bundle, so a partial bundle still produces a
+result with its gaps listed rather than an error. Missing samples stay missing
+and are never counted as zero. Values are per VM or per fio job; nothing is
+added up across VMs.
 """
 
 import json
-from datetime import datetime
 from pathlib import Path
+from typing import NamedTuple, cast
 
-from campaign.model.profiles import format_duration
 from campaign.model.state import RunState, events, now, outstanding, run_dir
+from campaign.model.target import Target
+from campaign.report import plots
 from campaign.workloads import collect, fio
-from probe.models import RunPlan
+from constants import (
+    FIO_DIRECTIONS,
+    FIO_LOG_MS,
+    MAX_CLOCK_OFFSET_S,
+    MAX_REPORT_FILE_BYTES,
+)
 
 Row = dict[str, object]
-Window = tuple[str, float, float]
-
-COLLECTORS = ("target-host", "sender-host", "ceph")
-MAX_FILE_BYTES = 64 * 1024**2
-MAX_CLOCK_OFFSET_S = 2.0
-PLACEMENT = (
-    "sender",
-    "sender_link",
-    "target",
-    "network",
-    "vlan",
-    "ip_version",
-    "mgmt_network",
-    "image",
-    "flavor",
-    "volume_type",
-    "target_link",
-)
+Samples = list[tuple[float, float]]
+DIRECTIONS = tuple(FIO_DIRECTIONS.values())
 
 
 def _num(value: object) -> float | None:
@@ -41,23 +33,12 @@ def _num(value: object) -> float | None:
     return float(value)
 
 
-def _mean(values: list[float]) -> float | None:
-    """Rounded arithmetic mean, or None for no values."""
-    return round(sum(values) / len(values), 2) if values else None
-
-
-def _ratio(part: object, whole: object) -> float | None:
-    """Rounded ratio, or None when either side is missing or zero."""
-    a, b = _num(part), _num(whole)
-    return round(a / b, 3) if a is not None and b else None
-
-
 def _text(bundle: Path, rel: str, gaps: list[str]) -> str | None:
     """Read a bundle file unless it is missing or too large to load."""
     path = bundle / rel
     if not path.is_file():
         return None
-    if path.stat().st_size > MAX_FILE_BYTES:
+    if path.stat().st_size > MAX_REPORT_FILE_BYTES:
         gaps.append(f"{rel}: larger than 64 MiB, not read")
         return None
     return path.read_text(errors="replace")
@@ -83,295 +64,506 @@ def _jsonl(bundle: Path, rel: str, gaps: list[str]) -> list[Row]:
     return rows
 
 
-def _rx_log(
-    bundle: Path, gaps: list[str]
-) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
-    """Guest receive and drop counter samples as (epoch seconds, count) lists."""
-    rel = "raw/rx/rx.log"
-    points: list[tuple[float, float]] = []
-    drops: list[tuple[float, float]] = []
-    bad = 0
-    for line in (_text(bundle, rel, gaps) or "").splitlines():
-        if not line.strip():
-            continue
-        try:
-            t, count, *rest = line.split()
-            points.append((float(t), float(count)))
-            if rest:
-                drops.append((float(t), float(rest[0])))
-        except ValueError:
-            bad += 1
-    if bad:
-        gaps.append(f"{bad} malformed lines in {rel}")
-    return sorted(points), sorted(drops)
+def _samples(rows: list[Row], key: str) -> Samples:
+    """(time, value) of one numeric key, in time order."""
+    return sorted(
+        (t, v)
+        for r in rows
+        if (t := _num(r.get("t"))) is not None and (v := _num(r.get(key))) is not None
+    )
 
 
-def _delta(points: list[tuple[float, float]], start: float, end: float) -> int | None:
-    """Counter increase inside [start, end], or None without a clean pair."""
-    inside = [p for p in points if start <= p[0] <= end]
-    if len(inside) < 2 or inside[-1][1] < inside[0][1]:
+def _windows(state: RunState, start: float, workload: str) -> list[Row]:
+    """Planned measured windows of one workload as absolute times."""
+    schedule = state.schedule.trex if workload == "trex" else state.schedule.fio
+    return [
+        {
+            "profile": w.profile,
+            "start": start + w.start_s,
+            "end": start + w.start_s + w.length_s,
+        }
+        for w in schedule
+    ]
+
+
+def _timeline(evts: list[Row]) -> tuple[float, float, float] | None:
+    """Warm-up start, measured start and end, if the run reached measurement."""
+    item = next((e for e in evts if e.get("event") == "timeline"), None)
+    if not item:
         return None
-    return round(inside[-1][1] - inside[0][1])
+    values = [
+        _num(item.get(k)) for k in ("warmup_start", "measured_start", "measured_end")
+    ]
+    if any(v is None for v in values):
+        return None
+    warm, start, end = (float(v or 0) for v in values)
+    return warm, start, end
 
 
-def _rx_pps(rx: list[tuple[float, float]], start: float, end: float) -> float | None:
-    """Received pps from the counter delta inside [start, end]."""
-    inside = [p for p in rx if start <= p[0] <= end]
-    if len(inside) < 2:
+def _rate_inside(samples: Samples, a: float, b: float) -> Row | None:
+    """Rate of a counter between its first and last sample inside [a, b].
+
+    None when there are fewer than two samples or the counter went backwards.
+    """
+    inside = [p for p in samples if a <= p[0] <= b]
+    if len(inside) < 2 or inside[-1][0] <= inside[0][0]:
+        return None
+    if any(c1 < c0 for (_, c0), (_, c1) in zip(inside, inside[1:], strict=False)):
         return None
     (t0, c0), (t1, c1) = inside[0], inside[-1]
-    if t1 <= t0 or c1 < c0:
-        return None
-    return round((c1 - c0) / (t1 - t0), 1)
+    return {"rate": (c1 - c0) / (t1 - t0), "from": t0, "to": t1}
 
 
-def _rx_series(rx: list[tuple[float, float]]) -> list[Row]:
-    """Per-interval receive rate rows for charting."""
-    return [
-        {"t": t1, "rx_pps": round((c1 - c0) / (t1 - t0), 1)}
-        for (t0, c0), (t1, c1) in zip(rx, rx[1:], strict=False)
-        if t1 > t0 and c1 >= c0
-    ]
-
-
-def _phases(state: RunState, evts: list[Row]) -> list[Window]:
-    """Measured phase windows (name, start, end) from measured-phase events."""
-    starts = [
-        (str(e.get("phase")), datetime.fromisoformat(str(e["at"])).timestamp())
-        for e in evts
-        if e.get("event") == "measured-phase"
-    ]
-    ends = [
-        datetime.fromisoformat(str(e["at"])).timestamp()
-        for e in evts
-        if e.get("event") in ("phase", "finalized")
-    ]
-    windows: list[Window] = []
-    for index, (name, start) in enumerate(starts):
-        if index + 1 < len(starts):
-            end = starts[index + 1][1]
-        else:
-            # The last phase ends at its planned length or the first later
-            # lifecycle event, whichever comes first.
-            length = next(
-                (p.length_s for p in state.schedule.phases if p.name == name), 0
-            )
-            end = min([start + length, *(t for t in ends if t > start)])
-        windows.append((name, start, end))
-    return windows
-
-
-def _inside(rows: list[Row], start: float, end: float) -> list[Row]:
-    """Rows whose time t falls in [start, end)."""
-    return [r for r in rows if (t := _num(r.get("t"))) is not None and start <= t < end]
-
-
-def _values(rows: list[Row], key: str) -> list[float]:
-    """Numeric values of one key."""
-    return [v for r in rows if (v := _num(r.get(key))) is not None]
-
-
-def _fio_dir(
-    bundle: Path, path: Path, gaps: list[str]
-) -> tuple[Row, list[Row], dict[int, list[int]]]:
-    """Read one fio output directory: summary, per-second rows, merged histogram.
-
-    Per-job histograms are merged by summing bins so percentiles are computed over
-    all I/Os, never as a maximum of per-job percentiles. Keys are epoch seconds.
-    """
-    jsons = sorted(path.glob("*.json"))
-    label = jsons[0].stem if jsons else path.name
-    rel = f"raw/{path.name}/{label}"
-    info: Row = {"name": path.name, "label": label}
-    text = _text(bundle, f"{rel}.json", gaps)
-    try:
-        info.update(fio.summary(text or ""))
-    except (ValueError, KeyError, TypeError) as error:
-        reason = f"unreadable fio result: {error}" if text else "no fio result"
-        info.update({"complete": False, "error": reason})
-    try:
-        start = int(float((_text(bundle, f"{rel}.start", gaps) or "").strip()))
-    except ValueError:
-        info["error"] = info.get("error") or "no start time"
-        return info, [], {}
-    hist: dict[int, list[int]] = {}
-    iops: dict[int, int] = {}
-    for job in range(1, fio.NUMJOBS + 1):
-        try:
-            job_hist = fio.parse_hist(
-                _text(bundle, f"{rel}_clat_hist.{job}.log", gaps) or ""
-            )
-            job_iops = fio.parse_iops(
-                _text(bundle, f"{rel}_iops.{job}.log", gaps) or ""
-            )
-        except (ValueError, IndexError):
-            gaps.append(f"{rel}: unreadable fio log for job {job}")
-            continue
-        for second, bins in job_hist.items():
-            hist[start + second] = fio.add_histograms(hist.get(start + second), bins)
-        for second, count in job_iops.items():
-            iops[start + second] = iops.get(start + second, 0) + count
-    rows: list[Row] = [
-        {
-            "t": second,
-            "iops": iops.get(second),
-            "p50_ms": fio.percentile(hist.get(second, []), 0.5),
-            "p99_ms": fio.percentile(hist.get(second, []), 0.99),
-        }
-        for second in sorted(set(hist) | set(iops))
-    ]
-    return info, rows, hist
-
-
-def _window_fio(
-    rows: list[Row], hist: dict[int, list[int]], start: float, end: float
-) -> Row:
-    """Completed I/Os, IOPS and p50/p99 latency in ms over one window."""
-    merged: list[int] = []
-    for second, bins in hist.items():
-        if start <= second < end:
-            merged = fio.add_histograms(merged, bins)
-    counts = _values(_inside(rows, start, end), "iops")
+def _spread(rates: dict[str, Row | None], start: float) -> Row:
+    """Per-VM rates in a window and their range; each over its own sample span."""
+    found = {vm: r for vm, r in rates.items() if r}
+    values = sorted(float(str(r["rate"])) for r in found.values())
     return {
-        "ios": int(sum(counts)) if counts else None,
-        "iops": _mean(counts),
-        "p50_ms": fio.percentile(merged, 0.5),
-        "p99_ms": fio.percentile(merged, 0.99),
+        "reporting": len(found),
+        "of": len(rates),
+        "pps_min": round(values[0], 1) if values else None,
+        "pps_median": round(values[len(values) // 2], 1) if values else None,
+        "pps_max": round(values[-1], 1) if values else None,
+        "vms": {
+            vm: {
+                "pps": round(float(str(r["rate"])), 1),
+                "from_s": round(float(str(r["from"])) - start, 3),
+                "to_s": round(float(str(r["to"])) - start, 3),
+            }
+            for vm, r in found.items()
+        },
     }
 
 
-def _count(rows: list[Row], keys: set[str]) -> int | None:
-    """Total events over rows from the per-second rates of the given keys."""
-    found = [
-        v * (_num(r.get("interval_s")) or 1.0)
-        for r in rows
-        for key in keys
-        if (v := _num(r.get(key))) is not None
-    ]
-    return round(sum(found)) if found else None
-
-
-def _host(
-    target: list[Row],
-    link: str | None,
-    window: Window,
-    guest_drops: list[tuple[float, float]],
+def _network(
+    state: RunState,
+    bundle: Path,
+    start: float,
+    evts: list[Row],
+    gaps: list[str],
+    metrics: dict[str, list[Row]],
 ) -> Row:
-    """Target host evidence over one window.
-
-    Bond-level drops and the members' driver ring drops count overlapping packets,
-    so they are reported separately and never summed.
-    """
-    _, start, end = window
-    inside = _inside(target, start, end)
-    cpu = [r for r in inside if not r.get("cpu.reset")]
-    rings = {k for r in inside for k in r if k.endswith(".rx_out_of_buffer_per_s")}
-    return {
-        "cpu_busy_pct": _mean(_values(cpu, "cpu.busy_pct")),
-        "cpu_iowait_pct": _mean(_values(cpu, "cpu.iowait_pct")),
-        "cpu_softirq_pct": _mean(_values(cpu, "cpu.softirq_pct")),
-        "host_drops": _count(inside, {f"{link}.rx_dropped_per_s"}) if link else None,
-        "nic_ring_drops": _count(inside, rings),
-        "lost_upcalls": _count(inside, {"ovs.lost_per_s"}),
-        "tap_drops": _count(inside, {"tap.tx_dropped_per_s"}),
-        "guest_drops": _delta(guest_drops, start, end),
-    }
-
-
-def _ceph(ceph: list[Row], window: Window) -> Row:
-    """Ceph slow operations over one window."""
-    _, start, end = window
-    slow = _values(_inside(ceph, start, end), "ceph.slow_ops")
-    return {"slow_ops_max": max(slow) if slow else None}
-
-
-def _load(samples: list[Row], rx: list[tuple[float, float]]) -> list[Row]:
-    """Per TRex step: requested, sender tx and target rx pps, and loss."""
-    steps: dict[int, list[Row]] = {}
-    for row in samples:
-        if isinstance(step := row.get("step"), int):
-            steps.setdefault(step, []).append(row)
-    out: list[Row] = []
-    for step, rows in sorted(steps.items()):
-        times = _values(rows, "t")
-        tx = _mean(_values(rows, "tx_pps"))
-        rx_pps = _rx_pps(rx, min(times), max(times)) if times else None
-        out.append(
+    """TRex requested and transmitted traffic, and packets counted at receivers."""
+    trex = state.config.workloads.trex
+    assert trex
+    senders = [t for t in state.targets if t.role == "sender"]
+    receivers = [t for t in state.targets if t.role == "receiver"]
+    connections = state.plan.connections
+    packets: dict[str, Samples] = {}
+    step_starts: dict[int, list[float]] = {}
+    for vm in senders:
+        rows = _jsonl(bundle, f"raw/{vm.name}/trex/flood.jsonl", gaps)
+        if not rows:
+            gaps.append(f"{vm.name}: no TRex samples")
+        stats = [r for r in rows if "event" not in r]
+        packets[vm.name] = _samples(stats, "opackets")
+        for row in rows:
+            if row.get("event") == "step" and isinstance(row.get("step"), int):
+                t = _num(row.get("t"))
+                if t is not None:
+                    step_starts.setdefault(int(str(row["step"])), []).append(t)
+        metrics[f"network-{vm.name}"] = _counter_rows(
+            vm.name, packets[vm.name], _samples(stats, "obytes"), "tx", start, gaps
+        )
+    for vm in receivers:
+        rows = _jsonl(bundle, f"raw/{vm.name}/sampler/samples.jsonl", gaps)
+        mine = [c.sender for c in connections if c.receiver == vm.name]
+        keys = [f"nft.from_{s}.{k}" for s in mine for k in ("packets", "bytes")]
+        complete = [r for r in rows if all(_num(r.get(k)) is not None for k in keys)]
+        if len(complete) < len(rows):
+            gaps.append(
+                f"{vm.name}: {len(rows) - len(complete)} of {len(rows)} samples "
+                "without every receive counter"
+            )
+        totals = [
             {
-                "step": step,
-                "requested_pps": _num(rows[0].get("requested_pps")),
-                "tx_pps": tx,
-                "rx_pps": rx_pps,
-                "delivered": _ratio(tx, rows[0].get("requested_pps")),
-                # Sample windows can make rx exceed tx slightly; that is no loss.
-                "loss": max(round(1 - rx_pps / tx, 3), 0.0)
-                if rx_pps is not None and tx
-                else None,
-                "oerrors": max(_values(rows, "oerrors"), default=0),
+                "t": r["t"],
+                "packets": sum(float(str(r[f"nft.from_{s}.packets"])) for s in mine),
+                "bytes": sum(float(str(r[f"nft.from_{s}.bytes"])) for s in mine),
+            }
+            for r in complete
+        ]
+        if not totals:
+            gaps.append(f"{vm.name}: no receive counter samples")
+        packets[vm.name] = _samples(totals, "packets")
+        metrics[f"network-{vm.name}"] = _counter_rows(
+            vm.name, packets[vm.name], _samples(totals, "bytes"), "rx", start, gaps
+        )
+
+    profiles = []
+    for window in _windows(state, start, "trex"):
+        a, b = float(str(window["start"])), float(str(window["end"]))
+        profiles.append(
+            {
+                "profile": window["profile"],
+                "pps_per_sender": trex.profiles[
+                    int(str(window["profile"]))
+                ].pps_per_sender,
+                "start_s": round(a - start),
+                "end_s": round(b - start),
+                "tx": _spread(
+                    {s.name: _rate_inside(packets[s.name], a, b) for s in senders},
+                    start,
+                ),
+                "rx": _spread(
+                    {r.name: _rate_inside(packets[r.name], a, b) for r in receivers},
+                    start,
+                ),
             }
         )
-    return out
+    actual = {
+        str(step): {
+            "first": round(min(times) - start, 3),
+            "last": round(max(times) - start, 3),
+            "senders": len(times),
+        }
+        for step, times in sorted(step_starts.items())
+    }
+    loads: dict[str, float] = {}
+    for c in connections:
+        pps = trex.profiles[0].pps_per_sender
+        loads[c.receiver] = loads.get(c.receiver, 0.0) + pps * c.share
+    receipt = next((e for e in evts if e.get("event") == "receipt"), None)
+    return {
+        "mode": trex.mode,
+        "focus": state.plan.focus,
+        "senders": len(senders),
+        "receivers": len(receivers),
+        "connections": [c.model_dump() for c in connections],
+        "receiver_load_first_profile_pps": loads,
+        "profiles": profiles,
+        "count_baselines_s": {
+            vm: round(first[0] - start, 3)
+            for vm, samples in packets.items()
+            if (first := next((p for p in samples if p[0] >= start), None))
+        },
+        "step_starts": actual,
+        "receipt": receipt,
+    }
 
 
-def _indicator(name: str, where: str, value: object, unit: str = "") -> Row:
-    """One measured value an operator compares with their SLO."""
-    return {"name": name, "where": where, "value": value, "unit": unit}
-
-
-def _indicators(
-    steps: list[Row],
-    fio_phases: dict[str, Row],
-    host: dict[str, Row],
-    ceph: dict[str, Row],
+def _counter_rows(
+    vm: str,
+    packets: Samples,
+    octets: Samples,
+    side: str,
+    start: float,
+    gaps: list[str],
 ) -> list[Row]:
-    """SLO-relevant measurements, without a verdict."""
-    rows = []
-    if steps:
-        top = steps[-1]
-        where = f"top step ({_fmt_pps(top['requested_pps'])} requested)"
-        rows.append(_indicator("sender delivered", where, top["tx_pps"], "pps"))
-        if (loss := _num(top["loss"])) is not None:
-            rows.append(_indicator("target loss", where, round(100 * loss, 2), "%"))
-    base = fio_phases.get("baseline", {})
-    for phase, values in fio_phases.items():
-        rows.append(_indicator("fio IOPS", phase, values.get("iops")))
-        rows.append(_indicator("fio p99 latency", phase, values.get("p99_ms"), "ms"))
-        if phase != "baseline":
-            change = _ratio(values.get("p99_ms"), base.get("p99_ms"))
-            if change is not None:
-                rows.append(
-                    _indicator(
-                        "fio p99 vs baseline", phase, round(100 * (change - 1), 1), "%"
-                    )
-                )
-    stress = host.get("stress", {})
-    for key, name in (
-        ("host_drops", "target host drops"),
-        ("nic_ring_drops", "target NIC ring drops"),
-        ("lost_upcalls", "OVS lost upcalls"),
-        ("tap_drops", "guest tap drops"),
-        ("guest_drops", "guest NIC drops"),
-    ):
-        if stress.get(key) is not None:
-            rows.append(_indicator(name, "stress", stress[key], "packets"))
-    slow = [v for c in ceph.values() if (v := _num(c.get("slow_ops_max"))) is not None]
-    if slow:
-        rows.append(_indicator("Ceph slow ops (max)", "run", max(slow)))
+    """Packet counts and packet and byte rates from one VM's counter samples.
+
+    Counts are packets since the VM's first sample at or after the measured
+    start; that sample's time is the count's baseline.
+    """
+    by_time = dict(octets)
+    baseline = next(((t, c) for t, c in packets if t >= start), None)
+    rows: list[Row] = []
+    if baseline:
+        rows.append({"t": round(baseline[0] - start, 3), f"{side}_packets": 0})
+    resets = 0
+    for (t0, c0), (t1, c1) in zip(packets, packets[1:], strict=False):
+        if t1 <= t0:
+            continue
+        if c1 < c0:
+            resets += 1
+            baseline = None
+            continue
+        row: Row = {
+            "t": round(t1 - start, 3),
+            "interval_s": round(t1 - t0, 3),
+            f"{side}_pps": round((c1 - c0) / (t1 - t0), 1),
+        }
+        if baseline and t1 > baseline[0]:
+            row[f"{side}_packets"] = c1 - baseline[1]
+        if t0 in by_time and t1 in by_time and by_time[t1] >= by_time[t0]:
+            row[f"{side}_bytes_per_s"] = round(
+                (by_time[t1] - by_time[t0]) / (t1 - t0), 1
+            )
+        rows.append(row)
+    rows.sort(key=lambda r: float(str(r["t"])))
+    if resets:
+        gaps.append(f"{vm}: {side} packet counter went backwards {resets} times")
     return rows
 
 
-def _fmt_pps(value: object) -> str:
-    """Rate with thousands separators."""
-    number = _num(value)
-    return f"{number:,.0f} pps" if number is not None else "-"
+class Interval(NamedTuple):
+    """One fio log entry: the value over (start, end], in epoch seconds."""
+
+    start: float
+    end: float
+    direction: str
+    value: object
+
+
+def _intervals_from(
+    entries: list[tuple[float, str, object]], job_start: float | None
+) -> tuple[list[Interval], int]:
+    """Turn fio log entries into intervals, and count missing entries.
+
+    fio averages each entry over the FIO_LOG_MS before its timestamp, so an
+    entry covers at most that period, starting no earlier than the job or the
+    previous entry of its direction.
+    """
+    period = FIO_LOG_MS / 1000
+    found: list[Interval] = []
+    previous: dict[str, float] = {}
+    missing = 0
+    for end, direction, value in sorted(entries, key=lambda e: e[0]):
+        begin = previous.get(direction, job_start)
+        if begin is not None and end - begin > 1.5 * period:
+            missing += round((end - begin) / period) - 1
+        if begin is None or end - begin > period:
+            begin = end - period
+        found.append(Interval(begin, end, direction, value))
+        previous[direction] = end
+    return found, missing
+
+
+def _fio_run(
+    bundle: Path, vm: str, run: str, numjobs: int, start: float, gaps: list[str]
+) -> tuple[Row, list[Row]]:
+    """One VM's fio run: its timing, and each job's result and interval logs."""
+    base = f"raw/{vm}/fio/{run}"
+    info: Row = {"vm": vm}
+    try:
+        times = json.loads(_text(bundle, f"{base}.times", gaps) or "")
+    except ValueError:
+        times = {}
+        gaps.append(f"{base}.times: missing or unreadable")
+    for key in ("start", "end"):
+        if (value := _num(times.get(key))) is not None:
+            info[f"{key}_s"] = round(value - start, 3)
+    for key in ("stopped_at_deadline", "exit_code", "problem"):
+        if key in times:
+            info[key] = times[key]
+    if "problem" in times:
+        gaps.append(f"{base}: {times['problem']}")
+    try:
+        results = fio.results(_text(bundle, f"{base}.json", gaps) or "")
+    except (ValueError, KeyError, TypeError):
+        results = []
+        gaps.append(f"{base}.json: no readable fio result")
+    jobs = []
+    for number in range(1, numjobs + 1):
+        result = results[number - 1] if number <= len(results) else None
+        job: Row = {"vm": vm, "job": number, "result": result}
+        if result and result.get("error"):
+            gaps.append(f"{base} job {number}: fio error {result['error']}")
+        job_start = _num(result.get("start")) if result else None
+        for kind in ("iops", "bw", "clat_hist"):
+            text = _text(bundle, f"{base}_{kind}.{number}.log", gaps)
+            if text is None:
+                gaps.append(f"{base}: no {kind} log for job {number}")
+                continue
+            try:
+                entries = (
+                    fio.parse_hist(text) if kind == "clat_hist" else fio.parse_log(text)
+                )
+            except (ValueError, IndexError):
+                gaps.append(f"{base}: unreadable {kind} log for job {number}")
+                continue
+            job[kind], missing = _intervals_from(
+                [(t, d, v) for t, d, v in entries], job_start
+            )
+            if missing:
+                gaps.append(
+                    f"{base}: about {missing} {kind} log entries missing "
+                    f"for job {number}"
+                )
+        jobs.append(job)
+    return info, jobs
+
+
+def _range(values: list[float | None]) -> Row | None:
+    """Minimum, median and maximum of per-job values."""
+    found = sorted(v for v in values if v is not None)
+    if not found:
+        return None
+    return {
+        "min": round(found[0], 3),
+        "median": round(found[len(found) // 2], 3),
+        "max": round(found[-1], 3),
+    }
+
+
+def _job_result(job: Row, start: float) -> Row:
+    """One job's fio result with its runtime on the measured time axis."""
+    result = job["result"]
+    if not isinstance(result, dict):
+        return {"vm": job["vm"], "job": job["job"], "result": None}
+    begin = float(str(result["start"]))
+    return {
+        "vm": job["vm"],
+        "job": job["job"],
+        "error": result.get("error"),
+        "start_s": round(begin - start, 3),
+        "end_s": round(begin + float(str(result["runtime_s"])) - start, 3),
+        **{d: result[d] for d in DIRECTIONS if d in result},
+    }
+
+
+def _ms(value: float | None) -> float | None:
+    return round(value, 3) if value is not None else None
+
+
+def _storage(
+    state: RunState,
+    bundle: Path,
+    start: float,
+    gaps: list[str],
+    metrics: dict[str, list[Row]],
+) -> Row:
+    """Fio results per job, their range per profile, and each job's interval logs.
+
+    Each job reports over its own runtime, so job results are not added up.
+    """
+    config = state.config.workloads.fio
+    assert config
+    numjobs = config.numjobs
+    vms = [t.name for t in state.targets]
+    profiles = []
+    for window in _windows(state, start, "fio"):
+        index = int(str(window["profile"]))
+        profile = config.profiles[index]
+        run = f"{index + 1:02d}-{profile.name}"
+        per_vm, jobs = [], []
+        for vm in vms:
+            info, vm_jobs = _fio_run(bundle, vm, run, numjobs, start, gaps)
+            per_vm.append(info)
+            jobs += vm_jobs
+        summary: Row = {
+            "profile": index,
+            "name": profile.name,
+            "settings": profile.model_dump(exclude_none=True),
+            "start_s": round(float(str(window["start"])) - start),
+            "end_s": round(float(str(window["end"])) - start),
+            "jobs_expected": len(jobs),
+            "vms": per_vm,
+        }
+        summary["jobs"] = [_job_result(job, start) for job in jobs]
+        for d in DIRECTIONS:
+            stats = [
+                cast(Row, cast(Row, j["result"])[d])
+                for j in jobs
+                if isinstance(j["result"], dict)
+                and not j["result"].get("error")
+                and isinstance(j["result"].get(d), dict)
+            ]
+            if not stats:
+                continue
+            summary[d] = {
+                "jobs": len(stats),
+                "iops": _range([_num(st.get("iops")) for st in stats]),
+                "bw_kib_s": _range([_num(st.get("bw_kib_s")) for st in stats]),
+                "p99_ms": _range([_num(st.get("p99_ms")) for st in stats]),
+            }
+            if len(stats) < len(jobs):
+                gaps.append(
+                    f"fio {run} {d}: results from {len(stats)} of {len(jobs)} jobs"
+                )
+        profiles.append(summary)
+        for job in jobs:
+            rows: list[Row] = []
+            for kind, unit in (("iops", "iops"), ("bw", "bw_kib_s")):
+                rows += [
+                    {
+                        "t": round(i.end - start, 3),
+                        "interval_s": round(i.end - i.start, 3),
+                        f"{i.direction}_{unit}": i.value,
+                    }
+                    for i in cast(list[Interval], job.get(kind, []))
+                ]
+            rows += [
+                {
+                    "t": round(i.end - start, 3),
+                    "interval_s": round(i.end - i.start, 3),
+                    f"{i.direction}_p50_ms": _ms(
+                        fio.percentile(cast(list[int], i.value), 0.5)
+                    ),
+                    f"{i.direction}_p99_ms": _ms(
+                        fio.percentile(cast(list[int], i.value), 0.99)
+                    ),
+                }
+                for i in cast(list[Interval], job.get("clat_hist", []))
+            ]
+            name = f"fio-{job['vm']}-job{job['job']}"
+            metrics[name] = sorted(
+                metrics.get(name, []) + rows, key=lambda r: float(str(r["t"]))
+            )
+    return {
+        "volume_size_gib": config.volume_size_gib,
+        "numjobs": numjobs,
+        "profiles": profiles,
+    }
+
+
+def _collectors(
+    state: RunState,
+    bundle: Path,
+    start: float | None,
+    end: float | None,
+    evts: list[Row],
+    gaps: list[str],
+    metrics: dict[str, list[Row]],
+) -> None:
+    """Normalize host, Ceph and guest samples; list their coverage problems."""
+    sources = {f"host-{h.name}": f"raw/host-{h.name}.jsonl" for h in state.plan.hosts}
+    if state.config.workloads.fio and state.plan.ceph_mon:
+        sources["ceph"] = "raw/ceph.jsonl"
+    sources |= {
+        f"guest-{t.name}": f"raw/{t.name}/sampler/samples.jsonl" for t in state.targets
+    }
+    for name, rel in sources.items():
+        raw = _jsonl(bundle, rel, gaps)
+        try:
+            rows = collect.normalize(raw)
+        except (KeyError, TypeError) as error:
+            rows = []
+            gaps.append(f"{name}: unreadable samples ({error})")
+        if not rows:
+            gaps.append(f"{name}: no samples")
+        if any(r.get("gap") for r in rows):
+            gaps.append(f"{name}: sample gaps")
+        resets = sorted({k for r in rows for k in r if k.endswith(".reset")})
+        if resets:
+            gaps.append(f"{name}: counter resets ({', '.join(resets)})")
+        errors = [str(r[k]) for r in raw for k in r if k.endswith(".error")]
+        if errors:
+            gaps.append(f"{name}: {len(errors)} failed reads ({errors[-1]})")
+        field = "ceph.health" if name == "ceph" else "cpu.busy_pct"
+        without = sum(field not in r for r in rows)
+        if rows and without:
+            gaps.append(f"{name}: {without} of {len(rows)} samples without {field}")
+        if start is not None and end is not None and rows:
+            for row in rows:
+                row["t"] = round(float(str(row["t"])) - start, 3)
+            first = float(str(rows[0]["t"])) - float(str(rows[0]["interval_s"]))
+            last = float(str(rows[-1]["t"]))
+            if first > 0:
+                gaps.append(f"{name}: no samples in the first {first:.0f}s")
+            if last < end - start:
+                gaps.append(f"{name}: no samples in the last {end - start - last:.0f}s")
+        metrics[name] = rows
+    for item in evts:
+        kind = item.get("event")
+        if kind in ("collector-failed", "evidence-lost"):
+            gaps.append(f"{kind}: {item.get('name', '')} {item.get('message', '')}")
+        elif kind in ("collector", "clock"):
+            offset = _num(item.get("clock_offset_s", item.get("offset_s")))
+            uncertainty = _num(item.get("uncertainty_s")) or 0.0
+            if offset is not None and abs(offset) - uncertainty > MAX_CLOCK_OFFSET_S:
+                who = item.get("name") or item.get("vm")
+                gaps.append(f"{who}: clock differs by {offset:.1f}s")
 
 
 def _run(state: RunState, finished: str) -> Row:
     """Run identity and outcome fields from the state."""
     return {
         "id": state.id,
-        "profile": state.profile,
-        "duration": format_duration(state.duration_s),
+        "workloads": [
+            n for n in ("trex", "fio") if getattr(state.config.workloads, n) is not None
+        ],
+        "duration_s": state.duration_s,
         "model": state.model,
         "cloud": state.cloud,
         "created": state.created_at.isoformat(),
@@ -383,170 +575,64 @@ def _run(state: RunState, finished: str) -> Row:
     }
 
 
-def _collectors(
-    state: RunState,
-    bundle: Path,
-    evts: list[Row],
-    windows: list[Window],
-    gaps: list[str],
-) -> dict[str, list[Row]]:
-    """Normalize collector samples; record their problems as gaps when measured."""
-    required = ["target-host"]
-    if state.profile in ("host-network", "network-ceph"):
-        required.append("sender-host")
-    if state.profile in ("ceph-block", "network-ceph"):
-        required.append("ceph")
-
-    metrics: dict[str, list[Row]] = {}
-    problems: dict[str, list[str]] = {}
-    for name in COLLECTORS:
-        found = problems.setdefault(name, [])
-        raw = _jsonl(bundle, f"raw/{name}.jsonl", gaps)
-        try:
-            rows = collect.normalize(raw)
-        except (KeyError, TypeError) as error:
-            rows = []
-            found.append(f"unreadable samples ({error})")
-        if not rows:
-            found.append("no samples")
-        metrics[name] = rows
-        if any(r.get("gap") for r in rows):
-            found.append("sample gaps")
-        resets = sorted({k for r in rows for k in r if k.endswith(".reset")})
-        if resets:
-            found.append(f"counter resets ({', '.join(resets)})")
-    for item in evts:
-        kind = item.get("event")
-        if kind in ("collector-failed", "evidence-lost"):
-            gaps.append(f"{kind}: {item.get('name', '')} {item.get('message', '')}")
-        elif kind == "collector":
-            offset = _num(item.get("clock_offset_s"))
-            if offset is not None and abs(offset) > MAX_CLOCK_OFFSET_S:
-                problems.setdefault(str(item.get("name")), []).append(
-                    f"clock offset {offset:.1f}s"
-                )
-    if windows:
-        gaps += [f"{n}: {p}" for n in required for p in problems.get(n, [])]
-    return metrics
-
-
-def _fio(
-    bundle: Path,
-    evts: list[Row],
-    windows: list[Window],
-    gaps: list[str],
-    metrics: dict[str, list[Row]],
-) -> tuple[Row, dict[str, Row]]:
-    """Aggregate fio cells and measured phases, with ratios against baseline."""
-    fio_cells: list[Row] = []
-    fio_phases: dict[str, Row] = {}
-    raw_dir = bundle / "raw"
-    for path in (
-        sorted(p for p in raw_dir.iterdir() if p.is_dir()) if raw_dir.is_dir() else []
-    ):
-        if path.name == "rx":
-            continue
-        info, rows, hist = _fio_dir(bundle, path, gaps)
-        metrics[f"fio-{path.name}"] = rows
-        if path.name == "measured":
-            fio_phases = {w[0]: _window_fio(rows, hist, w[1], w[2]) for w in windows}
-        elif path.name not in ("prefill", "calibration"):
-            info.update(_window_fio(rows, hist, 0, float("inf")))
-        fio_cells.append(info)
-    calibration = next((e for e in evts if e.get("event") == "calibration"), {})
-    fio_result: Row = {
-        "cells": fio_cells,
-        "offered_iops": calibration.get("offered_iops"),
-        "calibrated_iops": calibration.get("measured_iops"),
-        "phases": fio_phases,
+def _fleet(state: RunState, targets: list[Target]) -> Row:
+    """Hosts, VMs and resources the run used."""
+    plan = state.plan
+    return {
+        "network": plan.network,
+        "vlan": plan.vlan,
+        "ip_version": plan.ip_version,
+        "mgmt_network": plan.mgmt_network,
+        "flavor": plan.flavor,
+        "volume_type": plan.volume_type,
+        "focus": plan.focus,
+        "hosts": [h.model_dump() for h in plan.hosts],
+        "vms": [t.model_dump() for t in targets],
     }
-    base = fio_phases.get("baseline", {})
-    for name in ("stress", "recovery") if fio_phases else ():
-        for key in ("iops", "p50_ms", "p99_ms"):
-            fio_result[f"{name}_vs_baseline_{key}"] = _ratio(
-                fio_phases.get(name, {}).get(key), base.get(key)
-            )
-    return fio_result, fio_phases
-
-
-def _offload(
-    plan: RunPlan,
-    metrics: dict[str, list[Row]],
-    windows: list[Window],
-) -> str:
-    """Offload is observed only when offloaded flows rise from baseline to stress."""
-    if not (plan.target_datapath == "doca" and plan.target_hw_offload):
-        return "not-applicable"
-    means = {
-        name: _mean(
-            _values(_inside(metrics["target-host"], start, end), "ovs.offloaded_flows")
-        )
-        for name, start, end in windows
-    }
-    stress, baseline = means.get("stress"), means.get("baseline")
-    rising = stress is not None and baseline is not None and stress > baseline
-    return "observed" if rising else "unverified"
 
 
 def build(state: RunState) -> tuple[Row, dict[str, list[Row]]]:
     """Compute the run result and metric series without writing anything."""
     bundle = run_dir(state.id)
-    plan = state.plan
     evts = events(state.id)
     gaps: list[str] = []
-    target = state.target.model_dump() if state.target else {}
-    # A run that never reached measurement is not assessed; its cause says why.
-    windows = _phases(state, evts)
-    metrics = _collectors(state, bundle, evts, windows, gaps)
-    fio_result, fio_phases = _fio(bundle, evts, windows, gaps, metrics)
-
-    rx, guest_drops = _rx_log(bundle, gaps)
-    samples = _jsonl(bundle, "raw/stress.jsonl", gaps)
-    metrics["stress"] = samples
-    metrics["rx"] = _rx_series(rx)
-    steps = _load(samples, rx)
-
-    offload = _offload(plan, metrics, windows)
-    host = {
-        w[0]: _host(metrics["target-host"], plan.target_link, w, guest_drops)
-        for w in windows
-    }
-    ceph = {w[0]: _ceph(metrics["ceph"], w) for w in windows} if metrics["ceph"] else {}
+    metrics: dict[str, list[Row]] = {}
+    timeline = _timeline(evts)
+    start = timeline[1] if timeline else None
+    _collectors(
+        state, bundle, start, timeline[2] if timeline else None, evts, gaps, metrics
+    )
     result: Row = {
-        "placement": {**{k: getattr(plan, k) for k in PLACEMENT}, **target},
-        "tools": {
-            str(e.get("name")): e.get("version")
+        "config": state.config.model_dump(),
+        "fleet": _fleet(state, state.targets),
+        "tools": [
+            {k: e.get(k) for k in ("vm", "name", "version")}
             for e in evts
             if e.get("event") == "tool"
-        },
-        "schedule": [p.model_dump() for p in state.schedule.phases],
-        "phases": [{"name": n, "start": s, "end": e} for n, s, e in windows],
-        "sender": {
-            "planned_pps": state.schedule.trex_steps_pps,
-            "steps": [
-                {k: step[k] for k in ("step", "requested_pps", "tx_pps", "delivered")}
-                | {"oerrors": step["oerrors"]}
-                for step in steps
-            ],
-        },
-        "target": {
-            "receipt": next((e for e in evts if e.get("event") == "receipt"), None),
-            "steps": [
-                {k: step[k] for k in ("step", "tx_pps", "rx_pps", "loss")}
-                for step in steps
-            ],
-            "host": host,
-        },
-        "guest": {"fio": fio_result},
-        "ceph": ceph,
-        "indicators": _indicators(steps, fio_phases, host, ceph),
-        "datapath": {
-            "kind": "kernel"
-            if plan.target_datapath in (None, "system")
-            else plan.target_datapath,
-            "hw_offload": plan.target_hw_offload,
-            "offload": offload,
-        },
+        ],
+        "timeline": None,
+    }
+    if timeline:
+        warm, start_t, end = timeline
+        late = next(
+            (_num(e.get("late_s")) for e in evts if e.get("event") == "dispatched"),
+            None,
+        )
+        if late and late > 0:
+            gaps.append(f"workloads were started {late:.0f}s after the warm-up began")
+        result["timeline"] = {
+            "warmup_start": warm,
+            "measured_start": start_t,
+            "measured_end": end,
+            "warmup_s": state.schedule.warmup_s,
+            "trex": [w.model_dump() for w in state.schedule.trex],
+            "fio": [w.model_dump() for w in state.schedule.fio],
+        }
+        if state.config.workloads.trex:
+            result["network"] = _network(state, bundle, start_t, evts, gaps, metrics)
+        if state.config.workloads.fio:
+            result["storage"] = _storage(state, bundle, start_t, gaps, metrics)
+    result |= {
         "errors": [str(e.get("message")) for e in evts if e.get("event") == "error"],
         "gaps": gaps,
         "cleanup": [
@@ -565,11 +651,12 @@ def exit_code(state: RunState) -> int:
 
 
 def write(state: RunState, result: Row, metrics: dict[str, list[Row]]) -> None:
-    """Write report.json, headed by the final run state, and its metrics."""
+    """Write report.json, headed by the final run state, its metrics and graphs."""
     bundle = run_dir(state.id)
     result = {"run": _run(state, now().isoformat()), **result}
     (bundle / "metrics").mkdir(parents=True, exist_ok=True)
     for name, rows in metrics.items():
         text = "".join(json.dumps(row) + "\n" for row in rows)
         (bundle / "metrics" / f"{name}.jsonl").write_text(text)
+    result["graphs"] = plots.render(result, metrics, bundle / "graphs")
     (bundle / "report.json").write_text(json.dumps(result, indent=2))
