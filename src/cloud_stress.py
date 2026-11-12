@@ -219,16 +219,20 @@ def operator_access(cloud: str) -> access.Access:
         raise click.UsageError(str(error)) from None
 
 
-def follow(run_id: str, after_attempt: int = 0, full: bool = False) -> None:
+def follow(
+    run_id: str, after_attempt: int = 0, full: bool = False, clean: bool = False
+) -> None:
     """Print progress until a finalize attempt after `after_attempt` ends.
 
-    Ctrl+C only detaches; the run continues in the worker.
+    With clean, a result that still retains resources is not the end. Ctrl+C
+    only detaches; the run continues in the worker.
     """
     shown = None
     try:
         while True:
             state = run_state.load(run_id)
-            if state.code is not None and state.finalize_attempts > after_attempt:
+            ended = state.code is not None and state.finalize_attempts > after_attempt
+            if ended and not (clean and state.finalization == "retained"):
                 break
             line = state.detail or state.phase
             if line != shown and state.phase != "accepted":
@@ -265,6 +269,10 @@ def show_result(state: run_state.RunState, full: bool = False) -> None:
             click.echo(f"  {cause}")
         if state.finalization == "incomplete":
             click.echo(f"Retry: cloud-stress run stop {state.id}")
+    if state.finalization == "retained":
+        click.echo(
+            f"Resources retained. Clean up: cloud-stress run stop --clean {state.id}"
+        )
     click.echo(f"Results: {run_state.run_dir(state.id)}")
 
 
@@ -304,11 +312,18 @@ def show_result(state: run_state.RunState, full: bool = False) -> None:
 @click.option(
     "--allow-recovering", is_flag=True, help="Allow active Ceph recovery/backfill PGs."
 )
+@click.option(
+    "--retain",
+    is_flag=True,
+    help="Keep the VMs and run-owned resources for inspection; remove them with "
+    '"cloud-stress run stop --clean".',
+)
 def start(
     config_file: Path,
     juju_model: str,
     full: bool,
     allow_recovering: bool,
+    retain: bool,
     **choices: str | None,
 ) -> None:
     """Start a stress run from a configuration file."""
@@ -354,6 +369,7 @@ def start(
             "cloud": result.cloud,
             "plan": result.plan.model_dump(),
             "access": operator_access(result.cloud).model_dump(),
+            "retain": retain,
         }
     )
     click.echo(f"Run {reply['run_id']} accepted.")
@@ -403,15 +419,33 @@ def schedule_rows(
     is_flag=True,
     help="Clean up even when evidence on an unreachable host or guest is lost.",
 )
-def stop(run_id: str | None, abandon_evidence: bool, full: bool) -> None:
-    """Stop the active run, or finish cleanup of an interrupted one."""
+@click.option(
+    "--clean",
+    is_flag=True,
+    help="Delete resources kept by --retain, also after the run has ended.",
+)
+def stop(run_id: str | None, abandon_evidence: bool, clean: bool, full: bool) -> None:
+    """Stop the active run, or finish cleanup of an interrupted or retained one."""
     pending = run_state.unfinished()
+    if pending is None and clean:
+        try:
+            pending = run_state.load(run_id) if run_id else run_state.retained()
+        except FileNotFoundError:
+            raise click.UsageError(f"No run {run_id}") from None
+        if pending is not None and pending.finalization != "retained":
+            click.echo(f"Run {pending.id} has no retained resources.")
+            return
     if pending is None:
-        raise click.UsageError("No active or interrupted run.")
+        raise click.UsageError(
+            "No active, interrupted or retained run."
+            if clean
+            else "No active or interrupted run."
+        )
     payload: dict[str, object] = {
         "op": "stop",
         "run_id": run_id,
         "abandon_evidence": abandon_evidence,
+        "clean": clean,
     }
     reply = request(payload, check=False)
     if reply.get("needs_access"):
@@ -421,7 +455,7 @@ def stop(run_id: str | None, abandon_evidence: bool, full: bool) -> None:
         click.echo(f"Error: {reply.get('error')}", err=True)
         raise SystemExit(2)
     click.echo(f"Stopping run {reply['run_id']}.")
-    follow(str(reply["run_id"]), pending.finalize_attempts, full)
+    follow(str(reply["run_id"]), pending.finalize_attempts, full, clean)
 
 
 @run.command()

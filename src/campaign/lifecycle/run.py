@@ -72,6 +72,8 @@ class Run:
         self.conn = conn
         self.juju = juju
         self.cancel = threading.Event()
+        self.lock = threading.Lock()
+        self.done = False
         self.dir = run_state.run_dir(state.id)
         self.private = run_state.private_dir(state.id)
         self.short = state.id[:8]
@@ -103,6 +105,13 @@ class Run:
             self.state.causes.append(error)
         self.state.execution = execution
         finalize(self.state, self.conn, self.juju)
+        # `run stop --clean` may clear retain after deletion was skipped.
+        while True:
+            with self.lock:
+                if self.state.retain or self.state.finalization != "retained":
+                    self.done = True
+                    return
+            finalize(self.state, self.conn, self.juju)
 
     def phase(self, phase: run_state.Phase, detail: str | None = None) -> None:
         """Record a lifecycle phase change."""

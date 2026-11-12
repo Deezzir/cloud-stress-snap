@@ -647,8 +647,14 @@ def build(state: RunState) -> tuple[Row, dict[str, list[Row]]]:
 
 
 def exit_code(state: RunState) -> int:
-    """Process exit code: 0 completed, 30 cancelled, 20 failed or not cleaned up."""
-    if state.finalization != "complete" or state.execution in ("failed", "interrupted"):
+    """Process exit code: 0 completed, 30 cancelled, 20 failed or not cleaned up.
+
+    Resources retained on request do not fail the run.
+    """
+    if state.finalization not in ("complete", "retained") or state.execution in (
+        "failed",
+        "interrupted",
+    ):
         return 20
     return 30 if state.execution == "cancelled" else 0
 

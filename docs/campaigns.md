@@ -118,5 +118,22 @@ How values are computed:
   counter resets and clock offsets above 2 seconds are listed as gaps. After
   the measured time, the run keeps collecting for the slowest sample interval.
 
+## Stopping and cleanup
+
+`cloud-stress run stop [<run-id>]` stops the active run, or retries cleanup of
+an interrupted one. Run-owned resources are deleted only after their evidence
+is retrieved; `--abandon-evidence` deletes them even when that fails.
+
+`run start --retain` keeps the run's VMs and other resources for inspection
+after it completes, fails or is stopped. Workloads still stop and evidence is
+still collected.
+
+```bash
+cloud-stress run stop --clean [<run-id>]
+```
+
+`--clean` deletes a retained run's resources, also after the run has ended.
+Without a run ID it selects the active run first, else the newest retained run.
+
 Exit codes: `0` completed, `20` failed, interrupted or not cleaned up, `30`
 cancelled.

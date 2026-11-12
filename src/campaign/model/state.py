@@ -9,6 +9,7 @@ events.jsonl are append-only. Only the worker writes here; `check` never does.
 import fcntl
 import json
 import os
+import threading
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -30,7 +31,7 @@ SOCKET = STATE_ROOT / "control.sock"
 
 Phase = Literal["accepted", "preparing", "running", "finalizing", "finished"]
 Execution = Literal["completed", "cancelled", "failed", "interrupted"]
-Finalization = Literal["complete", "incomplete"]
+Finalization = Literal["complete", "incomplete", "retained"]
 Action = Literal["intent", "created", "deleted", "rejected", "failed", "requires-login"]
 
 
@@ -51,6 +52,7 @@ class RunState(BaseModel):
     phase: Phase = "accepted"
     detail: str | None = None
     cancel_requested: bool = False
+    retain: bool = False
     warmup_start: datetime | None = None
     measured_start: datetime | None = None
     execution: Execution | None = None
@@ -135,15 +137,25 @@ def runs() -> list[RunState]:
     return sorted(found, key=lambda state: state.created_at, reverse=True)
 
 
+def retained() -> RunState | None:
+    """The newest finished run that kept its resources, if any."""
+    return next((s for s in runs() if s.finalization == "retained"), None)
+
+
 def unfinished() -> RunState | None:
     """The run that is active or interrupted, if any."""
     return next((s for s in runs() if s.phase != "finished"), None)
 
 
+_saving = threading.Lock()
+
+
 def save(state: RunState) -> None:
-    """Persist a run's state, stamping the update time."""
-    state.updated_at = now()
-    write_file(run_dir(state.id) / "state.json", state.model_dump_json(indent=2))
+    """Persist a run's state, stamping the update time; safe across threads."""
+    with _saving:
+        state.updated_at = now()
+        text = state.model_dump_json(indent=2)
+        write_file(run_dir(state.id) / "state.json", text)
 
 
 def record(
@@ -242,6 +254,7 @@ def create(
     plan: RunPlan,
     schedule: Schedule,
     owner_uid: int,
+    retain: bool = False,
 ) -> RunState:
     """Accept a new run. Call while holding lock()."""
     if previous := unfinished():
@@ -258,6 +271,7 @@ def create(
         plan=plan,
         schedule=schedule,
         owner_uid=owner_uid,
+        retain=retain,
         created_at=created,
         updated_at=created,
         deadline=datetime.fromtimestamp(

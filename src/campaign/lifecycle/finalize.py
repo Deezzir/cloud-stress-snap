@@ -3,6 +3,8 @@
 The same path serves normal completion, cancellation, recovery after a crash and
 a later `run stop` retry. Directories, guests and cloud resources are removed
 only after the evidence they hold is retrieved, unless the operator abandons it.
+A run started with --retain retains its resources after stopping its work and
+retrieving evidence, until `run stop --clean` clears state.retain.
 """
 
 import base64
@@ -112,39 +114,48 @@ def finalize(
 
     # 3. Delete what no longer holds pending evidence. A host's directory holds
     # the guest key, so it stays while evidence in its guests is pending.
-    _progress(state, "deleting run-owned resources")
-    for entry in run_state.outstanding(state.id):
-        if entry.kind not in ("dir", "snap") or entry.where in pending_where:
-            continue
-        try:
-            if entry.kind == "snap":
-                remote.remove_snap(juju, entry.where or "", entry.name)
-            else:
-                remote.remove_dir(juju, entry.where or "", entry.name)
-            run_state.transition(state.id, entry, "deleted")
-        except Exception as error:  # noqa: BLE001
-            _failed(state, entry, error)
-    if not guest_pending:
-        if conn is None:
-            for entry in run_state.outstanding(state.id):
-                if entry.where == "openstack" and entry.action != "requires-login":
-                    run_state.transition(
-                        state.id, entry, "requires-login", "OpenStack login expired"
-                    )
-        else:
+    # A retaining run keeps everything left; `run stop --clean` finalizes it again.
+    retain = state.retain
+    if retain:
+        _progress(state, "retaining run-owned resources")
+    else:
+        _progress(state, "deleting run-owned resources")
+        for entry in run_state.outstanding(state.id):
+            if entry.kind not in ("dir", "snap") or entry.where in pending_where:
+                continue
             try:
-                provision.cleanup(conn, state)
-            except Exception as error:  # noqa: BLE001 - e.g. expired token
-                run_state.event(state.id, "cleanup-error", message=_short(error))
-            _settle_guest_units(state)
+                if entry.kind == "snap":
+                    remote.remove_snap(juju, entry.where or "", entry.name)
+                else:
+                    remote.remove_dir(juju, entry.where or "", entry.name)
+                run_state.transition(state.id, entry, "deleted")
+            except Exception as error:  # noqa: BLE001
+                _failed(state, entry, error)
+        if not guest_pending:
+            if conn is None:
+                for entry in run_state.outstanding(state.id):
+                    if entry.where == "openstack" and entry.action != "requires-login":
+                        run_state.transition(
+                            state.id, entry, "requires-login", "OpenStack login expired"
+                        )
+            else:
+                try:
+                    provision.cleanup(conn, state)
+                except Exception as error:  # noqa: BLE001 - e.g. expired token
+                    run_state.event(state.id, "cleanup-error", message=_short(error))
+                _settle_guest_units(state)
 
     _progress(state, "writing the result")
     left = run_state.outstanding(state.id)
-    state.finalization = "incomplete" if left else "complete"
+    retained = retain and bool(left)
+    state.finalization = (
+        "retained" if retained else "incomplete" if left else "complete"
+    )
     state.causes = [c for c in state.causes if not c.startswith("cleanup:")]
-    state.causes += [
-        f"cleanup: {e.kind} {e.name} on {e.where}: {e.action}" for e in left
-    ]
+    if not retained:
+        state.causes += [
+            f"cleanup: {e.kind} {e.name} on {e.where}: {e.action}" for e in left
+        ]
     try:
         result, metrics = report.build(state)
         state.code = report.exit_code(state)
@@ -154,8 +165,10 @@ def finalize(
         state.causes.append(f"result: {_short(error)}")
         state.code = report.exit_code(state)
     # A run with resources left stays unfinished, so `run stop` can retry it.
-    state.phase = "finalizing" if left else "finished"
-    state.detail = "cleanup pending" if left else None
+    # A retained run is finished; its keys stay for inspection and `--clean`.
+    pending = bool(left) and not retained
+    state.phase = "finalizing" if pending else "finished"
+    state.detail = "cleanup pending" if pending else None
     if not left:
         shutil.rmtree(private, ignore_errors=True)
     run_state.save(state)

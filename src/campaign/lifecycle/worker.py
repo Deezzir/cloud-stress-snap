@@ -110,6 +110,7 @@ class Worker:
                 plan=plan,
                 schedule=schedule,
                 owner_uid=uid,
+                retain=bool(request.get("retain")),
             )
             private = run_state.private_dir(state.id)
             private.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -132,28 +133,51 @@ class Worker:
             try:
                 self.run.execute()
             except Exception:  # noqa: BLE001 - never leave a run without cleanup
+                with self.run.lock:
+                    self.run.done = True
                 recover(run_state.load(self.run.state.id))
 
     def stop(self, request: dict[str, object], uid: int) -> dict[str, object]:
-        """Cancel the active run, or retry cleanup of an interrupted one."""
+        """Cancel the active run, or retry cleanup of an interrupted one.
+
+        With clean, retention is overridden, and a finished run that retained
+        its resources is cleaned up too.
+        """
         run_id = request.get("run_id")
-        if self.busy() and self.run and self.run.state.phase != "finished":
-            if run_id not in (None, self.run.state.id):
+        clean = bool(request.get("clean"))
+        run = self.run if self.busy() else None
+        if run:
+            if run_id not in (None, run.state.id):
                 return {"ok": False, "error": f"run {run_id} is not the active run"}
-            if uid not in (0, self.run.state.owner_uid):
+            if uid not in (0, run.state.owner_uid):
                 return {
                     "ok": False,
                     "error": "only the run's owner or root can stop it",
                 }
-            self.run.cancel.set()
-            self.run.state.cancel_requested = True
-            run_state.event(self.run.state.id, "stop-requested", uid=uid)
-            return {"ok": True, "run_id": self.run.state.id}
+            with run.lock:
+                live = not run.done
+                if live and clean:
+                    run.state.retain = False
+                    run_state.save(run.state)
+            if live:
+                run.cancel.set()
+                run.state.cancel_requested = True
+                run_state.event(run.state.id, "stop-requested", uid=uid, clean=clean)
+                return {"ok": True, "run_id": run.state.id}
+            assert self.thread
+            self.thread.join()  # the run has ended and is releasing its lock
         if self.busy():
             return {"ok": False, "error": "a cleanup is already in progress"}
         pending = run_state.unfinished()
+        if pending is None and clean:
+            try:
+                found = run_state.load(str(run_id)) if run_id else run_state.retained()
+            except FileNotFoundError:
+                found = None
+            if found and found.finalization == "retained":
+                pending = found
         if pending is None or run_id not in (None, pending.id):
-            return {"ok": False, "error": "no unfinished run to stop"}
+            return {"ok": False, "error": "no unfinished or retained run to stop"}
         if uid not in (0, pending.owner_uid):
             return {"ok": False, "error": "only the run's owner or root can stop it"}
         if not request.get("access"):
@@ -168,7 +192,12 @@ class Worker:
         except BaseException:
             stack.close()
             raise
+        if clean:
+            pending.retain = False
+            run_state.save(pending)
+            run_state.event(pending.id, "clean-requested", uid=uid)
         abandon = bool(request.get("abandon_evidence"))
+        self.run = None
         self.thread = threading.Thread(
             target=self.cleanup, args=(stack, pending, abandon)
         )
