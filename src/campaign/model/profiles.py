@@ -124,11 +124,12 @@ class FioConfig(Strict):
 
 
 class Placement(Strict):
-    """Total VM count or exact per-host counts, and the architecture filter."""
+    """Total VM count or exact per-host counts, with host and architecture filters."""
 
     vms: int | None = Field(default=None, gt=0)
     hosts: dict[str, int] | None = None
     architectures: list[str] = Field(default_factory=lambda: ["amd64"])
+    exclude_hosts: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _check(self) -> Self:

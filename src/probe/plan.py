@@ -3,7 +3,7 @@
 from math import ceil
 from typing import Literal, NamedTuple
 
-from campaign.model.profiles import RunConfig, normalize_arch
+from campaign.model.profiles import Placement, RunConfig, normalize_arch
 from campaign.workloads.trex import ip_packet_bytes
 from constants import TREX_ARCHITECTURES, TREX_MIN_VCPUS
 from probe.discover import short_name
@@ -83,7 +83,7 @@ def resolve_plan(
                 missing["placement"] = problem
     else:
         trex = "trex" in workloads
-        usable = [c for c in candidates if not _exclusion(c, plan, ["amd64"], trex)]
+        usable = [c for c in candidates if not _exclusion(c, plan, trex)]
         if trex and len(usable) < 2:
             missing["placement"] = f"fewer than two amd64 hosts carry {plan.network}"
         elif not usable:
@@ -222,10 +222,19 @@ def _candidates(
 
 
 def _exclusion(
-    candidate: Candidate, plan: RunPlan, architectures: list[str], trex: bool
+    candidate: Candidate,
+    plan: RunPlan,
+    trex: bool,
+    placement: Placement | None = None,
 ) -> str | None:
     """Why a host cannot take the run's VMs, or None when it can."""
     host = candidate.host
+    if placement is not None and (
+        host.name in placement.exclude_hosts
+        or host.hypervisor in placement.exclude_hosts
+    ):
+        return "it is excluded by placement.exclude_hosts"
+    architectures = placement.architectures if placement is not None else ["amd64"]
     if host.architecture == "unknown":
         return "its architecture is unknown"
     if architectures and host.architecture not in architectures:
@@ -287,7 +296,7 @@ def _place(config: RunConfig, candidates: list[Candidate], plan: RunPlan) -> str
     placement, trex = config.placement, config.workloads.trex
     total = placement.total
     reasons = {
-        c.host.name: _exclusion(c, plan, placement.architectures, trex is not None)
+        c.host.name: _exclusion(c, plan, trex is not None, placement)
         for c in candidates
     }
     by_name = {c.host.name: c for c in candidates}

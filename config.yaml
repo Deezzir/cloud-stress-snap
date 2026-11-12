@@ -20,6 +20,8 @@ placement:
   #   node-b: 2
   # Hypervisor architectures to use; [] removes the filter.
   architectures: [amd64]
+  # Exact short or full Nova hypervisor names to exclude.
+  exclude_hosts: []
 
 workloads:
   # UDP traffic between guests, sent with TRex.

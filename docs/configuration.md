@@ -39,6 +39,7 @@ a whole; profiles are not merged. An empty `profiles` list is an error.
 | `vms` | - | Total VM count, placed automatically. |
 | `hosts` | - | Exact VM count per Nova hypervisor, by short or full name. |
 | `architectures` | `[amd64]` | Hypervisor architectures to use. `[]` removes the filter. |
+| `exclude_hosts` | `[]` | Hypervisors to exclude, by exact short or full Nova name. |
 
 Use exactly one of `vms` and `hosts`. Counts are positive integers.
 
@@ -46,6 +47,16 @@ Architecture names are normalized: `x86_64` is `amd64`, `aarch64` is `arm64`,
 `ppc64le` is `ppc64el`. A hypervisor whose architecture is unknown is never
 used. With `[]`, other requirements still apply: a guest image for the host's
 architecture must exist, and TRex needs amd64.
+
+`exclude_hosts` applies to both automatic and exact placement. Explicitly
+requesting an excluded host in `hosts` or `trex.focus_host` is an error.
+
+```yaml
+placement:
+  vms: 20
+  architectures: [amd64]
+  exclude_hosts: [node-a, node-b.example.com]
+```
 
 A guest image is chosen per architecture from the newest Ubuntu image. An image
 without an architecture property is treated as amd64.
