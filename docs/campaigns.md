@@ -8,8 +8,8 @@ One run is active at a time.
 Use `cloud-stress check --full` for the full host, network and Ceph inventories,
 or `--json` for structured output.
 
-`--verbose` (`-v`) prints debug logs to stderr on `check`, `run start`, `run status`
-and `run stop`. Combine it with `--full` for expanded output and debug logs.
+`--verbose` (`-v`) prints debug logs to stderr on `check`, `run start`,
+`run status` and `run stop`.
 
 ```bash
 cp /snap/cloud-stress/current/share/cloud-stress/config.yaml ~/stress.yaml
@@ -17,10 +17,8 @@ cloud-stress run start --config ~/stress.yaml
 ```
 
 The run prints its resources, VM counts and schedule, then starts. Add `--full`
-to show every host, the selected image and timeout. The
-[configuration reference](configuration.md) describes every setting, placement
-and how the duration is divided; [`config.yaml`](../config.yaml) is the
-example.
+to show every host, the selected image and timeout. See the
+[configuration reference](configuration.md) for all settings.
 
 Every VM belongs to one fleet: `vms: 50` creates 50 VMs in total. When fio is
 enabled, every VM gets a data volume and runs fio. The run checks that every VM

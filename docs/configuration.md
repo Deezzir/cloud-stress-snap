@@ -5,15 +5,15 @@ A run is described by one YAML file. The example
 ships a read-only copy at
 `/snap/cloud-stress/current/share/cloud-stress/config.yaml`.
 
-Copy it to a regular file in your home directory and pass that file:
+Copy it to your home directory and pass the copy:
 
 ```bash
 cp /snap/cloud-stress/current/share/cloud-stress/config.yaml ~/stress.yaml
 cloud-stress run start --config ~/stress.yaml
 ```
 
-`cloud-stress` reads the file when you start the run and sends the validated
-configuration to the run worker. Unknown keys and invalid values are errors.
+The file is read and validated at `run start`. Unknown keys and invalid values
+are errors.
 
 ## Top level
 
@@ -133,10 +133,8 @@ The default profiles are 4k random read and random write at queue depth 4, and
 
 Each workload divides `duration` equally among its own profiles, in order.
 When the duration does not divide evenly, earlier profiles get one second
-more. Every profile window must be at least 10 seconds.
-
-A 10-second warm-up with the first profile of each workload runs before the
-measured time and is not part of `duration`.
+more. Every profile window must be at least 10 seconds. The 10-second warm-up
+is not part of `duration`; see [Timeline](campaigns.md#timeline).
 
 ## Resource overrides
 

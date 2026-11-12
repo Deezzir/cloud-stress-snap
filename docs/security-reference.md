@@ -45,7 +45,7 @@ Run cloud-stress as the user whose client configuration it should use.
 `--juju-model` needs admin access to the model, which also allows changes to
 it. Without it, `check` reports the Ceph and OVS reads as issues.
 
-Host commands run through `juju exec`; `run` uses `sudo` on machines, where `juju exec` runs as `ubuntu`:
+Host commands run through `juju exec` (as `ubuntu`); `run` uses `sudo`:
 
 | Command | On | Does |
 | --- | --- | --- |
