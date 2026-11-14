@@ -95,6 +95,10 @@ cloud-stress run status [<run-id>] --html report.html
 
 The terminal summary shows errors, cleanup status and measurements. `--full`
 includes the fleet and all data gaps; HTML and JSON reports include full details.
+HTML charts work offline: hover for values, drag to zoom, and click legend entries
+to hide series (double-click to isolate one). Filter by VM, job, host or counter;
+separate names with commas to compare several. Interactive charts use `metrics/`;
+bundles without those files show their existing PNGs instead.
 
 How values are computed:
 

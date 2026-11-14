@@ -1,19 +1,22 @@
-"""PNG graphs of a run on the common measured time axis, used by the HTML report."""
+"""Static and interactive graphs on the same measured time axis."""
 
+import html
 from pathlib import Path
 
 import matplotlib
+import plotly.graph_objects as go
 
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt  # noqa: E402
-from matplotlib.axes import Axes  # noqa: E402
 
 from constants import PLOT_COLORS, PLOT_FAINT  # noqa: E402
 
 Row = dict[str, object]
 Line = tuple[list[float], list[float]]
-Series = tuple[str | None, Line, dict[str, object]]
+# PNG legend label, points, PNG style, interactive series identity.
+Series = tuple[str | None, Line, dict[str, object], str]
+Panel = tuple[str, str, list[Series], bool]
 
 DIRS = ("read", "write")
 REQUESTED: dict[str, object] = {
@@ -77,12 +80,13 @@ def _has(line: Line) -> bool:
     return any(y == y for y in line[1])
 
 
-def _markers(ax: Axes, result: Row) -> None:
-    """Vertical lines where a workload changes profile."""
+def _markers(result: Row) -> list[tuple[float, str, str]]:
+    """Times, labels and line styles where a workload changes profile."""
     timeline = result.get("timeline")
     config = result.get("config")
     if not isinstance(timeline, dict) or not isinstance(config, dict):
-        return
+        return []
+    markers = []
     workloads = config.get("workloads")
     workloads = workloads if isinstance(workloads, dict) else {}
     for name, style in (("trex", "-"), ("fio", "--")):
@@ -101,17 +105,8 @@ def _markers(ax: Axes, result: Row) -> None:
                 else f"fio {profile.get('name', index + 1)}"
             )
             x = float(window["start_s"])
-            ax.axvline(x, color="0.4", linestyle=style, linewidth=0.8)
-            ax.text(
-                x,
-                0.98 if name == "trex" else 0.02,
-                f" {label}",
-                transform=ax.get_xaxis_transform(),
-                fontsize=7,
-                va="top" if name == "trex" else "bottom",
-                rotation=90,
-                color="0.3",
-            )
+            markers.append((x, label, style))
+    return markers
 
 
 def _panel(
@@ -127,14 +122,25 @@ def _panel(
     lines = [item for item in lines if _has(item[1])]
     if not lines:
         return None
-    labels = sum(bool(label) for label, _, _ in lines)
+    labels = sum(bool(label) for label, _, _, _ in lines)
     legend_rows = (labels + 2) // 3
     fig, ax = plt.subplots(figsize=(11, 3.8 + 0.25 * legend_rows), dpi=150)
-    for label, (xs, ys), style in lines:
+    for label, (xs, ys), style, _ in lines:
         # Each value covers the interval that ends at its time.
         style = {"drawstyle": "steps-pre", **style}
         ax.plot(xs, ys, label=label, **style)  # type: ignore[arg-type]
-    _markers(ax, result)
+    for x, label, marker_style in _markers(result):
+        ax.axvline(x, color="0.4", linestyle=marker_style, linewidth=0.8)
+        ax.text(
+            x,
+            0.98 if marker_style == "-" else 0.02,
+            f" {label}",
+            transform=ax.get_xaxis_transform(),
+            fontsize=7,
+            va="top" if marker_style == "-" else "bottom",
+            rotation=90,
+            color="0.3",
+        )
     ax.set_xlim(0, duration)
     ax.set_title(title, fontsize=11, loc="left")
     ax.set_xlabel("measured time (s)", fontsize=9)
@@ -163,18 +169,23 @@ def _per_job(jobs: dict[str, list[Row]], unit: str, scale: float = 1.0) -> list[
         for d in DIRS
         for series in _labelled(
             d,
-            [_line(rows, f"{d}_{unit}", scale) for rows in jobs.values()],
+            {
+                f"{name.removeprefix('fio-')} {d}": _line(rows, f"{d}_{unit}", scale)
+                for name, rows in jobs.items()
+            },
             {"color": PLOT_COLORS[d], **PLOT_FAINT},
         )
     ]
 
 
-def _labelled(label: str, lines: list[Line], style: dict[str, object]) -> list[Series]:
-    """Lines in one style; only the first carries the label."""
-    found = [line for line in lines if _has(line)]
+def _labelled(
+    label: str, lines: dict[str, Line], style: dict[str, object]
+) -> list[Series]:
+    """Named lines in one PNG style; only the first carries the PNG label."""
+    found = [(name, line) for name, line in lines.items() if _has(line)]
     return [
-        (label if index == 0 else NO_LABEL, line, style)
-        for index, line in enumerate(found)
+        (label if index == 0 else NO_LABEL, line, style, name)
+        for index, (name, line) in enumerate(found)
     ]
 
 
@@ -194,34 +205,40 @@ def _requested_line(result: Row) -> Line:
     return xs, ys
 
 
-def render(
-    result: Row, metrics: dict[str, list[Row]], out: Path
-) -> list[dict[str, str]]:
-    """Write the run's graphs to out and list them in order."""
-    run = result.get("run")
-    duration = _num(run.get("duration_s")) if isinstance(run, dict) else None
-    if not duration or not result.get("timeline"):
-        return []
-    out.mkdir(parents=True, exist_ok=True)
+def _panels(result: Row, metrics: dict[str, list[Row]]) -> list[Panel]:
+    """Shared panel definitions; retain each VM, job and counter separately."""
     per_vm = {k: v for k, v in metrics.items() if k.startswith("network-")}
     fio_vm = {k: v for k, v in metrics.items() if k.startswith("fio-")}
     hosts = {k: v for k, v in metrics.items() if k.startswith("host-")}
     guests = {k: v for k, v in metrics.items() if k.startswith("guest-")}
     ceph = metrics.get("ceph", [])
     mib = 1 / 1024
-    panels: list[tuple[str, str, list[Series], bool]] = [
+    return [
         (
             "network-packets",
             "Network: packets per second per VM",
-            [("requested per sender", _requested_line(result), REQUESTED)]
+            [
+                (
+                    "requested per sender",
+                    _requested_line(result),
+                    REQUESTED,
+                    "requested per sender",
+                )
+            ]
             + _labelled(
                 "transmitted per sender (TRex)",
-                [_line(rows, "tx_pps") for rows in per_vm.values()],
+                {
+                    f"{name.removeprefix('network-')} TX": _line(rows, "tx_pps")
+                    for name, rows in per_vm.items()
+                },
                 {"color": "tab:blue", **PLOT_FAINT},
             )
             + _labelled(
                 "received per receiver (nftables counters)",
-                [_line(rows, "rx_pps") for rows in per_vm.values()],
+                {
+                    f"{name.removeprefix('network-')} RX": _line(rows, "rx_pps")
+                    for name, rows in per_vm.items()
+                },
                 {"color": "tab:orange", **PLOT_FAINT},
             ),
             False,
@@ -231,7 +248,10 @@ def render(
             "Network: packets per VM since its first sample in the measured time",
             _labelled(
                 "transmitted (TRex)",
-                [_points(rows, "tx_packets") for rows in per_vm.values()],
+                {
+                    f"{name.removeprefix('network-')} TX": _points(rows, "tx_packets")
+                    for name, rows in per_vm.items()
+                },
                 {
                     "color": "tab:blue",
                     "linestyle": "none",
@@ -241,7 +261,10 @@ def render(
             )
             + _labelled(
                 "received (nftables counters)",
-                [_points(rows, "rx_packets") for rows in per_vm.values()],
+                {
+                    f"{name.removeprefix('network-')} RX": _points(rows, "rx_packets")
+                    for name, rows in per_vm.items()
+                },
                 {
                     "color": "tab:orange",
                     "linestyle": "none",
@@ -256,12 +279,18 @@ def render(
             "Network: bytes per second per VM (TRex frame bytes; nftables IP bytes)",
             _labelled(
                 "transmitted",
-                [_line(rows, "tx_bytes_per_s") for rows in per_vm.values()],
+                {
+                    f"{name.removeprefix('network-')} TX": _line(rows, "tx_bytes_per_s")
+                    for name, rows in per_vm.items()
+                },
                 {"color": "tab:blue", **PLOT_FAINT},
             )
             + _labelled(
                 "received",
-                [_line(rows, "rx_bytes_per_s") for rows in per_vm.values()],
+                {
+                    f"{name.removeprefix('network-')} RX": _line(rows, "rx_bytes_per_s")
+                    for name, rows in per_vm.items()
+                },
                 {"color": "tab:orange", **PLOT_FAINT},
             ),
             False,
@@ -288,7 +317,12 @@ def render(
             "host-cpu",
             "Hosts: CPU busy (%)",
             [
-                (name.removeprefix("host-"), _line(rows, "cpu.busy_pct"), {})
+                (
+                    name.removeprefix("host-"),
+                    _line(rows, "cpu.busy_pct"),
+                    {},
+                    name.removeprefix("host-"),
+                )
                 for name, rows in hosts.items()
             ],
             False,
@@ -301,8 +335,9 @@ def render(
                     NO_LABEL,
                     _line(rows, "cpu.busy_pct"),
                     {"color": "tab:blue", **PLOT_FAINT},
+                    name.removeprefix("guest-"),
                 )
-                for rows in guests.values()
+                for name, rows in guests.items()
             ],
             False,
         ),
@@ -317,13 +352,13 @@ def render(
                 )
                 for series in _labelled(
                     label,
-                    [
-                        _line(rows, key)
-                        for rows in sources.values()
+                    {
+                        f"{name} {key}": _line(rows, key)
+                        for name, rows in sources.items()
                         for key in sorted({k for r in rows for k in r})
                         if key.endswith(("rx_dropped_per_s", "tx_dropped_per_s"))
                         or key == "ovs.lost_per_s"
-                    ],
+                    },
                     {"color": color, **PLOT_FAINT},
                 )
             ],
@@ -333,21 +368,100 @@ def render(
             "ceph-ops",
             "Ceph: client operations per second",
             [
-                ("read", _line(ceph, "ceph.read_ops"), {}),
-                ("write", _line(ceph, "ceph.write_ops"), {}),
+                ("read", _line(ceph, "ceph.read_ops"), {}, "read"),
+                ("write", _line(ceph, "ceph.write_ops"), {}, "write"),
             ],
             False,
         ),
         (
             "ceph-slow",
             "Ceph: slow operations",
-            [(NO_LABEL, _line(ceph, "ceph.slow_ops"), {})],
+            [(NO_LABEL, _line(ceph, "ceph.slow_ops"), {}, "slow operations")],
             False,
         ),
     ]
+
+
+def render(
+    result: Row, metrics: dict[str, list[Row]], out: Path
+) -> list[dict[str, str]]:
+    """Write the run's PNG graphs to out and list them in order."""
+    run = result.get("run")
+    duration = _num(run.get("duration_s")) if isinstance(run, dict) else None
+    if not duration or not result.get("timeline"):
+        return []
+    out.mkdir(parents=True, exist_ok=True)
     written = []
-    for slug, title, lines, log in panels:
+    for slug, title, lines, log in _panels(result, metrics):
         item = _panel(out, slug, title, lines, result, duration, log)
         if item:
             written.append(item)
     return written
+
+
+def interactive(result: Row, metrics: dict[str, list[Row]]) -> dict[str, go.Figure]:
+    """Interactive counterparts of the PNGs, with independently selectable series."""
+    run = result.get("run")
+    duration = _num(run.get("duration_s")) if isinstance(run, dict) else None
+    if not duration or not result.get("timeline") or not metrics:
+        return {}
+    figures = {}
+    for slug, _, lines, log in _panels(result, metrics):
+        fig = go.Figure()
+        for _, (xs, ys), style, name in sorted(lines, key=lambda item: item[3]):
+            if not _has((xs, ys)):
+                continue
+            requested = style == REQUESTED
+            fig.add_trace(
+                go.Scatter(
+                    x=xs,
+                    y=ys,
+                    name=html.escape(name),
+                    mode="markers" if style.get("linestyle") == "none" else "lines",
+                    line={
+                        "shape": "linear" if requested else "vh",
+                        "width": 1.5,
+                        "dash": "dot" if requested else "solid",
+                        **({"color": "#526473"} if requested else {}),
+                    },
+                    marker={"size": 4},
+                    connectgaps=False,
+                    hovertemplate=(
+                        "%{x:.3f} s<br>%{y:,.4~g}<extra>%{fullData.name}</extra>"
+                    ),
+                )
+            )
+        if not fig.data:
+            continue
+        for x, label, marker_style in _markers(result):
+            fig.add_vline(
+                x=x,
+                line_width=1,
+                line_color="#8795a1",
+                line_dash="solid" if marker_style == "-" else "dash",
+                annotation_text=html.escape(label),
+                annotation_position="top right",
+                annotation_textangle=-90,
+                annotation_font_size=10,
+            )
+        fig.update_layout(
+            template="plotly_white",
+            font={"family": "system-ui, sans-serif", "color": "#172b3a", "size": 12},
+            margin={"l": 64, "r": 24, "t": 24, "b": 48},
+            xaxis={"title": "measured time (s)", "range": [0, duration]},
+            yaxis={"type": "log" if log else "linear", "rangemode": "tozero"},
+            hovermode="closest",
+            hoverlabel={"namelength": -1},
+            legend={
+                "orientation": "h",
+                "y": -0.2,
+                "maxheight": 120,
+                "font": {"size": 11},
+                "itemclick": "toggle",
+                "itemdoubleclick": "toggleothers",
+            },
+            showlegend=True,
+            uirevision=slug,
+        )
+        figures[f"{slug}.png"] = fig
+    return figures

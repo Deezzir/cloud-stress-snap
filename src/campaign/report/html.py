@@ -1,4 +1,4 @@
-"""Self-contained HTML report with measurement tables and embedded PNG graphs."""
+"""Self-contained HTML report with tables and offline interactive graphs."""
 
 import base64
 import html as html_lib
@@ -7,8 +7,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
+from plotly.offline import get_plotlyjs
+
 from campaign.model.profiles import format_duration
 from campaign.model.state import run_dir
+from campaign.report import plots
+from campaign.report.build import _jsonl
 from campaign.report.text import _dict, _fmt, _list, summary_text
 
 Row = dict[str, object]
@@ -53,6 +57,16 @@ tbody tr:nth-child(even) { background: #fafbfd; }
 figure { margin: 0; padding-top: 16px; border-top: 1px solid #e3e8ed;
   overflow-x: auto; }
 figure img { display: block; width: 100%; min-width: 720px; height: auto; }
+.plot-controls { display: flex; flex-wrap: wrap; align-items: center;
+  gap: 8px; padding-top: 12px; font-size: .875rem; }
+.plot-controls label { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.plot-controls input, .plot-controls button { font: inherit; padding: 6px 10px;
+  border: 1px solid #b7c4ce; border-radius: 5px; background: white; color: inherit; }
+.plot-controls input { width: 250px; max-width: 100%; }
+.plot-controls button { cursor: pointer; background: #f1f5f8; }
+.plot-controls :focus-visible { outline: 2px solid #075b91; outline-offset: 2px; }
+.plot-count { color: #526473; }
+.interactive-figure { overflow: visible; }
 details { border-top: 1px solid #e3e8ed; padding-top: 16px; }
 summary { cursor: pointer; font-weight: 600; }
 details[open] > summary { margin-bottom: 16px; }
@@ -72,13 +86,50 @@ footer { margin-top: 24px; font-size: .85rem; overflow-wrap: anywhere; }
 @media print {
   :root { background: white; }
   main { max-width: none; padding: 0; }
-  nav { display: none; }
+  nav, .plot-controls, .modebar { display: none; }
   section { border: 0; padding: 16px 0; }
   figure, tr { break-inside: avoid; }
   .table-scroll { overflow: visible; }
   td { white-space: normal; }
   figure img { min-width: 0; }
 }
+"""
+
+SCRIPT = """
+document.querySelectorAll(".interactive-figure").forEach(figure => {
+  const plot = figure.querySelector(".plotly-graph-div");
+  const input = figure.querySelector("input");
+  const count = figure.querySelector(".plot-count");
+  const updateCount = () => {
+    const visible = plot.data.filter(t => t.visible !== false &&
+      t.visible !== "legendonly").length;
+    count.textContent = `${visible} / ${plot.data.length} series shown`;
+  };
+  let pending;
+  const update = (hide = false) => {
+    clearTimeout(pending);
+    const terms = input.value.toLowerCase().split(",")
+      .map(s => s.trim()).filter(Boolean);
+    const matches = plot.data.map(t => !terms.length ||
+      terms.some(term => t.name.toLowerCase().includes(term)));
+    Plotly.restyle(plot, {
+      visible: matches.map(match => match ? (hide ? "legendonly" : true) : false),
+      showlegend: matches
+    });
+  };
+  input.addEventListener("input", () => {
+    clearTimeout(pending);
+    pending = setTimeout(() => update(), 150);
+  });
+  figure.querySelectorAll("button").forEach(button => {
+    button.addEventListener("click", () => {
+      input.value = "";
+      update(button.dataset.action === "hide");
+    });
+  });
+  plot.on("plotly_restyle", updateCount);
+  updateCount();
+});
 """
 
 
@@ -181,7 +232,7 @@ def _storage(result: Row) -> str:
     )
 
 
-def _figures(result: Row, bundle: Path, group: str) -> str:
+def _figures(result: Row, bundle: Path, group: str, charts: dict[str, str]) -> str:
     figures = []
     for graph in _list(result.get("graphs")):
         name = str(graph.get("file", ""))
@@ -198,7 +249,25 @@ def _figures(result: Row, bundle: Path, group: str) -> str:
             image = f'<img alt="{title}" src="data:image/png;base64,{data}">'
         else:
             image = f'<p class="note">{title}: graph file unavailable.</p>'
-        figures.append(f'<figure tabindex="0" aria-label="{title}">{image}</figure>')
+        if name in charts:
+            figures.append(
+                f'<figure class="interactive-figure" aria-label="{title}">'
+                f"<figcaption><h3>{title}</h3></figcaption>"
+                '<div class="plot-controls">'
+                '<label>Filter series <input type="search" '
+                'placeholder="e.g. vm001, vm002" aria-label="Filter series"></label>'
+                '<button type="button" data-action="show">Show all</button>'
+                '<button type="button" data-action="hide">Hide all</button>'
+                '<span class="plot-count" role="status"></span></div>'
+                + charts[name]
+                + f"<noscript>{image}</noscript></figure>"
+            )
+        else:
+            figures.append(
+                f'<figure tabindex="0" aria-label="{title}">{image}'
+                '<figcaption class="note">Static graph; interactive charts need '
+                "the run’s metrics/ files.</figcaption></figure>"
+            )
     return "".join(figures) or '<p class="note">No time-series graphs available.</p>'
 
 
@@ -213,6 +282,25 @@ def render_html(run_id: str) -> str | None:
     fleet = _dict(result.get("fleet"))
     timeline = _dict(result.get("timeline"))
     gaps = list(dict.fromkeys(str(g) for g in result.get("gaps") or []))
+    metrics = {
+        path.stem: _jsonl(bundle, f"metrics/{path.name}", gaps)
+        for path in sorted((bundle / "metrics").glob("*.jsonl"))
+    }
+    charts = {
+        name: fig.to_html(
+            full_html=False,
+            include_plotlyjs=False,
+            div_id=f"plot-{Path(name).stem}",
+            default_height="520px",
+            config={
+                "responsive": True,
+                "displaylogo": False,
+                "displayModeBar": True,
+                "modeBarButtonsToRemove": ["select2d", "lasso2d"],
+            },
+        )
+        for name, fig in plots.interactive(result, metrics).items()
+    }
     errors = list(
         dict.fromkeys(
             str(e)
@@ -254,7 +342,7 @@ def render_html(run_id: str) -> str | None:
         enabled = workloads.get("trex" if name == "network" else "fio") is not None
         if name in result or enabled:
             sections.append(
-                (name, title, summary(result) + _figures(result, bundle, name))
+                (name, title, summary(result) + _figures(result, bundle, name, charts))
             )
     sections.append(
         (
@@ -263,7 +351,7 @@ def render_html(run_id: str) -> str | None:
             '<p class="note">Time is relative to the scheduled measurement start. '
             "Dashed markers show profile changes. Each drop line is an individual "
             "counter; counters are not added together.</p>"
-            + _figures(result, bundle, "infrastructure"),
+            + _figures(result, bundle, "infrastructure", charts),
         )
     )
     notices = ""
@@ -308,11 +396,21 @@ def render_html(run_id: str) -> str | None:
         f'<section id="{name}"><h2>{title}</h2>{content}</section>'
         for name, title, content in sections
     )
+    guidance = (
+        '<p class="note">Hover for values; drag to zoom; double-click the plot '
+        "to reset. Click a legend entry to hide it, or double-click to isolate it. "
+        "Filter by VM, job, host or counter; commas match multiple names.</p>"
+        if charts
+        else ""
+    )
+    script = f"<script>{SCRIPT}</script>" if charts else ""
+    library = f"<script>{get_plotlyjs()}</script>" if charts else ""
     return (
         '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width, initial-scale=1">'
         f"<title>Run {_e(run.get('id'))} · Cloud stress</title><style>{STYLE}</style>"
-        '</head><body><main><header><p class="eyebrow">Cloud stress · Run report</p>'
+        f"</head><body>{library}<main><header>"
+        '<p class="eyebrow">Cloud stress · Run report</p>'
         "<h1>Workload measurements</h1>"
         f'<p class="run-id"><code>{_e(run.get("id"))}</code></p>'
         f'<div class="badges"><span class="badge {outcome}">'
@@ -320,6 +418,6 @@ def render_html(run_id: str) -> str | None:
         f'<a class="badge {coverage}" href="#coverage">{len(gaps)} data gaps</a></div>'
         f'<dl class="facts">{fact_html}</dl>'
         f'<nav aria-label="Report sections">{nav}</nav>'
-        f"</header>{body}<footer>Raw outputs, metric series and graphs: "
-        f"<code>{_e(str(bundle))}</code></footer></main></body></html>\n"
+        f"{guidance}</header>{body}<footer>Raw outputs, metric series and graphs: "
+        f"<code>{_e(str(bundle))}</code></footer></main>{script}</body></html>\n"
     )
