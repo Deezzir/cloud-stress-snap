@@ -33,7 +33,7 @@ from probe.display import (
 from probe.infra_probe import probe_infra
 from probe.juju_probe import probe_juju
 from probe.maas_probe import probe_maas
-from probe.models import WORKLOADS, CheckResult, Workload
+from probe.models import WORKLOADS, CephResult, CheckResult, ProbeNotice, Workload
 from probe.openstack_probe import resolve_cloud
 from probe.ovs_probe import probe_ovs
 from probe.plan import resolve_plan, workload_readiness
@@ -95,6 +95,7 @@ def discover(
     """Run live, read-only discovery and resolve the run plan.
 
     With a configuration, the plan includes the fleet for its workloads.
+    Force skips preflight queries while retaining resource discovery.
     """
     if not juju_model:
         raise click.UsageError("--juju-model must not be empty")
@@ -108,10 +109,20 @@ def discover(
         maas, maas_notices = probe_maas(juju_model, scoped_ids)
         link_notices = link_juju_to_hypervisors(juju, maas, openstack.hosts)
         infra_future = pool.submit(probe_infra, juju_model, juju, openstack.hosts)
-        ceph_future = pool.submit(probe_ceph, juju_model, juju)
+        ceph_future = None if force else pool.submit(probe_ceph, juju_model, juju)
         ovs_future = pool.submit(probe_ovs, juju_model, juju)
         infra, infra_notices = infra_future.result()
-        ceph_result, ceph_notices = ceph_future.result()
+        if ceph_future:
+            ceph_result, ceph_notices = ceph_future.result()
+        else:
+            ceph_result = CephResult()
+            ceph_notices = [
+                ProbeNotice(
+                    source="ceph",
+                    reason="not-queried",
+                    message="Preflight checks skipped (--force).",
+                )
+            ]
         ovs_hosts, ovs_notices = ovs_future.result()
     result = CheckResult(
         cloud=cloud,
@@ -308,7 +319,7 @@ def show_result(state: run_state.RunState, full: bool = False) -> None:
 @click.option("--image", help="Glance image name or ID for the guests.")
 @click.option("--flavor", help="Nova flavor name or ID for the guests.")
 @click.option("--volume-type", help="Cinder volume type name or ID.")
-@click.option("--force", is_flag=True, help="Bypass the Ceph health check for fio.")
+@click.option("--force", is_flag=True, help="Skip preflight checks.")
 @click.option(
     "--retain",
     is_flag=True,
