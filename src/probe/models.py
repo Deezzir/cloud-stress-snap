@@ -365,7 +365,7 @@ class VmPlan(Record):
     host: str
     image: str
     image_id: str
-    role: Literal["sender", "receiver"] | None = None
+    role: Literal["sender", "receiver", "peer"] | None = None
 
 
 class Connection(Record):

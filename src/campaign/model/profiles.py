@@ -55,9 +55,9 @@ class TrexProfile(Strict):
 
 
 class TrexConfig(Strict):
-    """Guest-to-guest UDP traffic between the focus host and the other hosts."""
+    """Guest-to-guest UDP traffic: focus host to or from the others, or all to all."""
 
-    mode: Literal["fan-in", "fan-out"]
+    mode: Literal["fan-in", "fan-out", "many-to-many"]
     focus_host: str | None = None
     udp_payload_bytes: int = Field(ge=2, le=1400)
     udp_dst_port: int = Field(ge=1, le=65535)
@@ -69,6 +69,8 @@ class TrexConfig(Strict):
         low, high = self.udp_src_ports
         if not 1 <= low <= high <= 65535:
             raise ValueError("udp_src_ports must be [low, high] within 1-65535")
+        if self.mode == "many-to-many" and self.focus_host is not None:
+            raise ValueError("focus_host does not apply to many-to-many")
         return self
 
 

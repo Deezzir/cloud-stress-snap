@@ -65,9 +65,12 @@ without an architecture property is treated as amd64.
 
 - Without `trex`, VMs are spread round-robin over eligible hypervisors in name
   order, within each hypervisor's capacity.
-- With `trex`, half of the VMs, rounded up, run on the focus host. The rest are
-  spread round-robin over the other eligible hypervisors. `trex` needs at least
-  two VMs and two eligible hypervisors.
+- With `trex` in `fan-in` or `fan-out`, half of the VMs, rounded up, run on the
+  focus host. The rest are spread round-robin over the other eligible
+  hypervisors.
+- With `trex` in `many-to-many`, VMs are spread round-robin over the eligible
+  hypervisors, within each hypervisor's capacity.
+- `trex` needs at least two VMs on at least two eligible hypervisors.
 
 ### Exact placement (`hosts`)
 
@@ -83,8 +86,8 @@ hypervisor of every VM after creation and fails if Nova placed a VM elsewhere.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `mode` | `fan-in` | `fan-in` or `fan-out`. |
-| `focus_host` | chosen | Hypervisor the traffic fans in to or out of. |
+| `mode` | `fan-in` | `fan-in`, `fan-out` or `many-to-many`. |
+| `focus_host` | chosen | Hypervisor the traffic fans in to or out of; rejected with `many-to-many`. |
 | `udp_payload_bytes` | `18` | UDP payload size, 2-1400 bytes. |
 | `udp_dst_port` | `33434` | UDP destination port. |
 | `udp_src_ports` | `[1024, 65535]` | Range of UDP source ports. |
@@ -94,14 +97,17 @@ hypervisor of every VM after creation and fails if Nova placed a VM elsewhere.
 | --- | --- | --- |
 | `fan-in` | VMs on other hypervisors | VMs on the focus host |
 | `fan-out` | VMs on the focus host | VMs on other hypervisors |
+| `many-to-many` | Every VM | Every other VM, including VMs on the same host |
 
-Without `focus_host`, the focus host is the eligible hypervisor with the
-healthiest provider link, then the first by name. With `hosts`, `focus_host`
-must be one of the listed hypervisors.
+In `fan-in` and `fan-out`, without `focus_host`, the focus host is the eligible
+hypervisor with the healthiest provider link, then the first by name. With
+`hosts`, `focus_host` must be one of the listed hypervisors. `many-to-many` has
+no focus host and rejects `focus_host`.
 
 `pps_per_sender` is a sender's total rate, shared equally among the receivers
 assigned to it. Every VM sends or receives, and every receiver is assigned at
-least one sender.
+least one sender. In `many-to-many`, every VM sends and receives, and each of N
+VMs sends `pps_per_sender / (N - 1)` to each other VM.
 
 TRex hypervisors must be amd64 and carry the provider network. The guest flavor
 needs at least 3 vCPUs for the TRex threads; the smallest flavor that fits is

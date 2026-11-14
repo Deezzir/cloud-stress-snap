@@ -187,8 +187,8 @@ def _network(result: Row) -> str:
             )
     return (
         f'<p class="note">{_e(network.get("mode"))} · '
-        f"Focus: {_e(network.get('focus'))} · "
-        f"{_e(network.get('senders'))} senders / "
+        + (f"Focus: {_e(network.get('focus'))} · " if network.get("focus") else "")
+        + f"{_e(network.get('senders'))} senders / "
         f"{_e(network.get('receivers'))} receivers</p>"
         + _table(
             "Per-VM packet rates",

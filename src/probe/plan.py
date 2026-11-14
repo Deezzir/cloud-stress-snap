@@ -292,6 +292,16 @@ def connect(senders: list[VmPlan], receivers: list[VmPlan]) -> list[Connection]:
     ]
 
 
+def connect_all(vms: list[VmPlan]) -> list[Connection]:
+    """Connect every VM to every other; a VM's rate is shared among its peers."""
+    return [
+        Connection(sender=s.name, receiver=r.name, share=1 / (len(vms) - 1))
+        for s in vms
+        for r in vms
+        if r is not s
+    ]
+
+
 def _place(config: RunConfig, candidates: list[Candidate], plan: RunPlan) -> str | None:
     """Resolve the fleet into plan; return why it cannot be placed, if so."""
     placement, trex = config.placement, config.workloads.trex
@@ -324,8 +334,18 @@ def _place(config: RunConfig, candidates: list[Candidate], plan: RunPlan) -> str
                 focus = by_name.get(trex.focus_host)
                 if focus is None or focus.host.name not in counts:
                     return f"focus host {trex.focus_host} is not in placement.hosts"
-            else:
+            elif trex.mode != "many-to-many":
                 focus = _rank(chosen)[0]
+    elif trex and trex.mode == "many-to-many":
+        if total < 2:
+            return "trex needs at least two VMs"
+        if len(eligible) < 2:
+            return "trex needs two eligible hypervisors" + _excluded(reasons)
+        counts = _spread(total, eligible) or {}
+        if not counts:
+            return f"the eligible hypervisors have no room for {total} VMs"
+        if len(counts) < 2:
+            return "trex needs VMs on at least two hypervisors"
     elif trex:
         if total < 2:
             return "trex needs at least two VMs"
@@ -371,8 +391,10 @@ def _place(config: RunConfig, candidates: list[Candidate], plan: RunPlan) -> str
         )
         plan.hosts.append(host)
         for _ in range(counts[name]):
-            role: Literal["sender", "receiver"] | None = None
-            if trex:
+            role: Literal["sender", "receiver", "peer"] | None = None
+            if trex and trex.mode == "many-to-many":
+                role = "peer"
+            elif trex:
                 sends = host.focus == (trex.mode == "fan-out")
                 role = "sender" if sends else "receiver"
             vms.append(
@@ -385,7 +407,9 @@ def _place(config: RunConfig, candidates: list[Candidate], plan: RunPlan) -> str
                 )
             )
     plan.vms = vms
-    if trex and focus:
+    if trex and trex.mode == "many-to-many":
+        plan.connections = connect_all(vms)
+    elif trex and focus:
         plan.focus = focus.host.name
         plan.connections = connect(
             [v for v in vms if v.role == "sender"],

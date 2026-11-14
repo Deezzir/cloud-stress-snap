@@ -148,24 +148,25 @@ def _network(
     """TRex requested and transmitted traffic, and packets counted at receivers."""
     trex = state.config.workloads.trex
     assert trex
-    senders = [t for t in state.targets if t.role == "sender"]
-    receivers = [t for t in state.targets if t.role == "receiver"]
+    senders = [t for t in state.targets if t.role in ("sender", "peer")]
+    receivers = [t for t in state.targets if t.role in ("receiver", "peer")]
     connections = state.plan.connections
-    packets: dict[str, Samples] = {}
+    sent: dict[str, Samples] = {}
+    received: dict[str, Samples] = {}
     step_starts: dict[int, list[float]] = {}
     for vm in senders:
         rows = _jsonl(bundle, f"raw/{vm.name}/trex/flood.jsonl", gaps)
         if not rows:
             gaps.append(f"{vm.name}: no TRex samples")
         stats = [r for r in rows if "event" not in r]
-        packets[vm.name] = _samples(stats, "opackets")
+        sent[vm.name] = _samples(stats, "opackets")
         for row in rows:
             if row.get("event") == "step" and isinstance(row.get("step"), int):
                 t = _num(row.get("t"))
                 if t is not None:
                     step_starts.setdefault(int(str(row["step"])), []).append(t)
         metrics[f"network-{vm.name}"] = _counter_rows(
-            vm.name, packets[vm.name], _samples(stats, "obytes"), "tx", start, gaps
+            vm.name, sent[vm.name], _samples(stats, "obytes"), "tx", start, gaps
         )
     for vm in receivers:
         rows = _jsonl(bundle, f"raw/{vm.name}/sampler/samples.jsonl", gaps)
@@ -187,9 +188,13 @@ def _network(
         ]
         if not totals:
             gaps.append(f"{vm.name}: no receive counter samples")
-        packets[vm.name] = _samples(totals, "packets")
-        metrics[f"network-{vm.name}"] = _counter_rows(
-            vm.name, packets[vm.name], _samples(totals, "bytes"), "rx", start, gaps
+        received[vm.name] = _samples(totals, "packets")
+        rows = _counter_rows(
+            vm.name, received[vm.name], _samples(totals, "bytes"), "rx", start, gaps
+        )
+        metrics[f"network-{vm.name}"] = sorted(
+            metrics.get(f"network-{vm.name}", []) + rows,
+            key=lambda r: float(str(r["t"])),
         )
 
     profiles = []
@@ -204,11 +209,11 @@ def _network(
                 "start_s": round(a - start),
                 "end_s": round(b - start),
                 "tx": _spread(
-                    {s.name: _rate_inside(packets[s.name], a, b) for s in senders},
+                    {s.name: _rate_inside(sent[s.name], a, b) for s in senders},
                     start,
                 ),
                 "rx": _spread(
-                    {r.name: _rate_inside(packets[r.name], a, b) for r in receivers},
+                    {r.name: _rate_inside(received[r.name], a, b) for r in receivers},
                     start,
                 ),
             }
@@ -226,6 +231,19 @@ def _network(
         pps = trex.profiles[0].pps_per_sender
         loads[c.receiver] = loads.get(c.receiver, 0.0) + pps * c.share
     receipt = next((e for e in evts if e.get("event") == "receipt"), None)
+    baselines = {
+        side: {
+            vm: round(first[0] - start, 3)
+            for vm, samples in counts.items()
+            if (first := next((p for p in samples if p[0] >= start), None))
+        }
+        for side, counts in (("tx", sent), ("rx", received))
+    }
+    counted: Row = (
+        {"count_baselines_by_direction_s": baselines}
+        if trex.mode == "many-to-many"
+        else {"count_baselines_s": baselines["tx"] | baselines["rx"]}
+    )
     return {
         "mode": trex.mode,
         "focus": state.plan.focus,
@@ -234,11 +252,7 @@ def _network(
         "connections": [c.model_dump() for c in connections],
         "receiver_load_first_profile_pps": loads,
         "profiles": profiles,
-        "count_baselines_s": {
-            vm: round(first[0] - start, 3)
-            for vm, samples in packets.items()
-            if (first := next((p for p in samples if p[0] >= start), None))
-        },
+        **counted,
         "step_starts": actual,
         "receipt": receipt,
     }

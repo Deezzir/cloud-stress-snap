@@ -147,8 +147,10 @@ class Run:
             future.result()
 
     def targets(self, role: str | None = None) -> list[Target]:
-        """The run's VMs, optionally with one network role."""
-        return [t for t in self.state.targets if role in (None, t.role)]
+        """The run's VMs, optionally those taking one network role; peers take both."""
+        return [
+            t for t in self.state.targets if role in (None, t.role) or t.role == "peer"
+        ]
 
     def prepare(self) -> None:
         """Create the fleet and verify every VM, device and traffic path."""
@@ -263,7 +265,7 @@ class Run:
                     f"{size}-byte TRex packets exceed the "
                     f"{mtu}-byte MTU of {link} in {target.name}"
                 )
-        if target.role == "receiver":
+        if target.role in ("receiver", "peer"):
             version = guest.run("nft --version || true").strip()
             if not version.startswith("nftables"):
                 raise PreparationError(f"nftables is not available in {target.name}")
@@ -699,7 +701,7 @@ class Run:
             )
             args = collect.start_args(
                 self.links.get(target.name),
-                nft=table if target.role == "receiver" else None,
+                nft=table if target.role in ("receiver", "peer") else None,
             )
             self.start_guest_unit(
                 guest,

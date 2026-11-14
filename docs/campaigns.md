@@ -26,8 +26,10 @@ landed on its planned hypervisor and fails otherwise.
 
 ## TRex
 
-Each sender is paired with one or more receivers so that every connection
-crosses hypervisors.
+In `fan-in` and `fan-out`, each sender is paired with one or more receivers so
+that every connection crosses hypervisors. In `many-to-many`, every VM is both a
+sender and a receiver and connects to every other VM, including VMs on the same
+hypervisor.
 
 Packets use the guests' own MAC and IP addresses on the provider network; the
 UDP source port changes with each packet and checksums stay valid. A run-owned

@@ -11,8 +11,9 @@
 duration: 10m
 
 placement:
-  # Total VM count, spread automatically. With trex, half of the VMs (rounded
-  # up) run on the focus host and the rest are spread over the other hosts.
+  # Total VM count, spread automatically. With trex fan-in or fan-out, half of
+  # the VMs (rounded up) run on the focus host and the rest are spread over the
+  # other hosts; with many-to-many, VMs are spread evenly over the hosts.
   vms: 4
   # Or exact counts per Nova hypervisor, instead of vms:
   # hosts:
@@ -28,6 +29,7 @@ workloads:
   trex:
     # fan-in: VMs on the other hosts send to VMs on the focus host.
     # fan-out: VMs on the focus host send to VMs on the other hosts.
+    # many-to-many: every VM sends to every other VM; no focus host.
     mode: fan-in
     # Hypervisor to focus on; chosen automatically when omitted.
     # focus_host: node-a

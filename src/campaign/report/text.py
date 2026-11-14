@@ -125,8 +125,9 @@ def _network_lines(result: Row) -> list[str]:
         )
     return [
         "",
-        f"Network ({network.get('mode')}, focus {network.get('focus')}, "
-        f"{network.get('senders')} senders, {network.get('receivers')} receivers):",
+        f"Network ({network.get('mode')}, "
+        + (f"focus {network.get('focus')}, " if network.get("focus") else "")
+        + f"{network.get('senders')} senders, {network.get('receivers')} receivers):",
         *_table(rows),
         "  TX/RX: reporting/total VMs, then min/median/max packets/s per VM.",
     ]
