@@ -65,17 +65,19 @@ without an architecture property is treated as amd64.
 
 - Without `trex`, VMs are spread round-robin over eligible hypervisors in name
   order, within each hypervisor's capacity.
-- With `trex` in `fan-in` or `fan-out`, half of the VMs, rounded up, run on the
-  focus host. The rest are spread round-robin over the other eligible
-  hypervisors.
+- With `trex` in `fan-in` or `fan-out`, `trex.focus_percent` of the VMs run on
+  the focus host: `ceil(vms * focus_percent / 100)`, capped at `vms - 1` so
+  both groups have at least one VM. The default is 50%. The rest are spread
+  round-robin over the other eligible hypervisors, within their capacity.
 - With `trex` in `many-to-many`, VMs are spread round-robin over the eligible
   hypervisors, within each hypervisor's capacity.
 - `trex` needs at least two VMs on at least two eligible hypervisors.
 
 ### Exact placement (`hosts`)
 
-The counts are used as given. A named hypervisor that does not exist or is not
-eligible is an error. With `trex`, at least two hypervisors must be listed.
+The counts are used as given; `trex.focus_percent` is ignored. A named hypervisor
+that does not exist or is not eligible is an error. With `trex`, at least two
+hypervisors must be listed.
 
 Capacity is what Placement reports as left on each hypervisor for the flavor,
 after reserved amounts, allocation ratios and current usage. When Placement
@@ -88,6 +90,7 @@ hypervisor of every VM after creation and fails if Nova placed a VM elsewhere.
 | --- | --- | --- |
 | `mode` | `fan-in` | `fan-in`, `fan-out` or `many-to-many`. |
 | `focus_host` | chosen | Hypervisor the traffic fans in to or out of; rejected with `many-to-many`. |
+| `focus_percent` | `50` | Integer percentage, 1-99, of `placement.vms` on the focus host: receivers in `fan-in`, senders in `fan-out`. Ignored with `placement.hosts` or `many-to-many`. |
 | `udp_payload_bytes` | `18` | UDP payload size, 2-1400 bytes. |
 | `udp_dst_port` | `33434` | UDP destination port. |
 | `udp_src_ports` | `[1024, 65535]` | Range of UDP source ports. |
@@ -169,16 +172,17 @@ workloads:
   fio: {}
 ```
 
-TRex fanning out of `node-a` to 12 VMs elsewhere, at two rates:
+TRex with 4 senders on `node-a` fanning out to 36 receivers elsewhere, at two rates:
 
 ```yaml
 duration: 10m
 placement:
-  vms: 24
+  vms: 40
 workloads:
   trex:
     mode: fan-out
     focus_host: node-a
+    focus_percent: 10
     profiles:
       - pps_per_sender: 50000
       - pps_per_sender: 100000

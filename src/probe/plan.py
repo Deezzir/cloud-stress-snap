@@ -351,7 +351,7 @@ def _place(config: RunConfig, candidates: list[Candidate], plan: RunPlan) -> str
             return "trex needs at least two VMs"
         if len(eligible) < 2:
             return "trex needs two eligible hypervisors" + _excluded(reasons)
-        on_focus = ceil(total / 2)
+        on_focus = min(ceil(total * trex.focus_percent / 100), total - 1)
         if trex.focus_host:
             focus = by_name.get(trex.focus_host)
             if focus is None:
