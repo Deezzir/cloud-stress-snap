@@ -21,6 +21,7 @@ from constants import (
     MAX_REPORT_FILE_BYTES,
     SAMPLE_INTERVAL_S,
 )
+from probe.models import Workload
 
 Row = dict[str, object]
 Samples = list[tuple[float, float]]
@@ -74,9 +75,9 @@ def _samples(rows: list[Row], key: str) -> Samples:
     )
 
 
-def _windows(state: RunState, start: float, workload: str) -> list[Row]:
+def _windows(state: RunState, start: float, workload: Workload) -> list[Row]:
     """Planned measured windows of one workload as absolute times."""
-    schedule = state.schedule.trex if workload == "trex" else state.schedule.fio
+    schedule = getattr(state.schedule, workload)
     return [
         {
             "profile": w.profile,
@@ -563,9 +564,7 @@ def _run(state: RunState, finished: str) -> Row:
     """Run identity and outcome fields from the state."""
     return {
         "id": state.id,
-        "workloads": [
-            n for n in ("trex", "fio") if getattr(state.config.workloads, n) is not None
-        ],
+        "workloads": state.config.workloads.enabled,
         "duration_s": state.duration_s,
         "model": state.model,
         "cloud": state.cloud,

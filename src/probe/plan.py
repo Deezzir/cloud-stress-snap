@@ -23,6 +23,7 @@ NEEDS: dict[Workload, tuple[str, ...]] = {
     "trex": ("network", "mgmt_network", "image", "flavor", "placement"),
     "fio": ("mgmt_network", "image", "flavor", "volume_type", "placement"),
 }
+HEALTH_NEEDS: dict[Workload, tuple[str, ...]] = {"trex": (), "fio": ("ceph",)}
 
 
 class Candidate(NamedTuple):
@@ -523,9 +524,9 @@ def _pick_volume_type(
 def workload_readiness(
     result: CheckResult,
     missing: dict[Workload, dict[str, str]],
-    allow_recovering: bool,
+    force: bool,
 ) -> list[WorkloadReadiness]:
-    """Gate each workload on its resource choices; fio also on Ceph health."""
+    """Gate each workload on its resources and, unless forced, its HEALTH_NEEDS."""
     ceph = result.ceph
     ceph_blockers = []
     checks = {check.split(":")[0] for check in ceph.health_checks}
@@ -538,30 +539,18 @@ def workload_readiness(
         ceph_blockers.append(f"{down} OSDs down")
     if "SLOW_OPS" in checks:
         ceph_blockers.append("Ceph has slow operations")
-    allowed_states = {"active", "clean", "scrubbing", "deep"}
-    if allow_recovering:
-        allowed_states.update(
-            {"remapped", "backfill_wait", "backfilling", "recovery_wait", "recovering"}
-        )
     unclean = sum(
-        count
-        for state, count in ceph.pg_states.items()
-        if not (
-            state == "active+clean"
-            or (
-                allow_recovering
-                and "active" in state.split("+")
-                and set(state.split("+")) <= allowed_states
-            )
-        )
+        count for state, count in ceph.pg_states.items() if state != "active+clean"
     )
     if unclean:
         ceph_blockers.append(f"{unclean} PGs not active+clean")
+    health = {"ceph": ceph_blockers}
     readiness = []
     for workload, found in missing.items():
         blockers = [found[need] for need in NEEDS[workload] if need in found]
-        if workload == "fio":
-            blockers += ceph_blockers
+        if not force:
+            for dependency in HEALTH_NEEDS[workload]:
+                blockers += health[dependency]
         readiness.append(
             WorkloadReadiness(workload=workload, ready=not blockers, blockers=blockers)
         )

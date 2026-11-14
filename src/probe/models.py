@@ -332,6 +332,7 @@ class OvsHost(Record):
 
 
 Workload = Literal["trex", "fio"]
+WORKLOADS: tuple[Workload, ...] = ("trex", "fio")
 
 
 class WorkloadReadiness(Record):

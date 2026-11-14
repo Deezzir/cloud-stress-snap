@@ -16,6 +16,7 @@ from constants import (
     PREPARE_BUDGET_S,
     WARMUP_S,
 )
+from probe.models import WORKLOADS, Workload
 
 ARCHITECTURES = {
     "amd64": "amd64",
@@ -165,6 +166,11 @@ class Workloads(Strict):
         if self.trex is None and self.fio is None:
             raise ValueError("enable at least one workload: trex or fio")
         return self
+
+    @property
+    def enabled(self) -> list[Workload]:
+        """Enabled workload names in run order."""
+        return [name for name in WORKLOADS if getattr(self, name) is not None]
 
 
 class RunConfig(Strict):

@@ -33,12 +33,11 @@ from probe.display import (
 from probe.infra_probe import probe_infra
 from probe.juju_probe import probe_juju
 from probe.maas_probe import probe_maas
-from probe.models import CheckResult, Workload
+from probe.models import WORKLOADS, CheckResult, Workload
 from probe.openstack_probe import resolve_cloud
 from probe.ovs_probe import probe_ovs
 from probe.plan import resolve_plan, workload_readiness
 
-WORKLOADS: tuple[Workload, ...] = ("trex", "fio")
 DEFAULT_CONFIG = "/snap/cloud-stress/current/share/cloud-stress/config.yaml"
 log = logging.getLogger(__name__)
 
@@ -90,7 +89,7 @@ def output_options[F: Callable[..., object]](func: F) -> F:
 def discover(
     juju_model: str,
     overrides: dict[str, str] | None = None,
-    allow_recovering: bool = False,
+    force: bool = False,
     config: profiles.RunConfig | None = None,
 ) -> CheckResult:
     """Run live, read-only discovery and resolve the run plan.
@@ -134,14 +133,14 @@ def discover(
     )
     missing: dict[Workload, dict[str, str]] = {}
     if config:
-        enabled = {w for w in WORKLOADS if getattr(config.workloads, w) is not None}
+        enabled = set(config.workloads.enabled)
         result.plan, found = resolve_plan(result, overrides, enabled, config)
         missing = {name: found for name in WORKLOADS if name in enabled}
     else:
         result.plan, _ = resolve_plan(result, overrides, set(WORKLOADS))
         for name in WORKLOADS:
             missing[name] = resolve_plan(result, overrides, {name})[1]
-    result.readiness = workload_readiness(result, missing, allow_recovering)
+    result.readiness = workload_readiness(result, missing, force)
     result.notices[:0] = nova_state_notices(result)
     result.notices.extend(datapath_notices(result))
     return result
@@ -309,9 +308,7 @@ def show_result(state: run_state.RunState, full: bool = False) -> None:
 @click.option("--image", help="Glance image name or ID for the guests.")
 @click.option("--flavor", help="Nova flavor name or ID for the guests.")
 @click.option("--volume-type", help="Cinder volume type name or ID.")
-@click.option(
-    "--allow-recovering", is_flag=True, help="Allow active Ceph recovery/backfill PGs."
-)
+@click.option("--force", is_flag=True, help="Bypass the Ceph health check for fio.")
 @click.option(
     "--retain",
     is_flag=True,
@@ -322,7 +319,7 @@ def start(
     config_file: Path,
     juju_model: str,
     full: bool,
-    allow_recovering: bool,
+    force: bool,
     retain: bool,
     **choices: str | None,
 ) -> None:
@@ -341,7 +338,7 @@ def start(
     result = discover(
         juju_model,
         overrides,
-        allow_recovering=allow_recovering,
+        force=force,
         config=config,
     )
     blockers = [b for item in result.readiness for b in item.blockers]
@@ -508,7 +505,7 @@ def status(
     rows = [
         ["Run", state.id],
         ["Status", state.detail or state.phase],
-        ["Workloads", ", ".join(_workloads(state))],
+        ["Workloads", ", ".join(state.config.workloads.enabled)],
         ["VMs", f"{len(state.targets)}/{len(state.plan.vms)} created"],
         ["Planned duration", profiles.format_duration(state.duration_s)],
         ["Elapsed", profiles.format_duration(elapsed)],
@@ -527,10 +524,6 @@ def status(
                 f"  - {entry.kind} {entry.name} on {entry.where}: {entry.action}"
             )
         click.echo(f"Retry: cloud-stress run stop {state.id}")
-
-
-def _workloads(state: run_state.RunState) -> list[str]:
-    return [w for w in WORKLOADS if getattr(state.config.workloads, w) is not None]
 
 
 if __name__ == "__main__":
