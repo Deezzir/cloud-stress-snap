@@ -60,6 +60,7 @@ class TrexConfig(Strict):
     mode: Literal["fan-in", "fan-out", "many-to-many"]
     focus_host: str | None = None
     focus_percent: int = Field(default=50, ge=1, le=99, strict=True)
+    processes: int = Field(default=1, ge=1, le=64, strict=True)
     udp_payload_bytes: int = Field(ge=2, le=1400)
     udp_dst_port: int = Field(ge=1, le=65535)
     udp_src_ports: tuple[int, int]
@@ -70,6 +71,8 @@ class TrexConfig(Strict):
         low, high = self.udp_src_ports
         if not 1 <= low <= high <= 65535:
             raise ValueError("udp_src_ports must be [low, high] within 1-65535")
+        if self.processes > high - low + 1:
+            raise ValueError("udp_src_ports must provide at least one port per process")
         if self.mode == "many-to-many" and self.focus_host is not None:
             raise ValueError("focus_host does not apply to many-to-many")
         return self

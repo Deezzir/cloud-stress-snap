@@ -246,6 +246,7 @@ def _network(
     )
     return {
         "mode": trex.mode,
+        "processes_per_sender": trex.processes,
         "focus": state.plan.focus,
         "senders": len(senders),
         "receivers": len(receivers),

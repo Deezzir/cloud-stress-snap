@@ -43,6 +43,15 @@ Counts therefore show benchmark packets that reached the guest's network
 stack, not packets read by an application. Before measuring, the run sends a
 short low-rate burst on every connection and requires it to arrive.
 
+`workloads.trex.processes` starts independent single-core servers on the same
+interface. One controller schedules all servers and divides the per-VM rate
+across them. Any failed client operation or early traffic stop fails the
+workload; all servers are journaled for cancellation and cleanup.
+Reports use complete aggregate per-VM counters at `raw/<vm>/trex/flood.jsonl`.
+Individual counters, server configurations and logs are retained under
+`raw/<vm>/trex/process-<index>/`. The existing `trex-generator` snap supports
+this; multi-process orchestration requires an updated `cloud-stress` snap.
+
 Guests must reach the Snap Store and an Ubuntu package mirror.
 
 ## fio

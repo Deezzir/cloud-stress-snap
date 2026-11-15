@@ -37,6 +37,9 @@ workloads:
     # fan-in, senders in fan-out. Rounded up, leaving at least one VM elsewhere.
     # Ignored with placement.hosts or many-to-many.
     focus_percent: 50
+    # Independent single-core TRex servers per sender (1-64).
+    # Each needs 3 vCPUs and 4 GiB RAM; PPS stays the total per VM.
+    processes: 1
     udp_payload_bytes: 18
     udp_dst_port: 33434
     udp_src_ports: [1024, 65535]

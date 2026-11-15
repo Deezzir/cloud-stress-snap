@@ -66,10 +66,17 @@ def resolve_plan(
     physnets = {ovs.host_id: ovs.physnets for ovs in result.ovs}
     network = _pick_networks(result, pick, physnets, plan, missing)
     _pick_images(result, pick, plan, missing)
-    _pick_flavor(result, pick, "trex" in workloads, plan, missing)
+    trex_config = config.workloads.trex if config else None
+    _pick_flavor(
+        result,
+        pick,
+        "trex" in workloads,
+        plan,
+        missing,
+        processes=trex_config.processes if trex_config else 1,
+    )
     _pick_volume_type(result, pick, charms, plan, missing)
     candidates = _candidates(result, physnets, network, plan)
-    trex_config = config.workloads.trex if config else None
     if trex_config and plan.mtu:
         size = ip_packet_bytes(trex_config, plan.ip_version)
         if size > plan.mtu:
@@ -125,16 +132,18 @@ def _pick_flavor(
     trex: bool,
     plan: RunPlan,
     missing: dict[str, str],
+    processes: int = 1,
 ) -> None:
     """Choose the smallest flavor large enough for the guests."""
-    vcpus = TREX_MIN_VCPUS if trex else 2
+    vcpus = TREX_MIN_VCPUS * processes if trex else 2
+    ram_gib = 4 * processes if trex else 4
     flavor = min(
         (
             f
             for f in result.openstack.flavors
             if not f.restricted
             and f.vcpus >= vcpus
-            and f.ram_mb >= 4096
+            and f.ram_mb >= ram_gib * 1024
             and f.disk_gb >= 20
             and pick.get("flavor") in (None, f.name, f.id)
         ),
@@ -145,10 +154,10 @@ def _pick_flavor(
         plan.flavor, plan.flavor_id = flavor.name, flavor.id
     else:
         missing["flavor"] = (
-            f"{pick['flavor']} is restricted or smaller than {vcpus} vCPUs, 4 GiB "
-            "RAM and 20 GB disk"
+            f"{pick['flavor']} is restricted or smaller than {vcpus} vCPUs, "
+            f"{ram_gib} GiB RAM and 20 GB disk"
             if "flavor" in pick
-            else f"no flavor with {vcpus} vCPUs, 4 GiB RAM and 20 GB disk"
+            else f"no flavor with {vcpus} vCPUs, {ram_gib} GiB RAM and 20 GB disk"
         )
 
 

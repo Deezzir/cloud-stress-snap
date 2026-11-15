@@ -91,6 +91,7 @@ hypervisor of every VM after creation and fails if Nova placed a VM elsewhere.
 | `mode` | `fan-in` | `fan-in`, `fan-out` or `many-to-many`. |
 | `focus_host` | chosen | Hypervisor the traffic fans in to or out of; rejected with `many-to-many`. |
 | `focus_percent` | `50` | Integer percentage, 1-99, of `placement.vms` on the focus host: receivers in `fan-in`, senders in `fan-out`. Ignored with `placement.hosts` or `many-to-many`. |
+| `processes` | `1` | Independent single-core TRex servers per sender, integer 1-64. |
 | `udp_payload_bytes` | `18` | UDP payload size, 2-1400 bytes. |
 | `udp_dst_port` | `33434` | UDP destination port. |
 | `udp_src_ports` | `[1024, 65535]` | Range of UDP source ports. |
@@ -112,9 +113,17 @@ assigned to it. Every VM sends or receives, and every receiver is assigned at
 least one sender. In `many-to-many`, every VM sends and receives, and each of N
 VMs sends `pps_per_sender / (N - 1)` to each other VM.
 
+With multiple processes, that total is also divided equally among processes:
+`processes: 2` at 500000 PPS requests 250000 PPS from each process, not one
+million PPS per VM. Processes share the data interface, with separate CPU
+triples, RPC/publisher ports, runtime prefixes and source-port ranges.
+`udp_src_ports` must contain at least one port per process.
+
 TRex hypervisors must be amd64 and carry the provider network. The guest flavor
-needs at least 3 vCPUs for the TRex threads; the smallest flavor that fits is
-chosen. TRex packets, IP and UDP headers included, must fit the MTU of the
+needs at least 3 vCPUs and 4 GiB RAM per process, plus 20 GB disk; the smallest
+flavor that fits is chosen. This shared flavor applies to receivers too.
+For example, two processes require at least 6 vCPUs and 8 GiB RAM.
+TRex packets, IP and UDP headers included, must fit the MTU of the
 provider network and of the guest interface.
 
 ## `workloads.fio`

@@ -25,10 +25,23 @@ def ip_packet_bytes(trex: TrexConfig, ip_version: int | None) -> int:
     return (40 if ip_version == 6 else 20) + 8 + trex.udp_payload_bytes
 
 
-def config(link: str, mac: str) -> str:
+def config(link: str, mac: str, index: int = 0, prefix: str = "cloudstress") -> str:
     """Use the guest's data interface with the AF_PACKET driver's default MTU."""
     octets = ",".join(f"0x{octet}" for octet in mac.split(":"))
-    return (FILES / "trex_cfg.yaml").read_text().format(link=link, mac=octets)
+    return (
+        (FILES / "trex_cfg.yaml")
+        .read_text()
+        .format(
+            link=link,
+            mac=octets,
+            prefix=f"{prefix}-{index}",
+            rpc=TREX_RPC_PORT + 2 * index,
+            pub=TREX_RPC_PORT - 1 + 2 * index,
+            master=3 * index,
+            rx=3 * index + 1,
+            traffic=3 * index + 2,
+        )
+    )
 
 
 def server_command(directory: str) -> str:
@@ -39,9 +52,9 @@ def server_command(directory: str) -> str:
     )
 
 
-def server_ready_command() -> str:
+def server_ready_command(index: int = 0) -> str:
     """Prints a line once the TRex server accepts RPC connections."""
-    return f"ss -Hltn 'sport = :{TREX_RPC_PORT}'"
+    return f"ss -Hltn 'sport = :{TREX_RPC_PORT + 2 * index}'"
 
 
 def flood_command(
@@ -68,6 +81,8 @@ def flood_command(
         "steps": steps,
         "end": end,
         "out": f"{directory}/{name}.jsonl",
+        "processes": trex.processes,
+        "rpc_port": TREX_RPC_PORT,
     }
     return (
         f"/snap/bin/{TREX_SNAP}.python {directory}/flood.py "

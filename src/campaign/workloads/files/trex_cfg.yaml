@@ -1,8 +1,17 @@
 # Omit port_mtu: the AF_PACKET driver limit can be below the kernel interface MTU.
 - version: 2
   interfaces: ["{link}", "dummy"]
+  prefix: "{prefix}"
+  zmq_pub_port: {pub}
+  zmq_rpc_port: {rpc}
   port_info:
     - src_mac: [{mac}]
       dest_mac: [{mac}]
     - src_mac: [0x00,0x00,0x00,0x00,0x00,0x01]
       dest_mac: [0x00,0x00,0x00,0x00,0x00,0x02]
+  platform:
+    master_thread_id: {master}
+    latency_thread_id: {rx}
+    dual_if:
+      - socket: 0
+        threads: [{traffic}]

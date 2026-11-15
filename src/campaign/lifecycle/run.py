@@ -297,34 +297,45 @@ class Run:
                 f"installing the {TREX_SNAP} snap in {target.name} failed: {error}"
             ) from None
         self.tool(target.name, "trex", version.splitlines()[-1] if version else "")
-        directory = self.trex_dir
-        for path, text in (
-            (
-                "trex_cfg.yaml",
-                trex.config(self.links[target.name], target.mac or ""),
-            ),
-            ("flood.py", trex.flood_script()),
-        ):
-            if path.endswith(".yaml"):
-                run_state.event(
-                    self.state.id, "file", where=target.name, path=path, text=text
-                )
+        trex_config = self.state.config.workloads.trex
+        assert trex_config
+        guest.run(
+            f"mkdir -p {self.trex_dir} && "
+            f"printf %s {shlex.quote(trex.flood_script())} > {self.trex_dir}/flood.py"
+        )
+        for index in range(trex_config.processes):
+            directory = f"{self.trex_dir}/process-{index}"
+            text = trex.config(
+                self.links[target.name], target.mac or "", index, f"cs-{self.short}"
+            )
+            run_state.event(
+                self.state.id,
+                "file",
+                where=target.name,
+                path=f"{directory}/trex_cfg.yaml",
+                text=text,
+            )
             guest.run(
                 f"mkdir -p {directory} && printf %s {shlex.quote(text)} "
-                f"> {directory}/{path}"
+                f"> {directory}/trex_cfg.yaml"
             )
-        self.start_guest_unit(
-            guest,
-            "trex",
-            self.state.schedule.max_elapsed_s,
-            trex.server_command(directory),
-            evidence=directory,
-        )
-        self.wait_for(
-            lambda: bool(guest.run(trex.server_ready_command()).strip()),
-            120,
-            f"TRex server start in {target.name}",
-        )
+            self.start_guest_unit(
+                guest,
+                "trex" if index == 0 else f"trex-{index}",
+                self.state.schedule.max_elapsed_s,
+                trex.server_command(directory),
+                # Fetch the whole tree once, including the aggregate controller output.
+                evidence=self.trex_dir if index == 0 else None,
+            )
+
+            def ready(index: int = index) -> bool:
+                return bool(guest.run(trex.server_ready_command(index)).strip())
+
+            self.wait_for(
+                ready,
+                120,
+                f"TRex server {index} start in {target.name}",
+            )
 
     def add_counters(self, target: Target) -> None:
         """Count benchmark packets from each assigned sender in a receiver."""
