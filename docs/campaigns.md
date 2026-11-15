@@ -1,152 +1,94 @@
 # Runs
 
-A run executes the workloads selected in a configuration file on a fixed fleet
-of VMs and records time-series measurements of the workloads, hosts and Ceph.
-One run is active at a time.
+A run executes TRex, fio or both on a fixed VM fleet. Only one run can be active.
 
-`cloud-stress check` shows workload readiness, resource choices and warnings.
-Use `cloud-stress check --full` for the full host, network and Ceph inventories,
-or `--json` for structured output.
-
-`--verbose` (`-v`) prints debug logs to stderr on `check`, `run start`,
-`run status` and `run stop`.
+## Start
 
 ```bash
+cloud-stress check
 cp /snap/cloud-stress/current/share/cloud-stress/config.yaml ~/stress.yaml
 cloud-stress run start --config ~/stress.yaml
 ```
 
-The run prints its resources, VM counts and schedule, then starts. Add `--full`
-to show every host, the selected image and timeout. See the
-[configuration reference](configuration.md) for all settings.
+`check` reports readiness and resource choices; `--full` adds inventories and
+`--json` returns structured output. `run start --full` expands the fleet and
+schedule details. Use `--verbose` (`-v`) for debug logs on `check`, `run start`,
+`run status` and `run stop`.
 
-Every VM belongs to one fleet: `vms: 50` creates 50 VMs in total. When fio is
-enabled, every VM gets a data volume and runs fio. The run checks that every VM
-landed on its planned hypervisor and fails otherwise.
+See [configuration](configuration.md) for placement, profiles and resource
+overrides. VM counts are fleet totals; placement on each hypervisor is verified.
+Guests need access to the Snap Store and an Ubuntu package mirror.
 
-## TRex
+## Workloads and timing
 
-In `fan-in` and `fan-out`, each sender is paired with one or more receivers so
-that every connection crosses hypervisors. In `many-to-many`, every VM is both a
-sender and a receiver and connects to every other VM, including VMs on the same
-hypervisor.
+- **TRex:** UDP traffic over the provider network in `fan-in`, `fan-out` or
+  `many-to-many` mode. `pps_per_sender` is the total per VM, shared across its
+  receivers and `processes`. A low-rate receipt check precedes measurement.
+  Receiver counters measure packets reaching the guest network stack, not
+  application delivery.
+- **fio:** direct, asynchronous I/O on one run-owned data volume per VM.
+  The device is checked against the volume identity and must be unpartitioned
+  and separate from the root disk. It is fully prefilled before measurement;
+  multiple jobs use equal, separate regions.
+- **Timing:** each workload divides `duration` equally among its own profiles.
+  A 10-second warm-up uses the first profiles. Warm-up, preparation, prefill and
+  cleanup are excluded from measured time. Workloads share a timeline but change
+  profiles independently.
+- **Failure:** an early workload or receiver-counter stop fails the run.
 
-Packets use the guests' own MAC and IP addresses on the provider network; the
-UDP source port changes with each packet and checksums stay valid. A run-owned
-security group admits the destination port only from the run's own ports.
-
-Senders install the `trex-generator` snap and run TRex on their data interface
-through a Linux socket, without binding the device. Receivers count packets
-from each assigned sender with nftables at the raw prerouting hook, matching
-source and destination address, UDP and the destination port, then drop them.
-Counts therefore show benchmark packets that reached the guest's network
-stack, not packets read by an application. Before measuring, the run sends a
-short low-rate burst on every connection and requires it to arrive.
-
-`workloads.trex.processes` starts independent single-core servers on the same
-interface. One controller schedules all servers and divides the per-VM rate
-across them. Any failed client operation or early traffic stop fails the
-workload; all servers are journaled for cancellation and cleanup.
-Reports use complete aggregate per-VM counters at `raw/<vm>/trex/flood.jsonl`.
-Individual counters, server configurations and logs are retained under
-`raw/<vm>/trex/process-<index>/`. The existing `trex-generator` snap supports
-this; multi-process orchestration requires an updated `cloud-stress` snap.
-
-Guests must reach the Snap Store and an Ubuntu package mirror.
-
-## fio
-
-Jobs use libaio, direct I/O and a time-based runtime over the whole device.
-With more than one job, each job gets its own region of equal size.
-
-Before the volume is used, the run checks that the device in the guest is the
-run's volume, unpartitioned and not the root disk. It then writes the whole
-volume with four writers on separate quarters.
-
-## Timeline
-
-Each workload divides `duration` among its own profiles; the lists are not
-combined. With `duration: 10m`, two TRex profiles and four fio profiles:
-
-| Measured time | TRex profile | fio profile |
-| --- | --- | --- |
-| 0:00-2:30 | 1 | 1 |
-| 2:30-5:00 | 1 | 2 |
-| 5:00-7:30 | 2 | 3 |
-| 7:30-10:00 | 2 | 4 |
-
-Every guest receives the full schedule before it starts and changes profile
-at the planned times; a TRex rate change does not restart fio, and the reverse.
-A 10-second warm-up with the first profiles runs before the measured time and
-is excluded from results. Preparation, prefill and cleanup are outside the
-measured time.
-
-If a workload or a receiver's packet counting stops early in any VM, the run
-stops and is reported as failed. Each fio job is stopped at the end of its
-window.
-
-## Results
-
-Each run writes a bundle to `/var/snap/cloud-stress/common/runs/<run-id>/`:
-
-| Path | Contents |
-| --- | --- |
-| `report.json` | Resolved configuration, fleet, connections, timeline and summaries |
-| `graphs/` | PNG graphs on the measured time axis, with profile changes marked |
-| `metrics/` | Time series per VM, per fio job, per host and Ceph |
-| `raw/` | TRex statistics, nftables and host samples, fio jobs, logs and JSON |
-| `events.jsonl` | Run events, the commands started, tool versions and clock offsets |
+## List and inspect
 
 ```bash
+cloud-stress run list
+cloud-stress run list --json
 cloud-stress run status [<run-id>]
 cloud-stress run status [<run-id>] --full
 cloud-stress run status [<run-id>] --json
 cloud-stress run status [<run-id>] --html report.html
 ```
 
-The terminal summary shows errors, cleanup status and measurements. `--full`
-includes the fleet and all data gaps; HTML and JSON reports include full details.
-HTML charts work offline: hover for values, drag to zoom, and click legend entries
-to hide series (double-click to isolate one). Filter by VM, job, host or counter;
-separate names with commas to compare several. Interactive charts use `metrics/`;
-bundles without those files show their existing PNGs instead.
+`run list` shows local runs newest first: full ID, creation time (UTC), status,
+workloads, configured VM count, duration and cleanup state. Unreadable runs warn
+on stderr without hiding readable runs. `--json` returns summary objects with
+ISO timestamps and durations in seconds.
 
-How values are computed:
+`run status` defaults to the latest run. `--full` includes the fleet and all
+data gaps; HTML and JSON include full details. HTML charts work offline and
+support zooming and filtering by VM, job, host or counter.
 
-- Network rates come from cumulative counters between consecutive samples
-  of each VM: packets and frame bytes sent by TRex in each sender, and IP
-  packets and bytes counted by nftables in each receiver. Graphs show each
-  VM's rates, with the requested rate per sender, and its packets counted
-  since its first sample in the measured time. Per profile, the report lists the
-  range of per-VM rates over each VM's samples inside the window.
-- fio values come from each job's logs, one value per logged interval, and
-  from fio's result for each job over its own runtime. Per profile, the
-  report lists the range of per-job IOPS, bandwidth and p99 latency.
-  fio versions without `job_start` have null per-job `start_s` and `end_s`;
-  their runtime, statistics and timestamped log samples are retained.
-  fio can delay or skip log entries without new IO, so wider spacing alone is
-  not reported as lost data; each entry is plotted over at most one log period.
-- Missing samples, sample gaps, uncovered time at the start or end exceeding the
-  source's sample interval (host 5 s, Ceph 10 s, guest 1 s), failed reads,
-  counter resets and clock offsets above 2 seconds are listed as gaps. After
-  the measured time, the run keeps collecting for the slowest sample interval.
+## Results
 
-## Stopping and cleanup
+Bundles are stored in `/var/snap/cloud-stress/common/runs/<run-id>/`:
 
-`cloud-stress run stop [<run-id>]` stops the active run, or retries cleanup of
-an interrupted one. Run-owned resources are deleted only after their evidence
-is retrieved; `--abandon-evidence` deletes them even when that fails.
+| Path | Contents |
+| --- | --- |
+| `report.json` | Configuration, fleet, timeline, summaries and gaps |
+| `graphs/` | PNG graphs |
+| `metrics/` | Per-VM, per-job, host and Ceph time series |
+| `raw/` | Workload output, counters, configurations and logs |
+| `events.jsonl` | Events, commands, tool versions and clock offsets |
 
-`run start --retain` keeps the run's VMs and other resources for inspection
-after it completes, fails or is stopped. Workloads still stop and evidence is
-still collected.
+Network rates use cumulative counters per VM: TX counts Ethernet frame bytes;
+RX counts IP bytes. TRex process counters are summed per VM, with individual
+output under `raw/<vm>/trex/process-<index>/`. fio reports IOPS, bandwidth and
+p99 latency per job. Profile summaries use each VM's or job's available samples.
+Missing data stays missing; failed reads, counter resets and excessive clock
+offsets are reported as gaps.
+
+## Stop and clean up
 
 ```bash
+cloud-stress run stop [<run-id>]
 cloud-stress run stop --clean [<run-id>]
 ```
 
-`--clean` deletes a retained run's resources, also after the run has ended.
-Without a run ID it selects the active run first, else the newest retained run.
+`stop` stops workloads or retries cleanup. Resources are deleted after evidence
+is retrieved; `--abandon-evidence` allows deletion if retrieval fails.
+
+`run start --retain` keeps resources after completion, failure or cancellation;
+workloads still stop and evidence is collected. `run stop --clean` deletes those
+resources. Without an ID, `stop` selects the active run, then the newest retained
+run.
 
 Exit codes: `0` completed, `20` failed, interrupted or not cleaned up, `30`
 cancelled.

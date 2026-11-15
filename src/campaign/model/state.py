@@ -127,13 +127,20 @@ def load(run_id: str) -> RunState:
     return RunState.model_validate_json((run_dir(run_id) / "state.json").read_text())
 
 
-def runs() -> list[RunState]:
-    """All runs, newest first."""
+def runs(errors: list[str] | None = None) -> list[RunState]:
+    """All runs, newest first; optionally collect read errors instead of raising."""
     if not RUNS.is_dir():
         return []
-    found = [
-        load(path.name) for path in RUNS.iterdir() if (path / "state.json").is_file()
-    ]
+    found = []
+    for path in RUNS.iterdir():
+        if not (path / "state.json").is_file():
+            continue
+        try:
+            found.append(load(path.name))
+        except (OSError, ValueError) as error:
+            if errors is None:
+                raise
+            errors.append(f"Cannot read run {path.name} ({type(error).__name__})")
     return sorted(found, key=lambda state: state.created_at, reverse=True)
 
 

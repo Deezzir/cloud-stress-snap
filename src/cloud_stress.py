@@ -419,6 +419,88 @@ def schedule_rows(
     return rows
 
 
+@run.command("list")
+@click.option(
+    "--json", "as_json", is_flag=True, help="Print saved run summaries as JSON."
+)
+def list_runs(as_json: bool) -> None:
+    """List all locally saved runs, newest first."""
+    errors: list[str] = []
+    try:
+        saved = run_state.runs(errors)
+    except OSError as error:
+        raise click.ClickException(
+            f"Cannot read saved runs ({type(error).__name__})"
+        ) from None
+    for warning in errors:
+        click.echo(f"Warning: {warning}", err=True)
+    summaries = [
+        {
+            "id": state.id,
+            "started_at": state.created_at.astimezone(UTC).isoformat(),
+            "status": (
+                state.execution or "unknown"
+                if state.phase == "finished"
+                else state.phase
+            ),
+            "workloads": state.config.workloads.enabled,
+            "vms": state.config.placement.total,
+            "duration_s": state.duration_s,
+            "cleanup": state.finalization,
+        }
+        for state in saved
+    ]
+    if as_json:
+        click.echo(json.dumps(summaries, indent=2))
+        return
+    if not saved:
+        click.echo("No saved runs." if not errors else "No readable saved runs.")
+        return
+    headers = [
+        "Run ID",
+        "Started (UTC)",
+        "Status",
+        "Workloads",
+        "VMs",
+        "Duration",
+        "Cleanup",
+    ]
+    rows = [
+        [
+            state.id,
+            state.created_at.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S"),
+            str(summary["status"]),
+            ",".join(state.config.workloads.enabled),
+            str(state.config.placement.total),
+            profiles.format_duration(state.duration_s),
+            state.finalization or "—",
+        ]
+        for state, summary in zip(saved, summaries, strict=True)
+    ]
+    widths = [max(len(row[i]) for row in [headers, *rows]) for i in range(len(headers))]
+
+    def border(left: str, join: str, right: str) -> str:
+        return left + join.join("─" * (width + 2) for width in widths) + right
+
+    click.echo(border("┌", "┬", "┐"))
+    for index, row in enumerate([headers, *rows]):
+        cells = [
+            cell.rjust(width) if column == 4 else cell.ljust(width)
+            for column, (cell, width) in enumerate(zip(row, widths, strict=True))
+        ]
+        if index:
+            color = {
+                "completed": "green",
+                "failed": "red",
+                "interrupted": "red",
+            }.get(row[2], "yellow")
+            cells[2] = click.style(cells[2], fg=color)
+        click.echo("│ " + " │ ".join(cells) + " │")
+        if index == 0:
+            click.echo(border("├", "┼", "┤"))
+    click.echo(border("└", "┴", "┘"))
+
+
 @run.command()
 @click.argument("run_id", required=False)
 @output_options
