@@ -248,6 +248,7 @@ def provision(
             raise PreparationError(
                 f"{target.name} landed on {landed}, not {hypervisors[target.host]}"
             )
+        target.hypervisor_hostname = landed
     if volumes:
         ready = _wait_all(
             volumes,

@@ -13,7 +13,7 @@ from campaign.model.profiles import format_duration
 from campaign.model.state import run_dir
 from campaign.report import plots
 from campaign.report.build import _jsonl
-from campaign.report.text import _dict, _fmt, _list, summary_text
+from campaign.report.text import _dict, _fleet_lines, _fmt, _list, _timeline_lines
 
 Row = dict[str, object]
 
@@ -34,8 +34,7 @@ section { margin-top: 24px; padding: 24px; background: white;
   border: 1px solid #dce2e7; border-radius: 10px; scroll-margin-top: 16px; }
 section > * { min-width: 0; }
 nav, .badges { display: flex; flex-wrap: wrap; gap: 8px 20px; }
-.eyebrow, .note, footer { color: #526473; }
-.eyebrow { font-size: .8rem; text-transform: uppercase; letter-spacing: .08em; }
+.note, footer { color: #526473; }
 .run-id { font-size: .9rem; overflow-wrap: anywhere; }
 .badge { display: inline-block; padding: 4px 10px; border-radius: 5px;
   background: #e8eef3; font-size: .85rem; font-weight: 600; }
@@ -52,6 +51,7 @@ caption { text-align: left; font-weight: 600; padding-bottom: 12px; }
 th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid #e3e8ed; }
 th { background: #f1f5f8; font-weight: 600; }
 td { white-space: nowrap; }
+.wrap-cells td { white-space: normal; }
 tbody tr:nth-child(even) { background: #fafbfd; }
 .note { font-size: .875rem; }
 figure { margin: 0; padding-top: 16px; border-top: 1px solid #e3e8ed;
@@ -138,7 +138,14 @@ def _e(value: object) -> str:
     return html_lib.escape(_fmt(value) if value is not None else "—")
 
 
-def _table(title: str, headers: list[str], rows: list[list[object]]) -> str:
+def _table(
+    title: str,
+    headers: list[str],
+    rows: list[list[object]],
+    *,
+    caption: bool = True,
+    wrap: bool = False,
+) -> str:
     """Scrollable, semantic table; every cell is plain text."""
     if not rows:
         return '<p class="note">No measurements available.</p>'
@@ -146,10 +153,30 @@ def _table(title: str, headers: list[str], rows: list[list[object]]) -> str:
     body = "".join(
         "<tr>" + "".join(f"<td>{_e(v)}</td>" for v in row) + "</tr>" for row in rows
     )
+    label = f"<caption>{_e(title)}</caption>" if caption else ""
+    style = ' class="wrap-cells"' if wrap else ""
     return (
         '<div class="table-scroll" tabindex="0" role="region" '
-        f'aria-label="{_e(title)}"><table><caption>{_e(title)}</caption>'
+        f'aria-label="{_e(title)}"><table{style}>{label}'
         f"<thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>"
+    )
+
+
+def _placement(fleet: Row) -> str:
+    """VM nodes from saved observations, with planned-only fallbacks labelled."""
+    hosts = {str(h.get("name")): h.get("hypervisor") for h in _list(fleet.get("hosts"))}
+    rows: list[list[object]] = []
+    for vm in sorted(_list(fleet.get("vms")), key=lambda v: str(v.get("name") or "")):
+        node = vm.get("hypervisor_hostname") or vm.get("binding_host")
+        if not node:
+            planned = hosts.get(str(vm.get("host"))) or vm.get("host")
+            node = f"{planned} (planned)" if planned else None
+        rows.append([vm.get("name"), node])
+    if not rows:
+        return '<p class="note">No VM placement recorded.</p>'
+    return _table("VM placement", ["VM", "Node"], rows, caption=False, wrap=True) + (
+        '<p class="note">Nodes recorded at provisioning from Nova or port binding. '
+        "(planned) means no placement observation was saved; — means unavailable.</p>"
     )
 
 
@@ -264,9 +291,8 @@ def _figures(result: Row, bundle: Path, group: str, charts: dict[str, str]) -> s
             )
         else:
             figures.append(
-                f'<figure tabindex="0" aria-label="{title}">{image}'
-                '<figcaption class="note">Static graph; interactive charts need '
-                "the run’s metrics/ files.</figcaption></figure>"
+                f'<figure tabindex="0" aria-label="{title}">'
+                f"<figcaption><h3>{title}</h3></figcaption>{image}</figure>"
             )
     return "".join(figures) or '<p class="note">No time-series graphs available.</p>'
 
@@ -318,7 +344,6 @@ def render_html(run_id: str) -> str | None:
         else "Not started"
     )
     facts = [
-        ("Execution", run.get("execution")),
         ("Exit code", run.get("code")),
         ("Cleanup", run.get("finalization")),
         (
@@ -332,7 +357,6 @@ def render_html(run_id: str) -> str | None:
         f"<div><dt>{_e(k)}</dt><dd>{_e(v)}</dd></div>" for k, v in facts
     )
     outcome = "good" if run.get("code") == 0 else "attention"
-    coverage = "attention" if gaps else ""
     sections = []
     workloads = _dict(_dict(result.get("config")).get("workloads"))
     for name, title, summary in (
@@ -354,6 +378,7 @@ def render_html(run_id: str) -> str | None:
             + _figures(result, bundle, "infrastructure", charts),
         )
     )
+    sections.append(("placement", "VM placement", _placement(fleet)))
     notices = ""
     if errors:
         notices += (
@@ -368,6 +393,10 @@ def render_html(run_id: str) -> str | None:
             ["Kind", "Name", "Action", "Location"],
             [[r.get(k) for k in ("kind", "name", "action", "where")] for r in cleanup],
         )
+        notices += (
+            '<p class="note">Retry cleanup: <code>cloud-stress run stop '
+            f"{_e(run.get('id'))}</code></p>"
+        )
     if gaps:
         notices += (
             f"<details><summary>Show all {len(gaps)} data gaps</summary>"
@@ -375,17 +404,21 @@ def render_html(run_id: str) -> str | None:
             + "".join(f"<li>{_e(g)}</li>" for g in gaps)
             + "</ul></details>"
         )
-    sections.insert(
-        0 if notices else len(sections),
-        ("coverage", "Data coverage", notices or "<p>No data gaps reported.</p>"),
+    if notices:
+        sections.insert(0, ("coverage", "Data coverage", notices))
+    fleet_details = "\n".join([*_fleet_lines(result), *_timeline_lines(result)]).strip()
+    details = (
+        "<details><summary>Fleet & timing</summary><pre>"
+        + html_lib.escape(fleet_details)
+        + "</pre></details>"
+        if fleet_details
+        else ""
     )
     sections.append(
         (
             "details",
             "Run details",
-            "<details><summary>Full text summary & fleet</summary><pre>"
-            + html_lib.escape(summary_text(result, full=True))
-            + "</pre></details>"
+            details
             + "<details><summary>Resolved configuration</summary><pre>"
             + html_lib.escape(json.dumps(result.get("config"), indent=2))
             + "</pre></details>",
@@ -397,11 +430,22 @@ def render_html(run_id: str) -> str | None:
         for name, title, content in sections
     )
     guidance = (
+        "<details><summary>Chart controls</summary>"
         '<p class="note">Hover for values; drag to zoom; double-click the plot '
         "to reset. Click a legend entry to hide it, or double-click to isolate it. "
-        "Filter by VM, job, host or counter; commas match multiple names.</p>"
+        "Filter by VM, job, host or counter; commas match multiple names.</p></details>"
         if charts
         else ""
+    )
+    if any(g.get("file") not in charts for g in _list(result.get("graphs"))):
+        guidance += (
+            '<p class="note">Static graphs are used where metric series are '
+            "unavailable.</p>"
+        )
+    coverage = (
+        f'<a class="badge attention" href="#coverage">{len(gaps)} data gaps</a>'
+        if gaps
+        else '<span class="badge">No data gaps</span>'
     )
     script = f"<script>{SCRIPT}</script>" if charts else ""
     library = f"<script>{get_plotlyjs()}</script>" if charts else ""
@@ -410,12 +454,11 @@ def render_html(run_id: str) -> str | None:
         '<meta name="viewport" content="width=device-width, initial-scale=1">'
         f"<title>Run {_e(run.get('id'))} · Cloud stress</title><style>{STYLE}</style>"
         f"</head><body>{library}<main><header>"
-        '<p class="eyebrow">Cloud stress · Run report</p>'
-        "<h1>Workload measurements</h1>"
+        "<h1>Cloud stress report</h1>"
         f'<p class="run-id"><code>{_e(run.get("id"))}</code></p>'
         f'<div class="badges"><span class="badge {outcome}">'
         f"{_e(run.get('execution'))}</span>"
-        f'<a class="badge {coverage}" href="#coverage">{len(gaps)} data gaps</a></div>'
+        f"{coverage}</div>"
         f'<dl class="facts">{fact_html}</dl>'
         f'<nav aria-label="Report sections">{nav}</nav>'
         f"{guidance}</header>{body}<footer>Raw outputs, metric series and graphs: "

@@ -12,6 +12,7 @@ class Target(BaseModel):
 
     name: str
     host: str
+    hypervisor_hostname: str | None = None
     role: Literal["sender", "receiver", "peer"] | None = None
     server_id: str
     mgmt_port_id: str
