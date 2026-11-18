@@ -63,6 +63,37 @@ def _fleet_lines(result: Row) -> list[str]:
         name = f"{host.get('name')}{' (focus)' if host.get('focus') else ''}"
         rows.append([name, host.get("architecture"), len(placed), ", ".join(roles)])
     lines = ["", "Fleet:", *_table(rows)] if len(rows) > 1 else []
+    if sources := _list(fleet.get("host_senders")):
+        lines += [
+            "",
+            "Host sources:",
+            *_table(
+                [
+                    [
+                        "SOURCE",
+                        "HOST",
+                        "BACKEND",
+                        "INTERFACE",
+                        "SOURCE IP",
+                        "SOURCE MAC",
+                    ],
+                    *[
+                        [
+                            s.get(k)
+                            for k in (
+                                "name",
+                                "host",
+                                "backend",
+                                "interface",
+                                "address",
+                                "mac",
+                            )
+                        ]
+                        for s in sources
+                    ],
+                ]
+            ),
+        ]
     resources = [
         ["TRex network", fleet.get("network")],
         ["Management", fleet.get("mgmt_network")],
@@ -129,7 +160,12 @@ def _network_lines(result: Row) -> list[str]:
         + (f"focus {network.get('focus')}, " if network.get("focus") else "")
         + f"{network.get('senders')} senders, {network.get('receivers')} receivers):",
         *_table(rows),
-        "  TX/RX: reporting/total VMs, then min/median/max packets/s per VM.",
+        (
+            "  TX/RX: reporting/total host sources or receiver VMs, "
+            "then min/median/max packets/s."
+            if network.get("mode") == "host-to-vm"
+            else "  TX/RX: reporting/total VMs, then min/median/max packets/s per VM."
+        ),
     ]
 
 

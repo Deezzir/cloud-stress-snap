@@ -12,6 +12,7 @@ from probe.models import (
     Connection,
     HostPlan,
     HostProbe,
+    HostSenderPlan,
     Network,
     RunPlan,
     VmPlan,
@@ -70,7 +71,7 @@ def resolve_plan(
     _pick_flavor(
         result,
         pick,
-        "trex" in workloads,
+        "trex" in workloads and not (trex_config and trex_config.mode == "host-to-vm"),
         plan,
         missing,
         processes=trex_config.processes if trex_config else 1,
@@ -84,6 +85,11 @@ def resolve_plan(
                 f"{size}-byte TRex packets exceed the {plan.mtu}-byte MTU of "
                 f"{plan.network}"
             )
+    if trex_config and trex_config.mode == "host-to-vm":
+        if plan.vlan is None or not 1 <= plan.vlan <= 4094:
+            missing["network"] = "host-to-vm requires a provider VLAN in 1-4094"
+        elif plan.mtu is None or plan.mtu < (1280 if plan.ip_version == 6 else 68):
+            missing["network"] = "host-to-vm requires a known, valid provider MTU"
     if config is not None:
         if not missing.keys() & {"mgmt_network", "image", "flavor"}:
             problem = _place(config, candidates, plan)
@@ -236,6 +242,7 @@ def _exclusion(
     plan: RunPlan,
     trex: bool,
     placement: Placement | None = None,
+    vm_sender: bool = True,
 ) -> str | None:
     """Why a host cannot take the run's VMs, or None when it can."""
     host = candidate.host
@@ -251,7 +258,7 @@ def _exclusion(
         return f"its architecture {host.architecture} is not selected"
     if host.architecture not in plan.image_ids:
         return f"there is no guest image for {host.architecture}"
-    if trex and host.architecture not in TREX_ARCHITECTURES:
+    if trex and vm_sender and host.architecture not in TREX_ARCHITECTURES:
         return f"TRex does not support {host.architecture}"
     if trex and not host.link:
         return f"it has no healthy link on {plan.network}"
@@ -314,15 +321,57 @@ def connect_all(vms: list[VmPlan]) -> list[Connection]:
 def _place(config: RunConfig, candidates: list[Candidate], plan: RunPlan) -> str | None:
     """Resolve the fleet into plan; return why it cannot be placed, if so."""
     placement, trex = config.placement, config.workloads.trex
+    host_mode = trex is not None and trex.mode == "host-to-vm"
     total = placement.total
     reasons = {
-        c.host.name: _exclusion(c, plan, trex is not None, placement)
+        c.host.name: _exclusion(c, plan, trex is not None, placement, not host_mode)
         for c in candidates
     }
     by_name = {c.host.name: c for c in candidates}
     by_name |= {c.host.hypervisor: c for c in candidates}
     eligible = [c for c in candidates if reasons[c.host.name] is None]
     focus: Candidate | None = None
+
+    if host_mode:
+        assert trex
+        selected: dict[str, HostSenderPlan] = {}
+        for name, source in trex.host_senders.items():
+            candidate = by_name.get(name)
+            if candidate is None:
+                return f"source {name} is not a usable hypervisor"
+            host = candidate.host
+            if host.name in selected:
+                return f"source {name} names the same host twice"
+            if (
+                host.name in placement.exclude_hosts
+                or host.hypervisor in placement.exclude_hosts
+            ):
+                return f"source {name} is excluded by placement.exclude_hosts"
+            if host.architecture not in TREX_ARCHITECTURES:
+                return f"source {name}: TRex does not support {host.architecture}"
+            if source.backend == "af_packet" and (
+                source.interface != host.link
+                or not candidate.health
+                or not candidate.health[0]
+            ):
+                return (
+                    f"source {name}: AF_PACKET interface must be the healthy "
+                    f"provider link {host.link}"
+                )
+            selected[host.name] = HostSenderPlan(
+                name=f"hv{len(selected) + 1:03d}", host=host.name, **source.model_dump()
+            )
+        plan.host_senders = [
+            sender.model_copy(update={"name": f"hv{index:03d}"})
+            for index, (_, sender) in enumerate(sorted(selected.items()), 1)
+        ]
+        # A single source cannot send through the physical switch to its own VMs.
+        eligible = [
+            c
+            for c in eligible
+            if any(s.host != c.host.name for s in plan.host_senders)
+            and (total > 1 or c.host.name not in selected)
+        ]
 
     if placement.hosts is not None:
         counts: dict[str, int] = {}
@@ -335,7 +384,7 @@ def _place(config: RunConfig, candidates: list[Candidate], plan: RunPlan) -> str
             if found.capacity is not None and count > found.capacity:
                 return f"{name} has room for at most {found.capacity} VMs"
             counts[found.host.name] = count
-        if trex:
+        if trex and not host_mode:
             if len(counts) < 2:
                 return "trex needs VMs on at least two hypervisors"
             chosen = [by_name[name] for name in counts]
@@ -355,12 +404,12 @@ def _place(config: RunConfig, candidates: list[Candidate], plan: RunPlan) -> str
             return f"the eligible hypervisors have no room for {total} VMs"
         if len(counts) < 2:
             return "trex needs VMs on at least two hypervisors"
-    elif trex:
+    elif trex and not host_mode:
         if total < 2:
             return "trex needs at least two VMs"
         if len(eligible) < 2:
             return "trex needs two eligible hypervisors" + _excluded(reasons)
-        on_focus = min(ceil(total * trex.focus_percent / 100), total - 1)
+        on_focus = min(ceil(total * (trex.focus_percent or 50) / 100), total - 1)
         if trex.focus_host:
             focus = by_name.get(trex.focus_host)
             if focus is None:
@@ -401,7 +450,9 @@ def _place(config: RunConfig, candidates: list[Candidate], plan: RunPlan) -> str
         plan.hosts.append(host)
         for _ in range(counts[name]):
             role: Literal["sender", "receiver", "peer"] | None = None
-            if trex and trex.mode == "many-to-many":
+            if host_mode:
+                role = "receiver"
+            elif trex and trex.mode == "many-to-many":
                 role = "peer"
             elif trex:
                 sends = host.focus == (trex.mode == "fan-out")
@@ -416,7 +467,21 @@ def _place(config: RunConfig, candidates: list[Candidate], plan: RunPlan) -> str
                 )
             )
     plan.vms = vms
-    if trex and trex.mode == "many-to-many":
+    if host_mode:
+        for sender in plan.host_senders:
+            peers = [vm for vm in vms if vm.host != sender.host]
+            if not peers:
+                return f"source {sender.host} has no receiver on another hypervisor"
+            plan.connections += [
+                Connection(sender=sender.name, receiver=vm.name, share=1 / len(peers))
+                for vm in peers
+            ]
+            if sender.host not in counts:
+                plan.hosts.append(by_name[sender.host].host.model_copy())
+        connected = {c.receiver for c in plan.connections}
+        if any(vm.name not in connected for vm in vms):
+            return "every receiver needs a source on another hypervisor"
+    elif trex and trex.mode == "many-to-many":
         plan.connections = connect_all(vms)
     elif trex and focus:
         plan.focus = focus.host.name
@@ -478,6 +543,7 @@ def _pick_networks(
     else:
         plan.network, plan.vlan = network.name or network.id, network.segmentation_id
         plan.network_id = network.id
+        plan.physical_network = network.physical_network
         plan.mtu = network.mtu
         plan.ip_version = 6 if 6 in network.ip_versions else 4
         if not network.ip_versions:

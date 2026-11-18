@@ -211,12 +211,18 @@ def _panels(result: Row, metrics: dict[str, list[Row]]) -> list[Panel]:
     fio_vm = {k: v for k, v in metrics.items() if k.startswith("fio-")}
     hosts = {k: v for k, v in metrics.items() if k.startswith("host-")}
     guests = {k: v for k, v in metrics.items() if k.startswith("guest-")}
+    network = result.get("network")
+    unit = (
+        "participant"
+        if isinstance(network, dict) and network.get("mode") == "host-to-vm"
+        else "VM"
+    )
     ceph = metrics.get("ceph", [])
     mib = 1 / 1024
     return [
         (
             "network-packets",
-            "Network: packets per second per VM",
+            f"Network: packets per second per {unit}",
             [
                 (
                     "requested per sender",
@@ -245,7 +251,7 @@ def _panels(result: Row, metrics: dict[str, list[Row]]) -> list[Panel]:
         ),
         (
             "network-counts",
-            "Network: packets per VM since its first sample in the measured time",
+            f"Network: packets per {unit} since its first sample in the measured time",
             _labelled(
                 "transmitted (TRex)",
                 {
@@ -276,7 +282,8 @@ def _panels(result: Row, metrics: dict[str, list[Row]]) -> list[Panel]:
         ),
         (
             "network-bytes",
-            "Network: bytes per second per VM (TRex frame bytes; nftables IP bytes)",
+            f"Network: bytes per second per {unit} "
+            "(TRex frame bytes; nftables IP bytes)",
             _labelled(
                 "transmitted",
                 {

@@ -4,6 +4,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
+from probe.models import HostSenderPlan
+
 
 class Target(BaseModel):
     """A run-owned VM as observed after creation."""
@@ -26,3 +28,12 @@ class Target(BaseModel):
     volume_type: str | None = None
     volume_backend: str | None = None
     volume_size_gb: int | None = None
+
+
+class HostTarget(HostSenderPlan):
+    """A host source using a run-owned, unattached Neutron port identity."""
+
+    machine: str
+    port_id: str
+    mac: str
+    address: str

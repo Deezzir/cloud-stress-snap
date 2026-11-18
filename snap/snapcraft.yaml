@@ -41,7 +41,7 @@ description: |
 
   Workloads, enabled by sections of the run configuration:
 
-  * `trex`: UDP traffic between guests, fanned in to or out of one hypervisor.
+  * `trex`: UDP traffic between guests or from explicit hypervisor sources to guests.
   * `fio`: fio on a Ceph-backed Cinder volume attached to every guest.
 
   Requirements:

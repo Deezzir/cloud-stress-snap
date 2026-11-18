@@ -1,8 +1,8 @@
 # cloud-stress
 
 A stress-testing tool for Prodstack infrastructure, distributed as a snap.
-Run TRex network traffic and fio storage workloads on VMs, and view network,
-storage and host measurements.
+Run TRex traffic between VMs or from hypervisors to VMs, alongside fio storage
+workloads on VMs, and view network, storage and host measurements.
 
 Usage is in the snap description in `snap/snapcraft.yaml`. Runs are configured
 with a YAML file; [`config.yaml`](config.yaml) is the example.

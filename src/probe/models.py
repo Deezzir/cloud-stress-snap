@@ -368,8 +368,18 @@ class VmPlan(Record):
     role: Literal["sender", "receiver", "peer"] | None = None
 
 
+class HostSenderPlan(Record):
+    """A physical host source, independent of VM placement and capacity."""
+
+    name: str = Field(pattern=r"^hv[0-9]{3,}$")
+    host: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+    backend: Literal["af_packet", "dpdk"]
+    interface: str
+    cpus: list[int]
+
+
 class Connection(Record):
-    """Traffic from a sender VM to a receiver VM: a share of the sender's rate."""
+    """Traffic from a source to a receiver VM: a share of the source's rate."""
 
     sender: str
     receiver: str
@@ -381,6 +391,7 @@ class RunPlan(Record):
 
     network: str | None = None
     network_id: str | None = None
+    physical_network: str | None = None
     vlan: int | None = None
     mtu: int | None = None
     ip_version: Literal[4, 6] | None = None
@@ -395,6 +406,7 @@ class RunPlan(Record):
     focus: str | None = None
     hosts: list[HostPlan] = Field(default_factory=list)
     vms: list[VmPlan] = Field(default_factory=list)
+    host_senders: list[HostSenderPlan] = Field(default_factory=list)
     connections: list[Connection] = Field(default_factory=list)
 
 

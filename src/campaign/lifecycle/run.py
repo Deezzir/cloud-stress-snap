@@ -21,7 +21,7 @@ from campaign.lifecycle.finalize import finalize
 from campaign.lifecycle.provision import PreparationError
 from campaign.model import state as run_state
 from campaign.model.state import RunState
-from campaign.model.target import Target
+from campaign.model.target import HostTarget, Target
 from campaign.transport import remote
 from campaign.transport.guest import Guest, guest_for, keygen
 from campaign.workloads import collect, fio, trex
@@ -36,6 +36,7 @@ from constants import (
     RECEIPT_PPS,
     RECEIPT_S,
     SAMPLE_INTERVAL_S,
+    TREX_RPC_PORT,
     TREX_SNAP,
 )
 
@@ -152,6 +153,43 @@ class Run:
             t for t in self.state.targets if role in (None, t.role) or t.role == "peer"
         ]
 
+    def senders(self) -> list[Target | HostTarget]:
+        """VM and physical-host sources; host sources never enter guest workflows."""
+        return [*self.targets("sender"), *self.state.host_senders]
+
+    def sender_dir(self, target: Target | HostTarget) -> str:
+        """Each sender's run-owned snap directory."""
+        if isinstance(target, HostTarget):
+            return f"/var/snap/{TREX_SNAP}/common/cloud-stress-{self.state.id}"
+        return self.trex_dir
+
+    def command(
+        self,
+        target: Target | HostTarget,
+        command: str,
+        timeout: int = 120,
+    ) -> str:
+        """Execute against the explicitly identified VM or physical host."""
+        if self.cancel.is_set():
+            raise Cancelled
+        if self.state.phase == "preparing":
+            remaining = int(self.prepare_deadline - time.monotonic())
+            if remaining <= 0:
+                raise PreparationError("preparation deadline exceeded")
+            timeout = min(timeout, remaining)
+        if isinstance(target, HostTarget):
+            try:
+                return remote.sh(self.juju, target.machine, command, wait=timeout)
+            except (jubilant.CLIError, jubilant.TaskError, TimeoutError) as error:
+                detail = str(getattr(error, "stderr", "") or error).rsplit(
+                    "Stderr:", 1
+                )[-1]
+                raise RuntimeError(
+                    f"host command in {target.name} failed: "
+                    + " ".join(detail.split())[-300:]
+                ) from None
+        return self.guests[target.name].run(command, timeout=timeout)
+
     def prepare(self) -> None:
         """Create the fleet and verify every VM, device and traffic path."""
         config = self.state.config
@@ -167,8 +205,8 @@ class Run:
         self.note("starting collectors")
         self.start_collectors()
         if config.workloads.trex:
-            self.note("installing TRex in the senders")
-            self.each(self.targets("sender"), self.start_trex)
+            self.note("preparing TRex senders")
+            self.each(self.senders(), self.start_trex)
             self.note("checking receipt between every sender and receiver")
             self.verify_receipt()
         if config.workloads.fio:
@@ -207,6 +245,8 @@ class Run:
         for target in self.state.targets:
             run_state.event(self.state.id, "target", **target.model_dump())
             self.guests[target.name] = guest_for(self.juju, self.state, target)
+        for sender in self.state.host_senders:
+            run_state.event(self.state.id, "host-sender", **sender.model_dump())
         private = (self.private / "id_ed25519").read_text()
         for host in self.state.plan.hosts:
             self.own_host_dir(host.machine)
@@ -281,32 +321,90 @@ class Run:
                 raise PreparationError(f"{target.name}: {reason}")
             self.devices[target.name] = device
 
-    def tool(self, vm: str, name: str, version: str) -> None:
-        """Record a tool version used in a guest."""
-        run_state.event(self.state.id, "tool", vm=vm, name=name, version=version)
+    def tool(self, vm: str, name: str, version: str, *, host: bool = False) -> None:
+        """Record a tool version at its VM or host source."""
+        run_state.event(
+            self.state.id,
+            "tool",
+            **{"source" if host else "vm": vm},
+            name=name,
+            version=version,
+        )
 
-    def start_trex(self, target: Target) -> None:
-        """Install TRex in a sender and start its server on the data interface."""
-        guest = self.guests[target.name]
-        install = trex.install_command()
-        run_state.event(self.state.id, "command", where=target.name, command=install)
-        try:
-            version = guest.run(install, timeout=900).strip()
-        except RuntimeError as error:
-            raise PreparationError(
-                f"installing the {TREX_SNAP} snap in {target.name} failed: {error}"
-            ) from None
-        self.tool(target.name, "trex", version.splitlines()[-1] if version else "")
+    def start_trex(self, target: Target | HostTarget) -> None:
+        """Prepare a sender and start its servers without changing host devices."""
         trex_config = self.state.config.workloads.trex
         assert trex_config
-        guest.run(
-            f"mkdir -p {self.trex_dir} && "
-            f"printf %s {shlex.quote(trex.flood_script())} > {self.trex_dir}/flood.py"
+        sockets = [0] * trex_config.processes
+        rpc_port = TREX_RPC_PORT
+        root = self.sender_dir(target)
+        if isinstance(target, HostTarget):
+            rpc_port = trex.host_rpc_port(self.state.id)
+            preflight = trex.host_preflight_command(
+                target, self.state.plan, rpc_port, trex_config.processes
+            )
+            try:
+                out = self.command(target, preflight, timeout=180)
+            except RuntimeError as error:
+                raise PreparationError(str(error)) from None
+            details = json.loads(out)
+            sockets, version = details["sockets"], details["version"]
+            table = trex.rpc_table(self.state.id)
+            tables = self.command(target, "nft list tables").splitlines()
+            if f"table inet {table}" in tables:
+                raise PreparationError(f"{target.name}: run RPC table already exists")
+            run_state.record(
+                self.state.id, "rpc-guard", table, "intent", where=target.machine
+            )
+            self.command(
+                target, trex.rpc_guard_command(table, rpc_port, trex_config.processes)
+            )
+            run_state.record(
+                self.state.id, "rpc-guard", table, "created", where=target.machine
+            )
+            run_state.record(self.state.id, "dir", root, "intent", where=target.machine)
+            # Claim a fresh directory, never overwrite a previous run's files.
+            self.command(target, f"mkdir -m 0700 {shlex.quote(root)}")
+            run_state.record(
+                self.state.id, "dir", root, "created", where=target.machine
+            )
+        else:
+            install = trex.install_command()
+            run_state.event(
+                self.state.id, "command", where=target.name, command=install
+            )
+            try:
+                version = self.command(target, install, timeout=900).strip()
+            except RuntimeError as error:
+                raise PreparationError(
+                    f"installing the {TREX_SNAP} snap in {target.name} failed: {error}"
+                ) from None
+        self.tool(
+            target.name,
+            "trex",
+            version.splitlines()[-1] if version else "",
+            host=isinstance(target, HostTarget),
+        )
+        self.command(
+            target,
+            f"mkdir -p {root} && "
+            f"printf %s {shlex.quote(trex.flood_script())} > {root}/flood.py",
         )
         for index in range(trex_config.processes):
-            directory = f"{self.trex_dir}/process-{index}"
-            text = trex.config(
-                self.links[target.name], target.mac or "", index, f"cs-{self.short}"
+            directory = f"{root}/process-{index}"
+            text = (
+                trex.host_config(
+                    target,
+                    self.state.plan.mtu or 1500,
+                    rpc_port,
+                    f"cs-{self.state.id}",
+                    index,
+                    sockets[index],
+                )
+                if isinstance(target, HostTarget)
+                else trex.config(
+                    self.links[target.name], target.mac or "", index, f"cs-{self.short}"
+                )
             )
             run_state.event(
                 self.state.id,
@@ -315,21 +413,60 @@ class Run:
                 path=f"{directory}/trex_cfg.yaml",
                 text=text,
             )
-            guest.run(
+            self.command(
+                target,
                 f"mkdir -p {directory} && printf %s {shlex.quote(text)} "
-                f"> {directory}/trex_cfg.yaml"
+                f"> {directory}/trex_cfg.yaml",
             )
-            self.start_guest_unit(
-                guest,
+            self.start_workload(
+                target,
                 "trex" if index == 0 else f"trex-{index}",
                 self.state.schedule.max_elapsed_s,
-                trex.server_command(directory),
+                trex.server_command(
+                    directory,
+                    target.backend if isinstance(target, HostTarget) else "af_packet",
+                ),
                 # Fetch the whole tree once, including the aggregate controller output.
-                evidence=self.trex_dir if index == 0 else None,
+                evidence=root if index == 0 else None,
             )
 
-            def ready(index: int = index) -> bool:
-                return bool(guest.run(trex.server_ready_command(index)).strip())
+            def ready(index: int = index, directory: str = directory) -> bool:
+                if isinstance(target, HostTarget):
+                    listening = self.command(
+                        target, f"ss -Hltnp 'sport = :{rpc_port + 2 * index}'"
+                    ).strip()
+                    if listening:
+                        pids = set(re.findall(r"pid=(\d+)", listening))
+                        if not pids:
+                            raise PreparationError(
+                                "cannot identify the host TRex RPC owner"
+                            )
+                        for pid in pids:
+                            argv = self.command(
+                                target, f"cat /proc/{pid}/cmdline"
+                            ).split("\0")
+                            if f"{directory}/trex_cfg.yaml" not in argv:
+                                raise PreparationError(
+                                    "host TRex RPC port belongs to another process"
+                                )
+                        return True
+                elif self.command(
+                    target, trex.server_ready_command(index, rpc_port)
+                ).strip():
+                    return True
+                name = "trex" if index == 0 else f"trex-{index}"
+                rc_dir = root if isinstance(target, HostTarget) else self.guest_dir
+                code = self.command(
+                    target, f"cat {rc_dir}/{name}.rc 2>/dev/null || true"
+                ).strip()
+                if code:
+                    log = self.command(
+                        target, f"tail -c 2000 {directory}/trex.log"
+                    ).strip()
+                    raise PreparationError(
+                        f"{target.name}: TRex exited {code}: {log[-300:]}"
+                    )
+                return False
 
             self.wait_for(
                 ready,
@@ -341,7 +478,11 @@ class Run:
         """Count benchmark packets from each assigned sender in a receiver."""
         trex_config = self.state.config.workloads.trex
         assert trex_config
-        by_name = {t.name: t for t in self.state.targets}
+        sources: list[Target | HostTarget] = [
+            *self.state.targets,
+            *self.state.host_senders,
+        ]
+        by_name = {t.name: t for t in sources}
         senders = {
             c.sender: by_name[c.sender].address or ""
             for c in self.state.plan.connections
@@ -357,7 +498,11 @@ class Run:
         self.guests[target.name].run(command)
 
     def flood(
-        self, target: Target, name: str, steps: list[tuple[int, float]], end: float
+        self,
+        target: Target | HostTarget,
+        name: str,
+        steps: list[tuple[int, float]],
+        end: float,
     ) -> None:
         """Start a scheduled flood from one sender to its receivers."""
         trex_config = self.state.config.workloads.trex
@@ -373,18 +518,20 @@ class Run:
             if c.sender == target.name
         ]
         command = trex.flood_command(
-            self.trex_dir,
+            self.sender_dir(target),
             trex_config,
             {"address": target.address or "", "mac": target.mac or ""},
             peers,
             steps,
             end,
             name,
+            vlan=self.state.plan.vlan if isinstance(target, HostTarget) else None,
+            rpc_port=trex.host_rpc_port(self.state.id)
+            if isinstance(target, HostTarget)
+            else TREX_RPC_PORT,
         )
         lifetime = int(end - time.time()) + 120
-        self.start_guest_unit(
-            self.guests[target.name], name, lifetime, command, evidence=None
-        )
+        self.start_workload(target, name, lifetime, command, evidence=None)
 
     def counters(self, target: Target) -> dict[str, int]:
         """A receiver's current packet count from each sender."""
@@ -403,11 +550,11 @@ class Run:
         start = time.time() + 30
         end = start + RECEIPT_S
         self.each(
-            self.targets("sender"),
+            self.senders(),
             lambda t: self.flood(t, "receipt", [(RECEIPT_PPS, start)], end),
         )
         self.wait(end + 5 - time.time())
-        self.each(self.targets("sender"), lambda t: self.wait_guest_unit(t, "receipt"))
+        self.each(self.senders(), lambda t: self.wait_workload(t, "receipt"))
         received: dict[str, dict[str, int]] = {}
 
         def read(target: Target) -> None:
@@ -456,7 +603,7 @@ class Run:
             self.note(f"prefilling the data volumes, {len(pending)} running")
 
         def verify(target: Target) -> None:
-            self.wait_guest_unit(target, "prefill")
+            self.wait_workload(target, "prefill")
             text = self.guests[target.name].run(
                 f"cat {self.guest_dir}/prefill/prefill.json 2>/dev/null || true"
             )
@@ -481,7 +628,7 @@ class Run:
             measured_start=start,
             measured_end=end,
         )
-        units: list[tuple[Target, str]] = []
+        units: list[tuple[Target | HostTarget, str]] = []
         trex_config, fio_config = config.workloads.trex, config.workloads.fio
         if trex_config:
             pps = [p.pps_per_sender for p in trex_config.profiles]
@@ -489,10 +636,10 @@ class Run:
                 (pps[w.profile], start + w.start_s) for w in schedule.trex[1:]
             ]
             self.each(
-                self.targets("sender"),
+                self.senders(),
                 lambda t: self.flood(t, "flood", steps, end),
             )
-            units += [(t, "flood") for t in self.targets("sender")]
+            units += [(t, "flood") for t in self.senders()]
         if fio_config:
             first = fio_config.profiles[0]
 
@@ -534,10 +681,10 @@ class Run:
             self.note(f"measuring, {int(end - time.time())}s left")
             self.wait(min(MONITOR_S, end - time.time()))
             if time.time() < end - 5:
-                self.check_running(units)
+                self.check_running(units, deadline=end)
             self.check_receivers()
         self.note("waiting for the workloads to finish")
-        self.each(units, lambda unit: self.wait_guest_unit(*unit))
+        self.each(units, lambda unit: self.wait_workload(*unit))
         settle = max(DRAIN_S, *SAMPLE_INTERVAL_S.values())
         self.wait(max(end + settle - time.time(), 0))
         self.check_receivers()
@@ -549,22 +696,39 @@ class Run:
             self.check_running([(t, "sampler") for t in receivers])
             self.each(receivers, self.check_counters)
 
-    def running(self, units: list[tuple[Target, str]]) -> set[tuple[str, str]]:
-        """The (VM, unit) pairs whose guest unit is still running."""
+    def running(
+        self, units: list[tuple[Target | HostTarget, str]]
+    ) -> set[tuple[str, str]]:
+        """The (target, unit) pairs whose unit is still running."""
         found: set[tuple[str, str]] = set()
 
-        def check(unit: tuple[Target, str]) -> None:
+        def check(unit: tuple[Target | HostTarget, str]) -> None:
             target, name = unit
-            guest = self.guests[target.name]
-            if guest.unit_active(f"cloud-stress-{self.short}-{name}"):
+            unit_name = f"cloud-stress-{self.short}-{name}"
+            if isinstance(target, HostTarget):
+                out = self.command(
+                    target, f"systemctl is-active {unit_name}.service || true"
+                )
+                active = out.strip() in ("active", "activating", "deactivating")
+            else:
+                active = self.guests[target.name].unit_active(unit_name)
+            if active:
                 found.add((target.name, name))
 
         self.each(units, check)
         return found
 
-    def check_running(self, units: list[tuple[Target, str]]) -> None:
-        """Fail the run as soon as a required workload unit has stopped."""
+    def check_running(
+        self,
+        units: list[tuple[Target | HostTarget, str]],
+        *,
+        deadline: float | None = None,
+    ) -> None:
+        """Fail for stopped units unless their scheduled deadline has passed."""
         running = self.running(units)
+        # Remote status queries may finish after the workload's scheduled end.
+        if deadline is not None and time.time() >= deadline:
+            return
         stopped = [f"{n} in {t.name}" for t, n in units if (t.name, n) not in running]
         if stopped:
             raise RuntimeError(
@@ -636,13 +800,52 @@ class Run:
         )
         run_state.record(self.state.id, "guest-unit", unit, "created", **record)
 
-    def wait_guest_unit(self, target: Target, name: str, timeout: int = 120) -> None:
-        """Wait for a guest unit to finish and require a zero exit code."""
-        guest, unit = self.guests[target.name], f"cloud-stress-{self.short}-{name}"
-        self.wait_for(
-            lambda: not guest.unit_active(unit), timeout, f"{name} in {target.name}"
+    def start_workload(
+        self,
+        target: Target | HostTarget,
+        name: str,
+        lifetime: int,
+        command: str,
+        evidence: str | None,
+    ) -> None:
+        """Start a sender workload, with its directory evidence and exit status."""
+        if isinstance(target, Target):
+            self.start_guest_unit(
+                self.guests[target.name], name, lifetime, command, evidence
+            )
+            return
+        unit = f"cloud-stress-{self.short}-{name}"
+        record = {"id": evidence, "where": target.name}
+        run_state.record(self.state.id, "host-workload", unit, "intent", **record)
+        run_state.event(
+            self.state.id, "command", unit=unit, where=target.name, command=command
         )
-        code = guest.exit_code(f"{self.guest_dir}/{name}.rc")
+        remote.start_unit(
+            self.juju,
+            target.machine,
+            unit,
+            lifetime,
+            command,
+            rc_path=f"{self.sender_dir(target)}/{name}.rc",
+        )
+        run_state.record(self.state.id, "host-workload", unit, "created", **record)
+
+    def wait_workload(
+        self, target: Target | HostTarget, name: str, timeout: int = 120
+    ) -> None:
+        """Wait for a workload to finish and require a recorded zero exit code."""
+        self.wait_for(
+            lambda: (target.name, name) not in self.running([(target, name)]),
+            timeout,
+            f"{name} in {target.name}",
+        )
+        if isinstance(target, HostTarget):
+            out = self.command(
+                target, f"cat {self.sender_dir(target)}/{name}.rc 2>/dev/null || true"
+            ).strip()
+            code = int(out) if out else None
+        else:
+            code = self.guests[target.name].exit_code(f"{self.guest_dir}/{name}.rc")
         if code != 0:
             raise RuntimeError(f"{name} in {target.name} exited with {code}")
 

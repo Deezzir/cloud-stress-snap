@@ -197,6 +197,7 @@ def _window(item: Row) -> str:
 
 def _network(result: Row) -> str:
     network = _dict(result.get("network"))
+    unit = "participant" if network.get("mode") == "host-to-vm" else "VM"
     rows: list[list[object]] = []
     for item in _list(network.get("profiles")):
         for side in ("tx", "rx"):
@@ -218,12 +219,13 @@ def _network(result: Row) -> str:
         + f"{_e(network.get('senders'))} senders / "
         f"{_e(network.get('receivers'))} receivers</p>"
         + _table(
-            "Per-VM packet rates",
-            ["Profile", "Window", "Target pps/sender", "Direction", "VMs", "PPS"],
+            f"Per-{unit} packet rates",
+            ["Profile", "Window", "Target pps/sender", "Direction", f"{unit}s", "PPS"],
             rows,
         )
-        + '<p class="note">PPS: minimum / median / maximum per VM. '
-        "VMs: reporting / expected. TX counts TRex frame bytes; RX counts IP bytes, "
+        + f'<p class="note">PPS: minimum / median / maximum per {unit}. '
+        f"{unit}s: reporting / expected. TX counts TRex frame bytes; "
+        "RX counts IP bytes, "
         "so their byte rates are not directly comparable.</p>"
     )
 
@@ -350,7 +352,10 @@ def render_html(run_id: str) -> str | None:
             "Planned measurement",
             format_duration(duration) if isinstance(duration, int) else None,
         ),
-        ("Participants", len(_list(fleet.get("vms")))),
+        (
+            "Participants",
+            len(_list(fleet.get("vms"))) + len(_list(fleet.get("host_senders"))),
+        ),
         ("Scheduled start", when),
     ]
     fact_html = "".join(
@@ -379,6 +384,40 @@ def render_html(run_id: str) -> str | None:
         )
     )
     sections.append(("placement", "VM placement", _placement(fleet)))
+    if sources := _list(fleet.get("host_senders")):
+        sections.append(
+            (
+                "host-sources",
+                "Host sources",
+                _table(
+                    "Host source identities",
+                    [
+                        "Source",
+                        "Host",
+                        "Backend",
+                        "Interface",
+                        "Source IP",
+                        "Source MAC",
+                    ],
+                    [
+                        [
+                            s.get(k)
+                            for k in (
+                                "name",
+                                "host",
+                                "backend",
+                                "interface",
+                                "address",
+                                "mac",
+                            )
+                        ]
+                        for s in sources
+                    ],
+                    caption=False,
+                    wrap=True,
+                ),
+            )
+        )
     notices = ""
     if errors:
         notices += (

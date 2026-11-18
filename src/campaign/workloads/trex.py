@@ -1,11 +1,15 @@
-"""TRex in sender guests: the trex-generator snap, its server and a scheduled flood."""
+"""TRex sender configuration, preflight and scheduled traffic."""
 
 import json
 import shlex
 from importlib import resources
 
+import yaml
+
 from campaign.model.profiles import TrexConfig
+from campaign.model.target import HostTarget
 from constants import TREX_CHANNEL, TREX_PLUGS, TREX_RPC_PORT, TREX_SNAP
+from probe.models import RunPlan
 
 FILES = resources.files("campaign.workloads") / "files"
 
@@ -44,17 +48,96 @@ def config(link: str, mac: str, index: int = 0, prefix: str = "cloudstress") -> 
     )
 
 
-def server_command(directory: str) -> str:
+def host_config(
+    sender: HostTarget,
+    mtu: int,
+    rpc_port: int,
+    prefix: str,
+    index: int = 0,
+    socket: int = 0,
+) -> str:
+    """A host server on explicit CPUs, with isolated RPC and DPDK identities."""
+    master, rx, traffic = sender.cpus[3 * index : 3 * index + 3]
+    mac = [int(octet, 16) for octet in sender.mac.split(":")]
+    item: dict[str, object] = {
+        "version": 2,
+        "interfaces": [sender.interface, "dummy"],
+        "prefix": f"{prefix}-{index}",
+        "zmq_pub_port": rpc_port - 1 + 2 * index,
+        "zmq_rpc_port": rpc_port + 2 * index,
+        "port_info": [
+            {"src_mac": mac, "dest_mac": mac.copy()},
+            {"src_mac": [0, 0, 0, 0, 0, 1], "dest_mac": [0, 0, 0, 0, 0, 2]},
+        ],
+        "platform": {
+            "master_thread_id": master,
+            "latency_thread_id": rx,
+            "dual_if": [{"socket": socket, "threads": [traffic]}],
+        },
+    }
+    if sender.backend == "dpdk":
+        item.update(
+            low_end=True,
+            limit_memory=512,
+            port_mtu=min(mtu, 1500),
+            ext_dpdk_opt=["--huge-dir", "/dev/hugepages", "--huge-unlink=always"],
+        )
+    return str(yaml.safe_dump([item], sort_keys=False))
+
+
+def host_rpc_port(run_id: str) -> int:
+    """Run-specific TCP range, checked for collisions before use."""
+    return 20001 + 128 * (int(run_id.replace("-", "")[:8], 16) % 300)
+
+
+def host_preflight_command(
+    sender: HostTarget,
+    plan: RunPlan,
+    rpc_port: int,
+    processes: int,
+) -> str:
+    """Read-only checks of operator preparation; never bind devices or take ports."""
+    args = {
+        **sender.model_dump(),
+        "mtu": plan.mtu,
+        "physnet": plan.physical_network,
+        "rpc_port": rpc_port,
+        "processes": processes,
+    }
+    script = (FILES / "host_preflight.py").read_text()
+    return f"python3 -c {shlex.quote(script)} {shlex.quote(json.dumps(args))}"
+
+
+def rpc_table(run_id: str) -> str:
+    """Exact run-owned nftables table protecting host TRex control ports."""
+    return f"cloud_stress_{run_id.replace('-', '')}_rpc"
+
+
+def rpc_guard_command(table: str, rpc_port: int, processes: int) -> str:
+    """Drop non-loopback access to TRex's otherwise unauthenticated TCP servers."""
+    ports = ", ".join(str(p) for p in range(rpc_port - 1, rpc_port + 2 * processes - 1))
+    rules = (
+        f"table inet {table} {{\n"
+        " chain input {\n  type filter hook input priority -300; policy accept;\n"
+        f'  iifname != "lo" tcp dport {{ {ports} }} drop\n'
+        " }\n}\n"
+    )
+    return f"printf %s {shlex.quote(rules)} | nft -f -"
+
+
+def server_command(directory: str, backend: str = "af_packet") -> str:
     """Command for the TRex server with one traffic core."""
+    app = "native" if backend == "dpdk" else "t-rex-64"
     return (
-        f"exec /snap/bin/{TREX_SNAP}.t-rex-64 -i -c 1 --no-scapy-server "
-        f"--no-ofed-check --cfg {directory}/trex_cfg.yaml >> {directory}/trex.log 2>&1"
+        f"exec /snap/bin/{TREX_SNAP}.{app} -i -c 1 --no-scapy-server "
+        f"--no-ofed-check --cfg {shlex.quote(directory + '/trex_cfg.yaml')} "
+        f">> {shlex.quote(directory + '/trex.log')} 2>&1"
     )
 
 
-def server_ready_command(index: int = 0) -> str:
+def server_ready_command(index: int = 0, rpc_port: int = TREX_RPC_PORT) -> str:
     """Prints a line once the TRex server accepts RPC connections."""
-    return f"ss -Hltn 'sport = :{TREX_RPC_PORT + 2 * index}'"
+    return f"ss -Hltn 'sport = :{rpc_port + 2 * index}'"
 
 
 def flood_command(
@@ -65,6 +148,9 @@ def flood_command(
     steps: list[tuple[int, float]],
     end: float,
     name: str,
+    *,
+    vlan: int | None = None,
+    rpc_port: int = TREX_RPC_PORT,
 ) -> str:
     """Flood from the sender to its peers, changing rate at each step's start time.
 
@@ -82,11 +168,13 @@ def flood_command(
         "end": end,
         "out": f"{directory}/{name}.jsonl",
         "processes": trex.processes,
-        "rpc_port": TREX_RPC_PORT,
+        "rpc_port": rpc_port,
+        "vlan": vlan,
     }
     return (
-        f"/snap/bin/{TREX_SNAP}.python {directory}/flood.py "
-        f"{shlex.quote(json.dumps(args))} >> {directory}/trex.log 2>&1"
+        f"/snap/bin/{TREX_SNAP}.python {shlex.quote(directory + '/flood.py')} "
+        f"{shlex.quote(json.dumps(args))} "
+        f">> {shlex.quote(directory + '/trex.log')} 2>&1"
     )
 
 

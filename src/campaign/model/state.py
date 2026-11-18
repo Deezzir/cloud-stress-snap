@@ -20,7 +20,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from campaign.model.profiles import RunConfig, Schedule
-from campaign.model.target import Target
+from campaign.model.target import HostTarget, Target
 from probe.models import RunPlan
 
 STATE_ROOT = Path(os.environ.get("SNAP_COMMON", ".scratch/state"))
@@ -48,6 +48,7 @@ class RunState(BaseModel):
     plan: RunPlan
     schedule: Schedule
     targets: list[Target] = Field(default_factory=list)
+    host_senders: list[HostTarget] = Field(default_factory=list)
     owner_uid: int
     phase: Phase = "accepted"
     detail: str | None = None

@@ -82,7 +82,10 @@ def print_resources(plan: RunPlan, full: bool = True) -> None:
 def print_fleet(plan: RunPlan, full: bool = True) -> None:
     """Print the fleet's hosts, VM counts and network roles."""
     if not full:
-        rows = [["VMs", f"{len(plan.vms)} on {len(plan.hosts)} hosts"]]
+        vm_hosts = sum(host.vms > 0 for host in plan.hosts)
+        rows = [["VMs", f"{len(plan.vms)} on {vm_hosts} hosts"]]
+        if plan.host_senders:
+            rows.append(["Host sources", str(len(plan.host_senders))])
         if plan.focus:
             rows.append(["Focus", plan.focus])
         if plan.connections:
@@ -101,6 +104,17 @@ def print_fleet(plan: RunPlan, full: bool = True) -> None:
             [name, host.architecture, str(host.vms), ", ".join(roles), host.link or "-"]
         )
     print_table(rows)
+    if plan.host_senders:
+        click.echo("\nHost sources:")
+        print_table(
+            [
+                ["SOURCE", "HOST", "BACKEND", "INTERFACE", "CPUS"],
+                *[
+                    [s.name, s.host, s.backend, s.interface, ",".join(map(str, s.cpus))]
+                    for s in plan.host_senders
+                ],
+            ]
+        )
     if plan.connections:
         senders = {c.sender for c in plan.connections}
         receivers = {c.receiver for c in plan.connections}

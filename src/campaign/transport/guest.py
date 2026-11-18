@@ -112,9 +112,11 @@ class Guest:
         snapd moves a snap app into its own cgroup scope, so `timeout` bounds the
         command too and forwards the unit's stop signal to it.
         """
+        # Bash defers TERM until the foreground timeout finishes stopping its child.
+        record = f"echo $? > {shlex.quote(rc_path)}"
         script = (
-            f"timeout --kill-after=10 {max_s} bash -c {shlex.quote(command)}; "
-            f"echo $? > {shlex.quote(rc_path)}"
+            f"trap {shlex.quote(record)} EXIT; trap 'exit 143' TERM; "
+            f"timeout --kill-after=10 {max_s} bash -c {shlex.quote(command)}"
         )
         script = script.replace("$", "$$")
         self.run(

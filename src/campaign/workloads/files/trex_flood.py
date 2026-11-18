@@ -1,4 +1,4 @@
-"""Scheduled TRex UDP flood from a sender guest, run with the trex-generator snap's Python.
+"""Scheduled TRex UDP flood, run with the trex-generator snap's Python.
 
 Each receiver gets one stream; streams have equal weight, so the requested rate
 is the sender's total, shared among its receivers. Statistics are written once
@@ -13,7 +13,7 @@ from pathlib import Path
 from trex.stl.api import *
 
 args = json.loads(sys.argv[1])
-signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
 
 
 def streams_for(index, count):
@@ -22,10 +22,15 @@ def streams_for(index, count):
     low = first + width * index // count
     high = first + width * (index + 1) // count - 1
     l3 = IPv6 if args["ipv6"] else IP
-    header = len(Ether() / l3() / UDP())
+    ethernet = Ether(src=args["src_mac"])
+    if args.get("vlan") is not None:
+        ethernet /= Dot1Q(vlan=args["vlan"])
+    header = len(ethernet / l3() / UDP())
     streams = []
     for peer in args["peers"]:
-        packet = Ether(src=args["src_mac"], dst=peer["mac"]) / l3(
+        layer2 = ethernet.copy()
+        layer2[Ether].dst = peer["mac"]
+        packet = layer2 / l3(
             src=args["src"], dst=peer["dst"]) / UDP(sport=low, dport=args["dport"]) / Raw(
             load=b"\xff\xff" + b"\x00" * (args["payload"] - 2))
         # The source port and first payload word change in opposite directions,

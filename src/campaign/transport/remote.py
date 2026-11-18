@@ -2,6 +2,7 @@
 
 import base64
 import gzip
+import re
 import shlex
 
 import jubilant
@@ -44,21 +45,31 @@ def fetch(juju: jubilant.Juju, where: str, path: str) -> str | None:
 
 
 def start_unit(
-    juju: jubilant.Juju, where: str, unit: str, max_runtime_s: int, command: str
+    juju: jubilant.Juju,
+    where: str,
+    unit: str,
+    max_runtime_s: int,
+    command: str,
+    rc_path: str | None = None,
 ) -> None:
     """Start a transient systemd unit that stops itself after max_runtime_s.
 
     snapd moves a snap app into its own cgroup scope, out of the unit's reach, so
     `timeout` bounds the command too and forwards the unit's stop signal to it.
     """
-    command = command.replace("$", "$$")
+    script = f"timeout --kill-after=10 {max_runtime_s} bash -c {shlex.quote(command)}"
+    if rc_path:
+        # Bash defers TERM until the foreground timeout finishes stopping its child.
+        record = f"echo $? > {shlex.quote(rc_path)}"
+        script = f"trap {shlex.quote(record)} EXIT; trap 'exit 143' TERM; {script}"
+    script = script.replace("$", "$$")
     sh(
         juju,
         where,
-        f"systemd-run --unit {unit} --collect "
-        f"--property RuntimeMaxSec={max_runtime_s} "
+        f"systemd-run --unit {shlex.quote(unit)} --collect "
+        f"--property RuntimeMaxSec={max_runtime_s + 30} "
         f"--property KillMode=control-group "
-        f"timeout --kill-after=10 {max_runtime_s} bash -c {shlex.quote(command)}",
+        f"bash -c {shlex.quote(script)}",
     )
 
 
@@ -81,7 +92,14 @@ sleep 1
 """
 
 
-def stop_unit(juju: jubilant.Juju, where: str, unit: str, run_dir: str | None) -> None:
+def stop_unit(
+    juju: jubilant.Juju,
+    where: str,
+    unit: str,
+    run_dir: str | None,
+    *,
+    process_path: str | None = None,
+) -> None:
     """Stop a run-owned transient unit and confirm it is gone or inactive.
 
     With run_dir, also stop any process that escaped the unit and still names
@@ -89,17 +107,39 @@ def stop_unit(juju: jubilant.Juju, where: str, unit: str, run_dir: str | None) -
     """
     script = STOP.format(unit=unit)
     if run_dir:
-        pattern = shlex.quote(f"[{run_dir[0]}]{run_dir[1:]}/")
+        pattern = shlex.quote(f"[{run_dir[0]}]{re.escape(run_dir[1:])}/")
+        script += REAP.format(pattern=pattern)
+    if process_path:
+        if not re.fullmatch(
+            r"/var/snap/trex-generator/common/cloud-stress-[0-9a-f-]+/"
+            r"(?:flood\.py|process-\d+/trex_cfg\.yaml)",
+            process_path,
+        ):
+            raise ValueError(f"refusing to reap processes for {process_path}")
+        pattern = shlex.quote(f"[/]{re.escape(process_path[1:])}( |$)")
         script += REAP.format(pattern=pattern)
     sh(juju, where, script)
 
 
 def remove_dir(juju: jubilant.Juju, where: str, path: str) -> None:
-    """Remove a run-owned directory under /var/lib/cloud-stress."""
-    if not path.startswith("/var/lib/cloud-stress/"):
+    """Remove only an exact run-owned directory."""
+    run_id = r"(?:[0-9a-f]{8}|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})"
+    if not re.fullmatch(
+        rf"(?:/var/lib/cloud-stress/|/var/snap/trex-generator/common/cloud-stress-){run_id}",
+        path,
+    ):
         raise ValueError(f"refusing to remove {path}")
     quoted = shlex.quote(path)
     sh(juju, where, f"rm -rf {quoted} && test ! -e {quoted}")
+
+
+def remove_rpc_guard(juju: jubilant.Juju, where: str, table: str) -> None:
+    """Delete the exact run-owned RPC table, or accept its confirmed absence."""
+    if not re.fullmatch(r"cloud_stress_[0-9a-f]{32}_rpc", table):
+        raise ValueError(f"refusing to remove nftables table {table}")
+    tables = sh(juju, where, "nft list tables").splitlines()
+    if f"table inet {table}" in tables:
+        sh(juju, where, f"nft delete table inet {table}")
 
 
 def remove_snap(juju: jubilant.Juju, where: str, name: str) -> None:

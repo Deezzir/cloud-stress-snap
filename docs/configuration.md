@@ -1,7 +1,7 @@
 # Configuration reference
 
 A run is described by one YAML file. The example
-[`config.yaml`](../config.yaml) lists every setting with its default; the snap
+[`config.yaml`](../config.yaml) supplies the default VM configuration; the snap
 ships a read-only copy at
 `/snap/cloud-stress/current/share/cloud-stress/config.yaml`.
 
@@ -24,7 +24,8 @@ are errors.
 | `workloads` | yes | Enabled workloads; at least one of `trex` and `fio`. |
 
 Enable a workload by including its section, even empty (`fio: {}`). Omit a
-section to disable it. Both sections together run concurrently on the same VMs.
+section to disable it. Enabled workloads run concurrently; fio uses the placed
+VMs, while TRex roles depend on its mode.
 
 ## Defaults and profile lists
 
@@ -46,7 +47,7 @@ Use exactly one of `vms` and `hosts`. Counts are positive integers.
 Architecture names are normalized: `x86_64` is `amd64`, `aarch64` is `arm64`,
 `ppc64le` is `ppc64el`. A hypervisor whose architecture is unknown is never
 used. With `[]`, other requirements still apply: a guest image for the host's
-architecture must exist, and TRex needs amd64.
+architecture must exist, and TRex senders need amd64.
 
 `exclude_hosts` applies to both automatic and exact placement. Explicitly
 requesting an excluded host in `hosts` or `trex.focus_host` is an error.
@@ -71,13 +72,15 @@ without an architecture property is treated as amd64.
   round-robin over the other eligible hypervisors, within their capacity.
 - With `trex` in `many-to-many`, VMs are spread round-robin over the eligible
   hypervisors, within each hypervisor's capacity.
-- `trex` needs at least two VMs on at least two eligible hypervisors.
+- VM sender modes need at least two VMs on at least two eligible hypervisors.
+- With `host-to-vm`, receiver VMs are spread across eligible hypervisors with
+  a source on another host. Host sources are selected separately.
 
 ### Exact placement (`hosts`)
 
 The counts are used as given; `trex.focus_percent` is ignored. A named hypervisor
-that does not exist or is not eligible is an error. With `trex`, at least two
-hypervisors must be listed.
+that does not exist or is not eligible is an error. With TRex VM sender modes,
+at least two hypervisors must be listed.
 
 Capacity is what Placement reports as left on each hypervisor for the flavor,
 after reserved amounts, allocation ratios and current usage. When Placement
@@ -88,10 +91,11 @@ hypervisor of every VM after creation and fails if Nova placed a VM elsewhere.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `mode` | `fan-in` | `fan-in`, `fan-out` or `many-to-many`. |
-| `focus_host` | chosen | Hypervisor the traffic fans in to or out of; rejected with `many-to-many`. |
-| `focus_percent` | `50` | Integer percentage, 1-99, of `placement.vms` on the focus host: receivers in `fan-in`, senders in `fan-out`. Ignored with `placement.hosts` or `many-to-many`. |
+| `mode` | `fan-in` | `fan-in`, `fan-out`, `many-to-many` or `host-to-vm`. |
+| `focus_host` | chosen | Hypervisor the traffic fans in to or out of; rejected with `many-to-many` or `host-to-vm`. |
+| `focus_percent` | `50` | Integer percentage, 1-99, of `placement.vms` on the focus host: receivers in `fan-in`, senders in `fan-out`. Ignored with `placement.hosts` or `many-to-many`; rejected with `host-to-vm`. |
 | `processes` | `1` | Independent single-core TRex servers per sender, integer 1-64. |
+| `host_senders` | `{}` | Required only for `host-to-vm`: discovered host names mapped to `backend`, `interface` and `cpus`. |
 | `udp_payload_bytes` | `18` | UDP payload size, 2-1400 bytes. |
 | `udp_dst_port` | `33434` | UDP destination port. |
 | `udp_src_ports` | `[1024, 65535]` | Range of UDP source ports. |
@@ -102,6 +106,7 @@ hypervisor of every VM after creation and fails if Nova placed a VM elsewhere.
 | `fan-in` | VMs on other hypervisors | VMs on the focus host |
 | `fan-out` | VMs on the focus host | VMs on other hypervisors |
 | `many-to-many` | Every VM | Every other VM, including VMs on the same host |
+| `host-to-vm` | Explicit physical hosts | Every placed VM on other hypervisors |
 
 In `fan-in` and `fan-out`, without `focus_host`, the focus host is the eligible
 hypervisor with the healthiest provider link, then the first by name. With
@@ -119,12 +124,56 @@ million PPS per VM. Processes share the data interface, with separate CPU
 triples, RPC/publisher ports, runtime prefixes and source-port ranges.
 `udp_src_ports` must contain at least one port per process.
 
-TRex hypervisors must be amd64 and carry the provider network. The guest flavor
-needs at least 3 vCPUs and 4 GiB RAM per process, plus 20 GB disk; the smallest
+VM sender modes require amd64 hypervisors carrying the provider network. The guest
+flavor needs at least 3 vCPUs and 4 GiB RAM per process, plus 20 GB disk; the smallest
 flavor that fits is chosen. This shared flavor applies to receivers too.
 For example, two processes require at least 6 vCPUs and 8 GiB RAM.
 TRex packets, IP and UDP headers included, must fit the MTU of the
 provider network and of the guest interface.
+
+### Direct host sources
+
+`host-to-vm` makes every placed VM a receiver. Each selected host sends equally
+to **all** receiver VMs on other hypervisors; local receivers are excluded because
+physical traffic cannot rely on switch hairpin. Every source and receiver must
+have a connection. `pps_per_sender` remains the total across processes and peers.
+
+`host_senders` keys are discovered short or full hypervisor names. Values require:
+
+| Key | Meaning |
+| --- | --- |
+| `backend` | `af_packet` or `dpdk`. |
+| `interface` | AF_PACKET: the discovered physical/bond provider link, not a VLAN subinterface. DPDK: full PCI BDF of a dedicated operator-prepared NIC/VF. |
+| `cpus` | Distinct nonnegative CPU IDs, exactly three per process: master, receive, traffic. |
+
+Focus defaults do not apply in this mode; remove `focus_host` and `focus_percent`
+from a copied default configuration. DPDK requires `processes: 1`; AF_PACKET supports
+multiple processes. `placement.exclude_hosts` excludes sources too.
+Receiver VMs need at least 2 vCPUs, 4 GiB RAM and 20 GB disk regardless of source
+process count. Source-only hosts use no VM capacity or guest image. Sources need
+amd64. The network must have a discovered VLAN ID in 1–4094 and a valid known MTU.
+
+```yaml
+duration: 2m
+placement:
+  hosts:
+    node-b: 2
+workloads:
+  trex:
+    mode: host-to-vm
+    host_senders:
+      node-a:
+        backend: af_packet
+        interface: bond0
+        cpus: [4, 5, 6]
+    profiles:
+      - pps_per_sender: 100000
+```
+
+For native DPDK, use `backend: dpdk` and a PCI BDF such as
+`interface: "0000:41:00.1"`. See [host preparation](campaigns.md#host-preparation).
+Source MAC/IP identities are reserved from the data network, separate from host
+management addresses.
 
 ## `workloads.fio`
 

@@ -3,7 +3,7 @@
 import re
 from importlib import resources
 from pathlib import Path
-from typing import Literal, Self
+from typing import Annotated, Literal, Self
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
@@ -54,12 +54,36 @@ class TrexProfile(Strict):
     pps_per_sender: int = Field(gt=0)
 
 
-class TrexConfig(Strict):
-    """Guest-to-guest UDP traffic: focus host to or from the others, or all to all."""
+class HostSenderConfig(Strict):
+    """Operator-selected host interface and exclusive CPU triples."""
 
-    mode: Literal["fan-in", "fan-out", "many-to-many"]
+    backend: Literal["af_packet", "dpdk"]
+    interface: str
+    cpus: list[Annotated[int, Field(ge=0, strict=True)]] = Field(min_length=3)
+
+    @model_validator(mode="after")
+    def _device(self) -> Self:
+        pattern = (
+            r"[A-Za-z0-9][A-Za-z0-9_.-]{0,14}"
+            if self.backend == "af_packet"
+            else r"[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[01][0-9a-fA-F]\.[0-7]"
+        )
+        if not re.fullmatch(pattern, self.interface):
+            raise ValueError("interface must be a kernel link name or full PCI BDF")
+        if self.backend == "dpdk":
+            self.interface = self.interface.lower()
+        if len(set(self.cpus)) != len(self.cpus):
+            raise ValueError("cpus must be distinct")
+        return self
+
+
+class TrexConfig(Strict):
+    """UDP traffic between guests or from explicit host senders."""
+
+    mode: Literal["fan-in", "fan-out", "many-to-many", "host-to-vm"]
     focus_host: str | None = None
-    focus_percent: int = Field(default=50, ge=1, le=99, strict=True)
+    focus_percent: int | None = Field(default=50, ge=1, le=99, strict=True)
+    host_senders: dict[str, HostSenderConfig] = Field(default_factory=dict)
     processes: int = Field(default=1, ge=1, le=64, strict=True)
     udp_payload_bytes: int = Field(ge=2, le=1400)
     udp_dst_port: int = Field(ge=1, le=65535)
@@ -75,6 +99,28 @@ class TrexConfig(Strict):
             raise ValueError("udp_src_ports must provide at least one port per process")
         if self.mode == "many-to-many" and self.focus_host is not None:
             raise ValueError("focus_host does not apply to many-to-many")
+        if self.mode == "host-to-vm":
+            if self.focus_host is not None or (
+                "focus_percent" in self.model_fields_set
+                and self.focus_percent is not None
+            ):
+                raise ValueError(
+                    "focus_host and focus_percent do not apply to host-to-vm"
+                )
+            self.focus_percent = None
+            if not self.host_senders:
+                raise ValueError("host-to-vm requires explicit host_senders")
+            for host, sender in self.host_senders.items():
+                if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", host):
+                    raise ValueError("host_senders keys must be discovered host names")
+                if len(sender.cpus) != 3 * self.processes:
+                    raise ValueError(f"{host}: cpus needs exactly 3 IDs per process")
+                if sender.backend == "dpdk" and self.processes != 1:
+                    raise ValueError("dpdk host senders require processes: 1")
+        elif self.host_senders:
+            raise ValueError("host_senders applies only to host-to-vm")
+        elif self.focus_percent is None:
+            raise ValueError("focus_percent must be an integer for VM sender modes")
         return self
 
 
@@ -214,7 +260,11 @@ def load_config(text: str) -> RunConfig:
     if isinstance(workloads, dict):
         for name, section in workloads.items():
             if name in defaults and (section is None or isinstance(section, dict)):
-                workloads[name] = {**defaults[name], **(section or {})}
+                base = dict(defaults[name])
+                if name == "trex" and (section or {}).get("mode") == "host-to-vm":
+                    base.pop("focus_percent", None)
+                    base.pop("focus_host", None)
+                workloads[name] = {**base, **(section or {})}
     try:
         return RunConfig.model_validate(data)
     except ValidationError as error:

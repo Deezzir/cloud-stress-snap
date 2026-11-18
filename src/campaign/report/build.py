@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import NamedTuple, cast
 
 from campaign.model.state import RunState, events, now, outstanding, run_dir
-from campaign.model.target import Target
+from campaign.model.target import HostTarget, Target
 from campaign.report import plots
 from campaign.workloads import collect, fio
 from constants import (
@@ -116,8 +116,8 @@ def _rate_inside(samples: Samples, a: float, b: float) -> Row | None:
     return {"rate": (c1 - c0) / (t1 - t0), "from": t0, "to": t1}
 
 
-def _spread(rates: dict[str, Row | None], start: float) -> Row:
-    """Per-VM rates in a window and their range; each over its own sample span."""
+def _spread(rates: dict[str, Row | None], start: float, key: str = "vms") -> Row:
+    """Per-participant rates and their range, each over its own sample span."""
     found = {vm: r for vm, r in rates.items() if r}
     values = sorted(float(str(r["rate"])) for r in found.values())
     return {
@@ -126,7 +126,7 @@ def _spread(rates: dict[str, Row | None], start: float) -> Row:
         "pps_min": round(values[0], 1) if values else None,
         "pps_median": round(values[len(values) // 2], 1) if values else None,
         "pps_max": round(values[-1], 1) if values else None,
-        "vms": {
+        key: {
             vm: {
                 "pps": round(float(str(r["rate"])), 1),
                 "from_s": round(float(str(r["from"])) - start, 3),
@@ -148,7 +148,10 @@ def _network(
     """TRex requested and transmitted traffic, and packets counted at receivers."""
     trex = state.config.workloads.trex
     assert trex
-    senders = [t for t in state.targets if t.role in ("sender", "peer")]
+    senders: list[Target | HostTarget] = [
+        *[t for t in state.targets if t.role in ("sender", "peer")],
+        *state.host_senders,
+    ]
     receivers = [t for t in state.targets if t.role in ("receiver", "peer")]
     connections = state.plan.connections
     sent: dict[str, Samples] = {}
@@ -211,6 +214,7 @@ def _network(
                 "tx": _spread(
                     {s.name: _rate_inside(sent[s.name], a, b) for s in senders},
                     start,
+                    "sources" if state.host_senders else "vms",
                 ),
                 "rx": _spread(
                     {r.name: _rate_inside(received[r.name], a, b) for r in receivers},
@@ -249,6 +253,7 @@ def _network(
         "processes_per_sender": trex.processes,
         "focus": state.plan.focus,
         "senders": len(senders),
+        "sender_kind": "host" if state.host_senders else "vm",
         "receivers": len(receivers),
         "connections": [c.model_dump() for c in connections],
         "receiver_load_first_profile_pps": loads,
@@ -605,6 +610,7 @@ def _fleet(state: RunState, targets: list[Target]) -> Row:
         "focus": plan.focus,
         "hosts": [h.model_dump() for h in plan.hosts],
         "vms": [t.model_dump() for t in targets],
+        "host_senders": [t.model_dump() for t in state.host_senders],
     }
 
 
@@ -623,7 +629,7 @@ def build(state: RunState) -> tuple[Row, dict[str, list[Row]]]:
         "config": state.config.model_dump(),
         "fleet": _fleet(state, state.targets),
         "tools": [
-            {k: e.get(k) for k in ("vm", "name", "version")}
+            {k: e.get(k) for k in ("vm", "source", "name", "version") if k in e}
             for e in evts
             if e.get("event") == "tool"
         ],

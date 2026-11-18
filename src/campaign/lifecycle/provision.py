@@ -1,6 +1,8 @@
 """Run-owned OpenStack resources, created after a journaled intent."""
 
 import base64
+import ipaddress
+import re
 import time
 from collections.abc import Callable
 from typing import Any
@@ -11,7 +13,7 @@ from openstack.connection import Connection
 
 from campaign.model import state as run_state
 from campaign.model.state import RunState
-from campaign.model.target import Target
+from campaign.model.target import HostTarget, Target
 from constants import BUILD_TIMEOUT_S
 
 
@@ -105,6 +107,18 @@ def check_quota(
     return problems
 
 
+def _port_identity(port: Any, version: int | None) -> tuple[str, str]:
+    """Require the reserved MAC and an address of the planned IP family."""
+    mac = str(port.mac_address or "").lower()
+    if not re.fullmatch(r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}", mac):
+        raise PreparationError(f"port {port.id} has no valid MAC address")
+    for item in port.fixed_ips:
+        address = ipaddress.ip_address(item["ip_address"])
+        if address.version == version:
+            return mac, str(address)
+    raise PreparationError(f"port {port.id} has no IPv{version} address")
+
+
 def provision(
     conn: Connection,
     state: RunState,
@@ -158,6 +172,42 @@ def provision(
             port_range_max=trex.udp_dst_port,
             remote_group_id=group.id,
         )
+    for sender in plan.host_senders:
+        port = _create(
+            state,
+            "port",
+            lambda n: conn.network.create_port(
+                name=n,
+                network_id=plan.network_id,
+                security_group_ids=[group.id],
+                is_port_security_enabled=True,
+            ),
+            sender.name,
+        )
+        mac, address = _port_identity(port, plan.ip_version)
+        host = next(h for h in plan.hosts if h.name == sender.host)
+        source_target = HostTarget(
+            **sender.model_dump(),
+            machine=host.machine,
+            port_id=port.id,
+            mac=mac,
+            address=address,
+        )
+        state.host_senders.append(source_target)
+        run_state.save(state)
+        if port.device_id or port.binding_host_id:
+            raise PreparationError(f"source port {port.id} is unexpectedly attached")
+        assert trex
+        # An unbound source port need not appear in Neutron's remote-group set.
+        conn.network.create_security_group_rule(
+            security_group_id=group.id,
+            direction="ingress",
+            ethertype=f"IPv{plan.ip_version}",
+            protocol="udp",
+            port_range_min=trex.udp_dst_port,
+            port_range_max=trex.udp_dst_port,
+            remote_ip_prefix=f"{address}/{32 if plan.ip_version == 4 else 128}",
+        )
     private, public = host_key
     user_data = "#cloud-config\n" + yaml.safe_dump(
         {
@@ -167,7 +217,7 @@ def provision(
         }
     )
     hypervisors = {host.name: host.hypervisor for host in plan.hosts}
-    targets, servers, volumes = [], {}, {}
+    targets, servers, volumes = state.targets, {}, {}
     for vm in plan.vms:
         mgmt_port = _create(
             state,
@@ -191,21 +241,23 @@ def provision(
             ),
             security_groups=[group.id],
         )
+        targets.append(target)
+        run_state.save(state)
         if trex:
             port = _create(
                 state,
                 "port",
                 lambda n: conn.network.create_port(
-                    name=n, network_id=plan.network_id, security_group_ids=[group.id]
+                    name=n,
+                    network_id=plan.network_id,
+                    security_group_ids=[group.id],
+                    is_port_security_enabled=True,
                 ),
                 vm.name,
             )
-            addresses = [item["ip_address"] for item in port.fixed_ips]
-            target.port_id, target.mac = port.id, port.mac_address
-            target.address = next(
-                (a for a in addresses if (":" in a) == (plan.ip_version == 6)),
-                addresses[0],
-            )
+            target.port_id = port.id
+            target.mac, target.address = _port_identity(port, plan.ip_version)
+            run_state.save(state)
             networks.append({"port": port.id})
         if fio:
             volumes[vm.name] = _create(
@@ -233,7 +285,7 @@ def provision(
             vm.name,
         ).id
         target.server_id = servers[vm.name]
-        targets.append(target)
+        run_state.save(state)
 
     built = _wait_all(
         servers,
@@ -299,6 +351,8 @@ def provision(
             raise PreparationError(
                 f"the {target.name} port has security groups the run does not own"
             )
+        if observed.is_port_security_enabled is False:
+            raise PreparationError(f"the {target.name} port has port security disabled")
     return targets
 
 

@@ -25,11 +25,13 @@ placement:
   exclude_hosts: []
 
 workloads:
-  # UDP traffic between guests, sent with TRex.
+  # UDP traffic sent with TRex.
   trex:
     # fan-in: VMs on the other hosts send to VMs on the focus host.
     # fan-out: VMs on the focus host send to VMs on the other hosts.
     # many-to-many: every VM sends to every other VM; no focus host.
+    # host-to-vm: explicit hypervisor sources send to VMs on other hosts.
+    # See docs/configuration.md for host_senders and operator prerequisites.
     mode: fan-in
     # Hypervisor to focus on; chosen automatically when omitted.
     # focus_host: node-a

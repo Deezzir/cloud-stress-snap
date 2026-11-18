@@ -53,6 +53,7 @@ def finalize(
     raw = run_state.run_dir(state.id) / "raw"
     private = run_state.private_dir(state.id)
     guests = {t.name: guest_for(juju, state, t) for t in state.targets}
+    senders = {t.name: t for t in state.host_senders}
     prefix = f"cloud-stress-{state.id[:8]}-"
 
     # 1. Stop: floods first so no load outlives the run.
@@ -67,8 +68,24 @@ def finalize(
                 if entry.where not in guests:
                     raise RuntimeError(f"the guest {entry.where} is not known")
                 guests[entry.where].stop_unit(entry.name)
+            elif entry.kind == "host-workload":
+                sender = senders.get(entry.where or "")
+                if sender is None:
+                    raise RuntimeError(f"the host sender {entry.where} is not known")
+                root = f"/var/snap/trex-generator/common/cloud-stress-{state.id}"
+                name = entry.name.removeprefix(prefix)
+                if name in ("flood", "receipt"):
+                    path = f"{root}/flood.py"
+                elif name == "trex" or name.startswith("trex-"):
+                    index = 0 if name == "trex" else int(name.removeprefix("trex-"))
+                    path = f"{root}/process-{index}/trex_cfg.yaml"
+                else:
+                    raise RuntimeError(f"unknown host workload {entry.name}")
+                remote.stop_unit(
+                    juju, sender.machine, entry.name, None, process_path=path
+                )
         except Exception as error:  # noqa: BLE001 - keep finalizing the rest
-            if entry.kind in ("unit", "guest-unit"):
+            if entry.kind in ("unit", "guest-unit", "host-workload"):
                 not_stopped.add((entry.where, entry.name))
             _failed(state, entry, error)
 
@@ -78,8 +95,9 @@ def finalize(
     _progress(state, "retrieving evidence")
     pending_where: set[str] = set()
     guest_pending = False
+    host_pending = False
     for entry in run_state.outstanding(state.id):
-        if entry.kind not in ("unit", "guest-unit"):
+        if entry.kind not in ("unit", "guest-unit", "host-workload"):
             continue
         stopped = (entry.where, entry.name) not in not_stopped
         try:
@@ -88,6 +106,24 @@ def finalize(
                     text = remote.fetch(juju, entry.where or "", entry.id)
                     if text is not None:
                         (raw / entry.id.rsplit("/", 1)[-1]).write_text(text)
+            elif entry.kind == "host-workload":
+                sender = senders.get(entry.where or "")
+                if sender is None:
+                    raise RuntimeError(f"the host sender {entry.where} is not known")
+                if any(where == entry.where for where, _ in not_stopped):
+                    raise RuntimeError(
+                        f"{sender.name}: evidence is still held by running workloads"
+                    )
+                if entry.id:
+                    name = entry.name.removeprefix(prefix)
+                    data = remote.sh(
+                        juju,
+                        sender.machine,
+                        f"set -o pipefail; tar -C {shlex.quote(entry.id)} "
+                        "-czf - . | base64 -w0",
+                        wait=300,
+                    )
+                    _extract(data, raw / sender.name / name)
             elif entry.id and entry.where in guests:
                 name = entry.name.removeprefix(prefix)
                 _fetch_guest(guests[entry.where], entry.id, raw / entry.where / name)
@@ -107,6 +143,14 @@ def finalize(
             run_state.transition(state.id, entry, "deleted", detail)
         elif entry.kind == "unit":
             pending_where.add(entry.where or "")
+        elif entry.kind == "host-workload":
+            # A source that is still running also holds its Neutron identity.
+            host_pending = True
+            sender = senders.get(entry.where or "")
+            if sender:
+                pending_where.add(sender.machine)
+            else:
+                pending_where.update(h.machine for h in state.plan.hosts)
         elif not abandon_evidence:
             guest_pending = True
             if entry.where in guests:
@@ -121,17 +165,22 @@ def finalize(
     else:
         _progress(state, "deleting run-owned resources")
         for entry in run_state.outstanding(state.id):
-            if entry.kind not in ("dir", "snap") or entry.where in pending_where:
+            if (
+                entry.kind not in ("dir", "snap", "rpc-guard")
+                or entry.where in pending_where
+            ):
                 continue
             try:
                 if entry.kind == "snap":
                     remote.remove_snap(juju, entry.where or "", entry.name)
+                elif entry.kind == "rpc-guard":
+                    remote.remove_rpc_guard(juju, entry.where or "", entry.name)
                 else:
                     remote.remove_dir(juju, entry.where or "", entry.name)
                 run_state.transition(state.id, entry, "deleted")
             except Exception as error:  # noqa: BLE001
                 _failed(state, entry, error)
-        if not guest_pending:
+        if not guest_pending and not host_pending:
             if conn is None:
                 for entry in run_state.outstanding(state.id):
                     if entry.where == "openstack" and entry.action != "requires-login":
@@ -147,7 +196,11 @@ def finalize(
 
     _progress(state, "writing the result")
     left = run_state.outstanding(state.id)
-    retained = retain and bool(left)
+    retained = (
+        retain
+        and bool(left)
+        and not (not_stopped or pending_where or guest_pending or host_pending)
+    )
     state.finalization = (
         "retained" if retained else "incomplete" if left else "complete"
     )
@@ -196,6 +249,14 @@ def _progress(state: RunState, detail: str) -> None:
 
 def _fetch_guest(guest: Guest, path: str, target: Path) -> None:
     """Copy a run-owned guest directory into the bundle."""
-    data = guest.run(f"tar -C {shlex.quote(path)} -czf - . | base64 -w0", timeout=300)
+    data = guest.run(
+        f"set -o pipefail; tar -C {shlex.quote(path)} -czf - . | base64 -w0",
+        timeout=300,
+    )
+    _extract(data, target)
+
+
+def _extract(data: str, target: Path) -> None:
+    """Extract workload directory evidence into the bundle."""
     with tarfile.open(fileobj=io.BytesIO(base64.b64decode(data)), mode="r:gz") as tar:
         tar.extractall(target, filter="data")
