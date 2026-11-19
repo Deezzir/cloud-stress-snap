@@ -1,6 +1,7 @@
 """Static and interactive graphs on the same measured time axis."""
 
 import html
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 import matplotlib
@@ -43,9 +44,7 @@ def _line(rows: list[Row], key: str, scale: float = 1.0) -> Line:
     end: float | None = None
     for row in rows:
         t = _num(row.get("t"))
-        if t is None:
-            continue
-        if key not in row:
+        if t is None or key not in row:
             continue
         value = _num(row.get(key))
         if value is None:
@@ -189,6 +188,30 @@ def _labelled(
     ]
 
 
+def _tx_rx(
+    per_vm: dict[str, list[Row]],
+    read: Callable[[list[Row], str], Line],
+    keys: tuple[str, str],
+    labels: tuple[str, str],
+    style: Mapping[str, object],
+) -> list[Series]:
+    """Per-VM transmitted and received lines of one network measure."""
+    return [
+        series
+        for side, key, label, color in zip(
+            ("TX", "RX"), keys, labels, ("tab:blue", "tab:orange"), strict=True
+        )
+        for series in _labelled(
+            label,
+            {
+                f"{name.removeprefix('network-')} {side}": read(rows, key)
+                for name, rows in per_vm.items()
+            },
+            {"color": color, **style},
+        )
+    ]
+
+
 def _requested_line(result: Row) -> Line:
     """Requested pps per sender over each TRex profile window."""
     config, timeline = result.get("config"), result.get("timeline")
@@ -229,54 +252,29 @@ def _panels(result: Row, metrics: dict[str, list[Row]]) -> list[Panel]:
                     _requested_line(result),
                     REQUESTED,
                     "requested per sender",
-                )
-            ]
-            + _labelled(
-                "transmitted per sender (TRex)",
-                {
-                    f"{name.removeprefix('network-')} TX": _line(rows, "tx_pps")
-                    for name, rows in per_vm.items()
-                },
-                {"color": "tab:blue", **PLOT_FAINT},
-            )
-            + _labelled(
-                "received per receiver (nftables counters)",
-                {
-                    f"{name.removeprefix('network-')} RX": _line(rows, "rx_pps")
-                    for name, rows in per_vm.items()
-                },
-                {"color": "tab:orange", **PLOT_FAINT},
-            ),
+                ),
+                *_tx_rx(
+                    per_vm,
+                    _line,
+                    ("tx_pps", "rx_pps"),
+                    (
+                        "transmitted per sender (TRex)",
+                        "received per receiver (nftables counters)",
+                    ),
+                    PLOT_FAINT,
+                ),
+            ],
             False,
         ),
         (
             "network-counts",
             f"Network: packets per {unit} since its first sample in the measured time",
-            _labelled(
-                "transmitted (TRex)",
-                {
-                    f"{name.removeprefix('network-')} TX": _points(rows, "tx_packets")
-                    for name, rows in per_vm.items()
-                },
-                {
-                    "color": "tab:blue",
-                    "linestyle": "none",
-                    "marker": ".",
-                    **PLOT_FAINT,
-                },
-            )
-            + _labelled(
-                "received (nftables counters)",
-                {
-                    f"{name.removeprefix('network-')} RX": _points(rows, "rx_packets")
-                    for name, rows in per_vm.items()
-                },
-                {
-                    "color": "tab:orange",
-                    "linestyle": "none",
-                    "marker": ".",
-                    **PLOT_FAINT,
-                },
+            _tx_rx(
+                per_vm,
+                _points,
+                ("tx_packets", "rx_packets"),
+                ("transmitted (TRex)", "received (nftables counters)"),
+                {"linestyle": "none", "marker": ".", **PLOT_FAINT},
             ),
             False,
         ),
@@ -284,21 +282,12 @@ def _panels(result: Row, metrics: dict[str, list[Row]]) -> list[Panel]:
             "network-bytes",
             f"Network: bytes per second per {unit} "
             "(TRex frame bytes; nftables IP bytes)",
-            _labelled(
-                "transmitted",
-                {
-                    f"{name.removeprefix('network-')} TX": _line(rows, "tx_bytes_per_s")
-                    for name, rows in per_vm.items()
-                },
-                {"color": "tab:blue", **PLOT_FAINT},
-            )
-            + _labelled(
-                "received",
-                {
-                    f"{name.removeprefix('network-')} RX": _line(rows, "rx_bytes_per_s")
-                    for name, rows in per_vm.items()
-                },
-                {"color": "tab:orange", **PLOT_FAINT},
+            _tx_rx(
+                per_vm,
+                _line,
+                ("tx_bytes_per_s", "rx_bytes_per_s"),
+                ("transmitted", "received"),
+                PLOT_FAINT,
             ),
             False,
         ),
@@ -389,13 +378,18 @@ def _panels(result: Row, metrics: dict[str, list[Row]]) -> list[Panel]:
     ]
 
 
+def _duration(result: Row) -> float | None:
+    """Measured duration when the run reached measurement."""
+    run = result.get("run")
+    duration = _num(run.get("duration_s")) if isinstance(run, dict) else None
+    return duration if duration and result.get("timeline") else None
+
+
 def render(
     result: Row, metrics: dict[str, list[Row]], out: Path
 ) -> list[dict[str, str]]:
     """Write the run's PNG graphs to out and list them in order."""
-    run = result.get("run")
-    duration = _num(run.get("duration_s")) if isinstance(run, dict) else None
-    if not duration or not result.get("timeline"):
+    if not (duration := _duration(result)):
         return []
     out.mkdir(parents=True, exist_ok=True)
     written = []
@@ -408,9 +402,7 @@ def render(
 
 def interactive(result: Row, metrics: dict[str, list[Row]]) -> dict[str, go.Figure]:
     """Interactive counterparts of the PNGs, with independently selectable series."""
-    run = result.get("run")
-    duration = _num(run.get("duration_s")) if isinstance(run, dict) else None
-    if not duration or not result.get("timeline") or not metrics:
+    if not (duration := _duration(result)) or not metrics:
         return {}
     figures = {}
     for slug, _, lines, log in _panels(result, metrics):

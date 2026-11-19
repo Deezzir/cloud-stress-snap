@@ -24,18 +24,29 @@ RUNNER = (resources.files("campaign.workloads") / "files" / "fio_run.py").read_t
 def find_device(guest: Guest, volume_id: str, fio: FioConfig) -> tuple[str | None, str]:
     """Resolve the run's volume in the guest, or say why it is not safe to use."""
     link = f"/dev/disk/by-id/virtio-{volume_id[:20]}"
-    out = guest.run(
-        f"test -e {link} || exit 0; dev=$(readlink -f {link}); echo $dev; "
-        "blockdev --getsize64 $dev; blockdev --getss $dev; "
-        "lsblk -nr -o NAME $dev | wc -l; "
-        "lsblk -ndo PKNAME $(findmnt -nvo SOURCE /)"
-    ).split()
-    if not out:
+    lines = guest.run(
+        f"set -eo pipefail; test -e {link} || exit 0; dev=$(readlink -e {link}); "
+        'echo "$dev"; blockdev --getsize64 "$dev"; blockdev --getss "$dev"; '
+        'lsblk -nr -o NAME "$dev" | wc -l; '
+        # The root filesystem's device and every device below it.
+        'lsblk -nrso PATH "/dev/block/$(findmnt -nro MAJ:MIN /)"; '
+        # Mounts on the device or its children, holders and active swap.
+        'echo @use; lsblk -nro MOUNTPOINTS "$dev"; '
+        'ls "/sys/class/block/${dev##*/}/holders"; '
+        "awk -v d=\"$dev\" '$1 == d' /proc/swaps"
+    ).splitlines()
+    if not lines:
         return None, f"the volume is not visible in the guest at {link}"
-    device, size, sector, nodes = out[0], int(out[1]), int(out[2]), int(out[3])
+    device, size, sector, nodes = lines[0], int(lines[1]), int(lines[2]), int(lines[3])
+    split = lines.index("@use")
+    root = [path for path in lines[4:split] if path.strip()]
     size_gib = fio.volume_size_gib
-    if out[4:] and device == f"/dev/{out[4]}":
-        return None, f"{device} is the guest's root disk"
+    if not root:
+        return None, "cannot identify the guest's root disk"
+    if device in root:
+        return None, f"{device} holds the guest's root filesystem"
+    if any(line.strip() for line in lines[split + 1 :]):
+        return None, f"{device} is mounted or in use"
     if size != size_gib * GIB:
         return None, f"{device} is {size} bytes, not {size_gib} GiB"
     if nodes != 1:
@@ -170,13 +181,10 @@ def parse_hist(text: str) -> list[tuple[float, str, list[int]]]:
 
 def parse_log(text: str) -> list[tuple[float, str, int]]:
     """(epoch seconds, direction, value) per interval of a fio IOPS or bw log."""
-    found = []
-    for line in text.splitlines():
-        fields = [int(f) for f in line.split(",")]
-        found.append(
-            (fields[0] / 1000, FIO_DIRECTIONS.get(fields[2], str(fields[2])), fields[1])
-        )
-    return found
+    return [
+        (fields[0] / 1000, FIO_DIRECTIONS.get(fields[2], str(fields[2])), fields[1])
+        for fields in ([int(f) for f in line.split(",")] for line in text.splitlines())
+    ]
 
 
 def results(text: str) -> list[dict[str, object]]:

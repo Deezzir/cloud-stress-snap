@@ -27,6 +27,7 @@ from probe.models import (
     Relationship,
     Volume,
     VolumeType,
+    Workload,
 )
 
 MAX_RECORDS = 10000
@@ -54,18 +55,24 @@ def configured_clouds() -> list[str]:
 def resolve_cloud(name: str) -> CloudRegion:
     """Resolve and validate the specified cloud configuration."""
     config = OpenStackConfig().get_one_cloud(name)
-    if config.config.get("verify") is False:
+    # Effective settings: `insecure` overrides `verify`; a CA path implies it.
+    cacert, _ = config.get_requests_verify_args()
+    if cacert is False:
         raise ValueError("TLS certificate verification must remain enabled")
-    cacert = config.config.get("cacert")
-    if cacert and not os.access(cacert, os.R_OK):
+    if isinstance(cacert, str) and not os.access(cacert, os.R_OK):
         raise ValueError(CACERT_UNREADABLE)
-    auth = config.config.get("auth", {})
-    if any(auth.get(key) for key in ("password", "application_credential_secret")):
-        if urlsplit(str(auth.get("auth_url", ""))).scheme != "https":
-            raise ValueError("Password authentication requires an HTTPS auth URL")
+    require_auth_tls(config.config.get("auth", {}))
     if not config.config.get("api_timeout"):
         config.config["api_timeout"] = 30
     return config
+
+
+def require_auth_tls(auth: dict[str, Any]) -> None:
+    """Require TLS when sending a password or application secret."""
+    if (auth.get("password") or auth.get("application_credential_secret")) and urlsplit(
+        str(auth.get("auth_url", ""))
+    ).scheme != "https":
+        raise ValueError("Password authentication requires an HTTPS auth URL")
 
 
 def _bounded(records: Iterable[Any]) -> list[Any]:
@@ -127,7 +134,9 @@ def _free(inventory: ResourceProviderInventory, used: int) -> int:
     return int(capacity) - used
 
 
-def probe_openstack(cloud: CloudRegion) -> tuple[OpenstackResult, list[ProbeNotice]]:
+def probe_openstack(
+    cloud: CloudRegion, workloads: set[Workload] | None = None
+) -> tuple[OpenstackResult, list[ProbeNotice]]:
     """Collect OpenStack infrastructure details using the provided cloud region."""
     notices: list[ProbeNotice] = []
 
@@ -205,14 +214,14 @@ def probe_openstack(cloud: CloudRegion) -> tuple[OpenstackResult, list[ProbeNoti
             id=str(item.id), host=item.host, binary=item.binary, state=item.state
         )
         for item in _collect(
-            conn.compute.services(),
+            conn.compute.services() if workloads is None else (),
             "nova.services",
             "OpenStack compute services",
             notices,
         )
     ]
     all_project_servers = _collect(
-        conn.compute.servers(all_projects=True),
+        conn.compute.servers(all_projects=True) if workloads is None else (),
         "nova.servers.all-projects",
         "OpenStack instances across all projects",
         notices,
@@ -245,7 +254,10 @@ def probe_openstack(cloud: CloudRegion) -> tuple[OpenstackResult, list[ProbeNoti
             mac_address=item.mac_address,
         )
         for item in _collect(
-            conn.network.ports(), "neutron.ports", "OpenStack network ports", notices
+            conn.network.ports() if workloads is None else (),
+            "neutron.ports",
+            "OpenStack network ports",
+            notices,
         )
     ]
     ip_versions: dict[str, set[int]] = {}
@@ -303,7 +315,12 @@ def probe_openstack(cloud: CloudRegion) -> tuple[OpenstackResult, list[ProbeNoti
             backend=(item.extra_specs or {}).get("volume_backend_name"),
         )
         for item in _collect(
-            conn.block_storage.types(), "cinder.types", "Cinder volume types", notices
+            conn.block_storage.types()
+            if workloads is None or "fio" in workloads
+            else (),
+            "cinder.types",
+            "Cinder volume types",
+            notices,
         )
     ]
     volumes = [
@@ -318,7 +335,10 @@ def probe_openstack(cloud: CloudRegion) -> tuple[OpenstackResult, list[ProbeNoti
             backend_host=item.host,
         )
         for item in _collect(
-            conn.block_storage.volumes(), "cinder.volumes", "OpenStack volumes", notices
+            conn.block_storage.volumes() if workloads is None else (),
+            "cinder.volumes",
+            "OpenStack volumes",
+            notices,
         )
     ]
     if any(volume.backend_host is None for volume in volumes):

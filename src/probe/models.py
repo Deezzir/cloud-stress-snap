@@ -320,6 +320,17 @@ class CephResult(Record):
     public_space: str | None = None
     cluster_space: str | None = None
 
+    @property
+    def unclean_pgs(self) -> int | None:
+        """PGs lacking active or clean; an absent reading is unknown."""
+        if not self.pg_states:
+            return None
+        return sum(
+            n
+            for flags, n in self.pg_states.items()
+            if not {"active", "clean"} <= set(flags.split("+"))
+        )
+
 
 class OvsHost(Record):
     """OVS bridge datapath types and offload setting read through ovn-chassis."""
@@ -346,9 +357,9 @@ class WorkloadReadiness(Record):
 class HostPlan(Record):
     """One hypervisor in the run's fleet."""
 
-    name: str
+    name: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
     hypervisor: str
-    machine: str
+    machine: str = Field(pattern=r"^[0-9]+$")
     architecture: str
     vms: int
     focus: bool = False
@@ -361,7 +372,7 @@ class HostPlan(Record):
 class VmPlan(Record):
     """One VM of the fleet, its host, image and network role."""
 
-    name: str
+    name: str = Field(pattern=r"^vm[0-9]{3,}$")
     host: str
     image: str
     image_id: str

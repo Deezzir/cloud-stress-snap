@@ -54,25 +54,32 @@ class TrexProfile(Strict):
     pps_per_sender: int = Field(gt=0)
 
 
+HOST_LINK_PATTERN = r"[A-Za-z0-9][A-Za-z0-9_.-]{0,14}"
+
+
 class HostSenderConfig(Strict):
-    """Operator-selected host interface and exclusive CPU triples."""
+    """Host backend and optional provider-link and CPU overrides."""
 
     backend: Literal["af_packet", "dpdk"]
-    interface: str
-    cpus: list[Annotated[int, Field(ge=0, strict=True)]] = Field(min_length=3)
+    interface: str | None = None
+    cpus: list[Annotated[int, Field(ge=0, strict=True)]] | None = Field(
+        default=None, min_length=3
+    )
 
     @model_validator(mode="after")
     def _device(self) -> Self:
         pattern = (
-            r"[A-Za-z0-9][A-Za-z0-9_.-]{0,14}"
+            HOST_LINK_PATTERN
             if self.backend == "af_packet"
             else r"[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[01][0-9a-fA-F]\.[0-7]"
         )
-        if not re.fullmatch(pattern, self.interface):
+        if self.interface is not None and not re.fullmatch(pattern, self.interface):
             raise ValueError("interface must be a kernel link name or full PCI BDF")
         if self.backend == "dpdk":
+            if self.interface is None:
+                raise ValueError("dpdk requires the full PCI BDF of a dedicated NIC/VF")
             self.interface = self.interface.lower()
-        if len(set(self.cpus)) != len(self.cpus):
+        if self.cpus is not None and len(set(self.cpus)) != len(self.cpus):
             raise ValueError("cpus must be distinct")
         return self
 
@@ -113,7 +120,7 @@ class TrexConfig(Strict):
             for host, sender in self.host_senders.items():
                 if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", host):
                     raise ValueError("host_senders keys must be discovered host names")
-                if len(sender.cpus) != 3 * self.processes:
+                if sender.cpus is not None and len(sender.cpus) != 3 * self.processes:
                     raise ValueError(f"{host}: cpus needs exactly 3 IDs per process")
                 if sender.backend == "dpdk" and self.processes != 1:
                     raise ValueError("dpdk host senders require processes: 1")

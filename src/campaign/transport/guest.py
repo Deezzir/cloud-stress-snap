@@ -2,7 +2,8 @@
 
 A guest's management NIC sits on an overlay network. On the guest's host, that
 network's `ovnmeta-<network-id>` namespace has an address on the same subnet, so
-SSH runs there through `juju exec`, with the run's key and pinned host key.
+SSH runs there through `juju exec`, with a key generated on that host and the
+guest's pinned host key.
 """
 
 import shlex
@@ -23,6 +24,24 @@ def keygen(path: Path) -> str:
     command = "ssh-keygen -q -t ed25519 -C cloud-stress -N".split()
     subprocess.run([*command, "", "-f", str(path)], check=True)
     return path.with_suffix(".pub").read_text().strip()
+
+
+def guest_keygen(juju: jubilant.Juju, machine: str, host_dir: str) -> str:
+    """Create the run's guest key on a host and return only its public key.
+
+    Guests on one host share this key; the private key never leaves the host.
+    """
+    key = shlex.quote(f"{host_dir}/guest/id_ed25519")
+    public = remote.sh(
+        juju,
+        machine,
+        f"install -d -m 0700 {shlex.quote(host_dir)}/guest && "
+        f"ssh-keygen -q -t ed25519 -C cloud-stress -N '' -f {key} >/dev/null && "
+        f"cat {key}.pub",
+    ).strip()
+    if not public.startswith("ssh-ed25519 ") or "\n" in public:
+        raise RuntimeError(f"machine {machine} returned no guest public key")
+    return public
 
 
 class Guest:
@@ -46,25 +65,14 @@ class Guest:
         self.key = f"{host_dir}/guest/id_ed25519"
         self.known_hosts = f"{host_dir}/guest/{name}.known_hosts"
 
-    def install_keys(self, private_key: str | None, host_public_key: str) -> None:
-        """Place the guest's pinned host key, and the run's key if given, on the host.
-
-        Guests on one host share the run's key, so it is placed once per host.
-        """
-        if private_key is not None:
-            remote.push(self.juju, self.machine, self.key, private_key)
-            remote.sh(self.juju, self.machine, f"chmod 600 {shlex.quote(self.key)}")
+    def pin_host_key(self, host_public_key: str) -> None:
+        """Place the guest's pinned host key on its host."""
         remote.push(
             self.juju,
             self.machine,
             self.known_hosts,
             f"{self.address} {host_public_key}\n",
         )
-
-    def namespace_ready(self) -> bool:
-        """Whether the management network's metadata namespace exists on the host."""
-        out = remote.sh(self.juju, self.machine, "ip netns list")
-        return any(line.split()[:1] == [self.namespace] for line in out.splitlines())
 
     def run(self, command: str, timeout: int = SSH_TIMEOUT_S) -> str:
         """Run a command with sudo on the guest and return stdout."""
@@ -105,35 +113,6 @@ class Guest:
             return True
         except RuntimeError:
             return False
-
-    def start_unit(self, unit: str, max_s: int, command: str, rc_path: str) -> None:
-        """Start a transient unit that records its exit code in rc_path.
-
-        snapd moves a snap app into its own cgroup scope, so `timeout` bounds the
-        command too and forwards the unit's stop signal to it.
-        """
-        # Bash defers TERM until the foreground timeout finishes stopping its child.
-        record = f"echo $? > {shlex.quote(rc_path)}"
-        script = (
-            f"trap {shlex.quote(record)} EXIT; trap 'exit 143' TERM; "
-            f"timeout --kill-after=10 {max_s} bash -c {shlex.quote(command)}"
-        )
-        script = script.replace("$", "$$")
-        self.run(
-            f"systemd-run --unit {unit} --collect "
-            f"--property RuntimeMaxSec={max_s + 30} --property KillMode=control-group "
-            f"bash -c {shlex.quote(script)}"
-        )
-
-    def unit_active(self, unit: str) -> bool:
-        """Whether a transient unit is still running."""
-        out = self.run(f"systemctl is-active {unit}.service || true")
-        return out.strip() in ("active", "activating", "deactivating")
-
-    def exit_code(self, rc_path: str) -> int | None:
-        """Exit code a finished unit recorded, or None if it never finished."""
-        out = self.run(f"cat {shlex.quote(rc_path)} 2>/dev/null || true").strip()
-        return int(out) if out else None
 
     def stop_unit(self, unit: str) -> None:
         """Stop a transient unit and confirm it is gone or inactive."""

@@ -163,7 +163,11 @@ class Worker:
                 run.cancel.set()
                 run.state.cancel_requested = True
                 run_state.event(run.state.id, "stop-requested", uid=uid, clean=clean)
-                return {"ok": True, "run_id": run.state.id}
+                return {
+                    "ok": True,
+                    "run_id": run.state.id,
+                    "attempt": max(1, run.state.finalize_attempts),
+                }
             assert self.thread
             self.thread.join()  # the run has ended and is releasing its lock
         if self.busy():
@@ -176,12 +180,22 @@ class Worker:
                 found = None
             if found and found.finalization == "retained":
                 pending = found
+            elif found:
+                return {
+                    "ok": True,
+                    "message": f"Run {found.id} has no retained resources.",
+                }
         if pending is None or run_id not in (None, pending.id):
             return {"ok": False, "error": "no unfinished or retained run to stop"}
         if uid not in (0, pending.owner_uid):
             return {"ok": False, "error": "only the run's owner or root can stop it"}
         if not request.get("access"):
-            return {"ok": False, "error": "access", "needs_access": True}
+            return {
+                "ok": True,
+                "needs_access": True,
+                "run_id": pending.id,
+                "cloud": pending.cloud,
+            }
         given = access.Access.model_validate(request["access"])
         stack = ExitStack()
         stack.enter_context(run_state.lock())
@@ -201,8 +215,9 @@ class Worker:
         self.thread = threading.Thread(
             target=self.cleanup, args=(stack, pending, abandon)
         )
+        attempt = pending.finalize_attempts + 1
         self.thread.start()
-        return {"ok": True, "run_id": pending.id}
+        return {"ok": True, "run_id": pending.id, "attempt": attempt}
 
     def cleanup(
         self, stack: ExitStack, pending: run_state.RunState, abandon: bool
@@ -229,13 +244,11 @@ def recover(pending: run_state.RunState, abandon: bool = False) -> None:
 
 def recover_unfinished() -> None:
     """Finalize an interrupted run unless a live worker holds the lock."""
-    pending = run_state.unfinished()
-    if pending is None or pending.code is not None:
-        # A finalized run with cleanup left waits for `run stop` with new access.
-        return
     try:
         with run_state.lock():
-            recover(pending)
+            pending = run_state.unfinished()
+            if pending and pending.code is None:
+                recover(pending)
     except run_state.RunActiveError:
         return
 
@@ -291,7 +304,7 @@ def main() -> None:
         try:
             conn, _ = server.accept()
         except TimeoutError:
-            if worker.busy():
+            if worker.busy() or worker.mutex.locked():
                 idle_since = time.monotonic()
             elif time.monotonic() - idle_since > IDLE_EXIT_S:
                 return

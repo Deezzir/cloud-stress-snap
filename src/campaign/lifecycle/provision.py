@@ -122,11 +122,11 @@ def _port_identity(port: Any, version: int | None) -> tuple[str, str]:
 def provision(
     conn: Connection,
     state: RunState,
-    public_key: str,
+    public_keys: dict[str, str],
     host_key: tuple[str, str],
     sleep: Callable[[float], None],
 ) -> list[Target]:
-    """Create the run's key pair, security group and VMs with their ports and volumes.
+    """Create the run's security group and VMs with their ports and volumes.
 
     Calls run one after another; servers and volumes build in parallel in the
     cloud and are awaited together.
@@ -134,18 +134,9 @@ def provision(
     plan, config = state.plan, state.config
     trex, fio = config.workloads.trex, config.workloads.fio
     source = metadata_address(conn, plan.mgmt_network_id or "")
-    volume_type = None
-    if fio:
-        types = {t.name for t in conn.block_storage.types()}
-        if plan.volume_type in types:
-            volume_type = plan.volume_type
-        elif plan.volume_type != "default":
-            raise PreparationError(f"volume type {plan.volume_type} no longer exists")
-    keypair = _create(
-        state,
-        "keypair",
-        lambda n: conn.compute.create_keypair(name=n, public_key=public_key),
-    )
+    volume_type = plan.volume_type
+    if fio and volume_type == "default" and not conn.block_storage.find_type("default"):
+        volume_type = None
     group = _create(
         state,
         "security-group",
@@ -172,8 +163,9 @@ def provision(
             port_range_max=trex.udp_dst_port,
             remote_group_id=group.id,
         )
-    for sender in plan.host_senders:
-        port = _create(
+
+    def data_port(participant: str) -> Any:
+        return _create(
             state,
             "port",
             lambda n: conn.network.create_port(
@@ -182,8 +174,11 @@ def provision(
                 security_group_ids=[group.id],
                 is_port_security_enabled=True,
             ),
-            sender.name,
+            participant,
         )
+
+    for sender in plan.host_senders:
+        port = data_port(sender.name)
         mac, address = _port_identity(port, plan.ip_version)
         host = next(h for h in plan.hosts if h.name == sender.host)
         source_target = HostTarget(
@@ -209,16 +204,17 @@ def provision(
             remote_ip_prefix=f"{address}/{32 if plan.ip_version == 4 else 128}",
         )
     private, public = host_key
-    user_data = "#cloud-config\n" + yaml.safe_dump(
-        {
-            "ssh_keys": {"ed25519_private": private, "ed25519_public": public},
-            "package_update": bool(fio or trex),
-            "packages": (["fio"] if fio else []) + (["nftables"] if trex else []),
-        }
-    )
+    guest_config = {
+        "ssh_keys": {"ed25519_private": private, "ed25519_public": public},
+        "package_update": True,
+        "packages": (["fio"] if fio else []) + (["nftables"] if trex else []),
+    }
     hypervisors = {host.name: host.hypervisor for host in plan.hosts}
     targets, servers, volumes = state.targets, {}, {}
     for vm in plan.vms:
+        user_data = "#cloud-config\n" + yaml.safe_dump(
+            {**guest_config, "ssh_authorized_keys": [public_keys[vm.host]]}
+        )
         mgmt_port = _create(
             state,
             "mgmt-port",
@@ -244,17 +240,7 @@ def provision(
         targets.append(target)
         run_state.save(state)
         if trex:
-            port = _create(
-                state,
-                "port",
-                lambda n: conn.network.create_port(
-                    name=n,
-                    network_id=plan.network_id,
-                    security_group_ids=[group.id],
-                    is_port_security_enabled=True,
-                ),
-                vm.name,
-            )
+            port = data_port(vm.name)
             target.port_id = port.id
             target.mac, target.address = _port_identity(port, plan.ip_version)
             run_state.save(state)
@@ -278,8 +264,7 @@ def provision(
                 flavor_id=plan.flavor_id,
                 networks=networks,  # noqa: B023
                 config_drive=True,
-                key_name=keypair.name,
-                user_data=base64.b64encode(user_data.encode()).decode(),
+                user_data=base64.b64encode(user_data.encode()).decode(),  # noqa: B023
                 hypervisor_hostname=hypervisors[vm.host],  # noqa: B023
             ),
             vm.name,
@@ -290,7 +275,7 @@ def provision(
     built = _wait_all(
         servers,
         conn.compute.get_server,
-        lambda s: s.status == "ACTIVE",
+        "ACTIVE",
         "guest",
         sleep,
     )
@@ -305,7 +290,7 @@ def provision(
         ready = _wait_all(
             volumes,
             conn.block_storage.get_volume,
-            lambda v: v.status == "available",
+            "available",
             "data volume",
             sleep,
         )
@@ -327,7 +312,7 @@ def provision(
         attached = _wait_all(
             volumes,
             conn.block_storage.get_volume,
-            lambda v: v.status == "in-use",
+            "in-use",
             "volume attachment",
             sleep,
         )
@@ -343,7 +328,12 @@ def provision(
         observed = conn.network.get_port(target.port_id)
         target.binding_host = observed.binding_host_id
         target.security_groups = list(observed.security_group_ids)
-        if _short(observed.binding_host_id) != _short(hypervisors[target.host]):
+        bound = observed.binding_host_id or ""
+        # Neutron may record the short name, which identifies only a unique host.
+        if bound != hypervisors[target.host] and not (
+            "." not in bound
+            and bound == target.host == _short(hypervisors[target.host])
+        ):
             raise PreparationError(
                 f"the {target.name} port is bound to {observed.binding_host_id}"
             )
@@ -359,7 +349,7 @@ def provision(
 def _wait_all(
     ids: dict[str, str],
     read: Callable[[str], Any],
-    done: Callable[[Any], bool],
+    status: str,
     what: str,
     sleep: Callable[[float], None],
 ) -> dict[str, Any]:
@@ -371,9 +361,9 @@ def _wait_all(
             if key in finished:
                 continue
             value = read(resource_id)
-            if done(value):
+            if value.status == status:
                 finished[key] = value
-            elif str(getattr(value, "status", "")).lower() == "error":
+            elif value.status.lower() == "error":
                 raise PreparationError(f"the {key} {what} went into ERROR")
         if len(finished) == len(ids):
             return finished
@@ -444,16 +434,19 @@ def cleanup(conn: Connection, state: RunState) -> None:
                 )
                 if found:
                     if entry.kind == "volume":
-                        conn.block_storage.wait_for_status(
-                            conn.block_storage.get_volume(found),
-                            "available",
-                            wait=BUILD_TIMEOUT_S,
-                        )
+                        volume = conn.block_storage.get_volume(found)
+                        # Cinder deletes an unattached error volume without force.
+                        if volume.attachments or not volume.status.startswith("error"):
+                            volume = conn.block_storage.wait_for_status(
+                                volume, "available", wait=BUILD_TIMEOUT_S
+                            )
                     DELETE[entry.kind](conn, found)
                     if entry.kind == "server":
                         conn.compute.wait_for_delete(
                             conn.compute.get_server(found), wait=BUILD_TIMEOUT_S
                         )
+                    elif entry.kind == "volume":
+                        conn.block_storage.wait_for_delete(volume, wait=BUILD_TIMEOUT_S)
             run_state.transition(state.id, entry, "deleted")
         except exceptions.NotFoundException:
             run_state.transition(state.id, entry, "deleted")

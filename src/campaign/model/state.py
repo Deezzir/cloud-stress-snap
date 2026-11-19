@@ -194,7 +194,7 @@ def resources(run_id: str) -> list[ResourceEntry]:
     if not path.is_file():
         return []
     return [
-        ResourceEntry.model_validate(json.loads(line))
+        ResourceEntry.model_validate_json(line)
         for line in path.read_text().splitlines()
         if line.strip()
     ]
@@ -245,10 +245,7 @@ def lock() -> Iterator[None]:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            active = unfinished()
-            raise RunActiveError(
-                f"Run {active.id} is active." if active else "A run is active."
-            ) from None
+            raise RunActiveError("A run is active.") from None
         yield
     finally:
         os.close(fd)

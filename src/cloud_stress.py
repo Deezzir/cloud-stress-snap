@@ -33,7 +33,7 @@ from probe.display import (
 from probe.infra_probe import probe_infra
 from probe.juju_probe import probe_juju
 from probe.maas_probe import probe_maas
-from probe.models import WORKLOADS, CephResult, CheckResult, ProbeNotice, Workload
+from probe.models import WORKLOADS, CephResult, CheckResult, ProbeNotice
 from probe.openstack_probe import resolve_cloud
 from probe.ovs_probe import probe_ovs
 from probe.plan import resolve_plan, workload_readiness
@@ -65,25 +65,17 @@ def debug_logging(ctx: click.Context, param: click.Parameter, value: bool) -> No
 
 def output_options[F: Callable[..., object]](func: F) -> F:
     """Independent controls for expanded output and debug logs."""
-    for option in reversed(
-        [
-            click.option(
-                "--full",
-                is_flag=True,
-                help="Show full inventory, fleet and result details.",
-            ),
-            click.option(
-                "-v",
-                "--verbose",
-                is_flag=True,
-                expose_value=False,
-                callback=debug_logging,
-                help="Print debug logs to stderr.",
-            ),
-        ]
-    ):
-        func = option(func)
-    return func
+    func = click.option(
+        "-v",
+        "--verbose",
+        is_flag=True,
+        expose_value=False,
+        callback=debug_logging,
+        help="Print debug logs to stderr.",
+    )(func)
+    return click.option(
+        "--full", is_flag=True, help="Show full inventory, fleet and result details."
+    )(func)
 
 
 def discover(
@@ -101,7 +93,9 @@ def discover(
         raise click.UsageError("--juju-model must not be empty")
     with ThreadPoolExecutor(max_workers=3) as pool:
         juju_future = pool.submit(probe_juju, juju_model)
-        cloud, openstack, openstack_notices = discover_cloud()
+        cloud, openstack, openstack_notices = discover_cloud(
+            set(config.workloads.enabled) if config else None
+        )
         juju, juju_notices = juju_future.result()
         scoped_ids = {
             machine.instance_id for machine in juju.machines if machine.instance_id
@@ -109,7 +103,10 @@ def discover(
         maas, maas_notices = probe_maas(juju_model, scoped_ids)
         link_notices = link_juju_to_hypervisors(juju, maas, openstack.hosts)
         infra_future = pool.submit(probe_infra, juju_model, juju, openstack.hosts)
-        ceph_future = None if force else pool.submit(probe_ceph, juju_model, juju)
+        # Ceph health gates only fio; its inventory is for `check`.
+        ceph_future = None
+        if not force and (config is None or config.workloads.fio):
+            ceph_future = pool.submit(probe_ceph, juju_model, juju, config is None)
         ovs_future = pool.submit(probe_ovs, juju_model, juju)
         infra, infra_notices = infra_future.result()
         if ceph_future:
@@ -120,7 +117,9 @@ def discover(
                 ProbeNotice(
                     source="ceph",
                     reason="not-queried",
-                    message="Preflight checks skipped (--force).",
+                    message="Preflight checks skipped (--force)."
+                    if force
+                    else "Ceph is not used by this run.",
                 )
             ]
         ovs_hosts, ovs_notices = ovs_future.result()
@@ -142,16 +141,19 @@ def discover(
             *ovs_notices,
         ],
     )
-    missing: dict[Workload, dict[str, str]] = {}
+    plans = {}
     if config:
         enabled = set(config.workloads.enabled)
         result.plan, found = resolve_plan(result, overrides, enabled, config)
         missing = {name: found for name in WORKLOADS if name in enabled}
     else:
-        result.plan, _ = resolve_plan(result, overrides, set(WORKLOADS))
+        missing = {}
         for name in WORKLOADS:
-            missing[name] = resolve_plan(result, overrides, {name})[1]
+            plans[name], missing[name] = resolve_plan(result, overrides, {name})
     result.readiness = workload_readiness(result, missing, force)
+    if plans:
+        selected = next((r.workload for r in result.readiness if r.ready), WORKLOADS[0])
+        result.plan = plans[selected]
     result.notices[:0] = nova_state_notices(result)
     result.notices.extend(datapath_notices(result))
     return result
@@ -194,7 +196,7 @@ def run() -> None:
     """Start, follow and stop stress runs."""
 
 
-def request(payload: dict[str, object], check: bool = True) -> dict[str, object]:
+def request(payload: dict[str, object]) -> dict[str, object]:
     """Send one request to the worker and return its reply."""
     log.debug("Worker: %s request via %s", payload.get("op"), run_state.SOCKET)
     try:
@@ -215,7 +217,7 @@ def request(payload: dict[str, object], check: bool = True) -> dict[str, object]
             "See: sudo journalctl -u snap.cloud-stress.worker"
         ) from None
     reply: dict[str, object] = json.loads(data)
-    if check and not reply.get("ok"):
+    if not reply.get("ok"):
         click.echo(f"Error: {reply.get('error')}", err=True)
         raise SystemExit(2)
     return reply
@@ -230,9 +232,9 @@ def operator_access(cloud: str) -> access.Access:
 
 
 def follow(
-    run_id: str, after_attempt: int = 0, full: bool = False, clean: bool = False
+    run_id: str, attempt: int = 1, full: bool = False, clean: bool = False
 ) -> None:
-    """Print progress until a finalize attempt after `after_attempt` ends.
+    """Print progress until finalize attempt `attempt`, or a later one, ends.
 
     With clean, a result that still retains resources is not the end. Ctrl+C
     only detaches; the run continues in the worker.
@@ -241,7 +243,7 @@ def follow(
     try:
         while True:
             state = run_state.load(run_id)
-            ended = state.code is not None and state.finalize_attempts > after_attempt
+            ended = state.code is not None and state.finalize_attempts >= attempt
             if ended and not (clean and state.finalization == "retained"):
                 break
             line = state.detail or state.phase
@@ -279,10 +281,8 @@ def show_result(state: run_state.RunState, full: bool = False) -> None:
             click.echo(f"  {cause}")
         if state.finalization == "incomplete":
             click.echo(f"Retry: cloud-stress run stop {state.id}")
-    if state.finalization == "retained":
-        click.echo(
-            f"Resources retained. Clean up: cloud-stress run stop --clean {state.id}"
-        )
+        elif state.finalization == "retained":
+            click.echo(f"Retained. Clean up: cloud-stress run stop --clean {state.id}")
     click.echo(f"Results: {run_state.run_dir(state.id)}")
 
 
@@ -393,25 +393,22 @@ def schedule_rows(
         ["Warm-up", f"{fmt(schedule.warmup_s)} before measurement"],
         ["Measured", fmt(schedule.duration_s)],
     ]
-    trex_config, fio_config = config.workloads.trex, config.workloads.fio
-    for window in schedule.trex if trex_config else []:
-        pps = trex_config.profiles[window.profile].pps_per_sender if trex_config else 0
-        rows.append(
-            [
-                "TRex" if window.profile == 0 else "",
-                f"{fmt(window.start_s)}-{fmt(window.start_s + window.length_s)}  "
-                f"{pps:,} pps per sender",
-            ]
-        )
-    for window in schedule.fio if fio_config else []:
-        name = fio_config.profiles[window.profile].name if fio_config else ""
-        end = fmt(window.start_s + window.length_s)
-        rows.append(
-            [
-                "fio" if window.profile == 0 else "",
-                f"{fmt(window.start_s)}-{end}  {name}",
-            ]
-        )
+    trex, fio = config.workloads.trex, config.workloads.fio
+    for name, windows, labels in (
+        (
+            "TRex",
+            schedule.trex,
+            [f"{p.pps_per_sender:,} pps per sender" for p in trex.profiles]
+            if trex
+            else [],
+        ),
+        ("fio", schedule.fio, [p.name for p in fio.profiles] if fio else []),
+    ):
+        for w in windows:
+            period = f"{fmt(w.start_s)}-{fmt(w.start_s + w.length_s)}"
+            rows.append(
+                [name if w.profile == 0 else "", f"{period}  {labels[w.profile]}"]
+            )
     if full:
         rows.append(
             ["Timeout", f"{fmt(schedule.max_elapsed_s)} including setup and cleanup"]
@@ -434,71 +431,46 @@ def list_runs(as_json: bool) -> None:
         ) from None
     for warning in errors:
         click.echo(f"Warning: {warning}", err=True)
-    summaries = [
-        {
-            "id": state.id,
-            "started_at": state.created_at.astimezone(UTC).isoformat(),
-            "status": (
-                state.execution or "unknown"
-                if state.phase == "finished"
-                else state.phase
-            ),
-            "workloads": state.config.workloads.enabled,
-            "vms": state.config.placement.total,
-            "duration_s": state.duration_s,
-            "cleanup": state.finalization,
-        }
-        for state in saved
+    summaries = []
+    rows = [
+        ["Run ID", "Started (UTC)", "Status", "Workloads", "VMs", "Duration", "Cleanup"]
     ]
+    for state in saved:
+        started = state.created_at.astimezone(UTC)
+        status = (
+            (state.execution or "unknown") if state.phase == "finished" else state.phase
+        )
+        workloads, vms = state.config.workloads.enabled, state.config.placement.total
+        if as_json:
+            summaries.append(
+                {
+                    "id": state.id,
+                    "started_at": started.isoformat(),
+                    "status": status,
+                    "workloads": workloads,
+                    "vms": vms,
+                    "duration_s": state.duration_s,
+                    "cleanup": state.finalization,
+                }
+            )
+        else:
+            rows.append(
+                [
+                    state.id,
+                    started.strftime("%Y-%m-%d %H:%M:%S"),
+                    status,
+                    ",".join(workloads),
+                    str(vms),
+                    profiles.format_duration(state.duration_s),
+                    state.finalization or "-",
+                ]
+            )
     if as_json:
         click.echo(json.dumps(summaries, indent=2))
-        return
-    if not saved:
-        click.echo("No saved runs." if not errors else "No readable saved runs.")
-        return
-    headers = [
-        "Run ID",
-        "Started (UTC)",
-        "Status",
-        "Workloads",
-        "VMs",
-        "Duration",
-        "Cleanup",
-    ]
-    rows = [
-        [
-            state.id,
-            state.created_at.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S"),
-            str(summary["status"]),
-            ",".join(state.config.workloads.enabled),
-            str(state.config.placement.total),
-            profiles.format_duration(state.duration_s),
-            state.finalization or "—",
-        ]
-        for state, summary in zip(saved, summaries, strict=True)
-    ]
-    widths = [max(len(row[i]) for row in [headers, *rows]) for i in range(len(headers))]
-
-    def border(left: str, join: str, right: str) -> str:
-        return left + join.join("─" * (width + 2) for width in widths) + right
-
-    click.echo(border("┌", "┬", "┐"))
-    for index, row in enumerate([headers, *rows]):
-        cells = [
-            cell.rjust(width) if column == 4 else cell.ljust(width)
-            for column, (cell, width) in enumerate(zip(row, widths, strict=True))
-        ]
-        if index:
-            color = {
-                "completed": "green",
-                "failed": "red",
-                "interrupted": "red",
-            }.get(row[2], "yellow")
-            cells[2] = click.style(cells[2], fg=color)
-        click.echo("│ " + " │ ".join(cells) + " │")
-        if index == 0:
-            click.echo(border("├", "┼", "┤"))
-    click.echo(border("└", "┴", "┘"))
+    elif saved:
+        print_table(rows)
+    else:
+        click.echo("No readable saved runs." if errors else "No saved runs.")
 
 
 @run.command()
@@ -516,36 +488,22 @@ def list_runs(as_json: bool) -> None:
 )
 def stop(run_id: str | None, abandon_evidence: bool, clean: bool, full: bool) -> None:
     """Stop the active run, or finish cleanup of an interrupted or retained one."""
-    pending = run_state.unfinished()
-    if pending is None and clean:
-        try:
-            pending = run_state.load(run_id) if run_id else run_state.retained()
-        except FileNotFoundError:
-            raise click.UsageError(f"No run {run_id}") from None
-        if pending is not None and pending.finalization != "retained":
-            click.echo(f"Run {pending.id} has no retained resources.")
-            return
-    if pending is None:
-        raise click.UsageError(
-            "No active, interrupted or retained run."
-            if clean
-            else "No active or interrupted run."
-        )
     payload: dict[str, object] = {
         "op": "stop",
         "run_id": run_id,
         "abandon_evidence": abandon_evidence,
         "clean": clean,
     }
-    reply = request(payload, check=False)
+    reply = request(payload)
+    if "message" in reply:
+        click.echo(reply["message"])
+        return
     if reply.get("needs_access"):
-        payload["access"] = operator_access(pending.cloud).model_dump()
+        payload["run_id"] = reply["run_id"]
+        payload["access"] = operator_access(str(reply["cloud"])).model_dump()
         reply = request(payload)
-    elif not reply.get("ok"):
-        click.echo(f"Error: {reply.get('error')}", err=True)
-        raise SystemExit(2)
     click.echo(f"Stopping run {reply['run_id']}.")
-    follow(str(reply["run_id"]), pending.finalize_attempts, full, clean)
+    follow(str(reply["run_id"]), int(str(reply["attempt"])), full, clean)
 
 
 @run.command()
@@ -574,7 +532,6 @@ def status(
     if state is None:
         click.echo("No runs.")
         return
-    bundle = run_state.run_dir(state.id)
     if html_file:
         report = render_html(state.id)
         if report is None:
@@ -583,7 +540,7 @@ def status(
         click.echo(f"Wrote {html_file.resolve()}")
         return
     if as_json:
-        result_file = bundle / "report.json"
+        result_file = run_state.run_dir(state.id) / "report.json"
         click.echo(
             result_file.read_text()
             if result_file.is_file()
@@ -593,8 +550,7 @@ def status(
     if state.code is not None or state.phase == "finished":
         show_result(state, full)
         return
-    end = datetime.now(UTC)
-    elapsed = int((end - state.created_at).total_seconds())
+    elapsed = int((datetime.now(UTC) - state.created_at).total_seconds())
     rows = [
         ["Run", state.id],
         ["Status", state.detail or state.phase],
@@ -609,14 +565,6 @@ def status(
     if full:
         click.echo("\nPlanned fleet:")
         print_fleet(state.plan)
-    pending = run_state.outstanding(state.id)
-    if state.finalization == "incomplete" and pending:
-        click.echo(f"\nCleanup pending: {len(pending)} item(s).")
-        for entry in pending:
-            click.echo(
-                f"  - {entry.kind} {entry.name} on {entry.where}: {entry.action}"
-            )
-        click.echo(f"Retry: cloud-stress run stop {state.id}")
 
 
 if __name__ == "__main__":

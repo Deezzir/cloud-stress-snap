@@ -95,7 +95,7 @@ hypervisor of every VM after creation and fails if Nova placed a VM elsewhere.
 | `focus_host` | chosen | Hypervisor the traffic fans in to or out of; rejected with `many-to-many` or `host-to-vm`. |
 | `focus_percent` | `50` | Integer percentage, 1-99, of `placement.vms` on the focus host: receivers in `fan-in`, senders in `fan-out`. Ignored with `placement.hosts` or `many-to-many`; rejected with `host-to-vm`. |
 | `processes` | `1` | Independent single-core TRex servers per sender, integer 1-64. |
-| `host_senders` | `{}` | Required only for `host-to-vm`: discovered host names mapped to `backend`, `interface` and `cpus`. |
+| `host_senders` | `{}` | Required for `host-to-vm`: discovered host names mapped to source settings. |
 | `udp_payload_bytes` | `18` | UDP payload size, 2-1400 bytes. |
 | `udp_dst_port` | `33434` | UDP destination port. |
 | `udp_src_ports` | `[1024, 65535]` | Range of UDP source ports. |
@@ -133,25 +133,23 @@ provider network and of the guest interface.
 
 ### Direct host sources
 
-`host-to-vm` makes every placed VM a receiver. Each selected host sends equally
-to **all** receiver VMs on other hypervisors; local receivers are excluded because
-physical traffic cannot rely on switch hairpin. Every source and receiver must
-have a connection. `pps_per_sender` remains the total across processes and peers.
-
-`host_senders` keys are discovered short or full hypervisor names. Values require:
+Select sources by short or full hypervisor name. Each source needs nftables.
+The campaign reuses an existing `trex-generator` without changing its connections.
+If absent, it installs `latest/edge` and connects the four standard
+[TRex interfaces](security-reference.md#juju-access). Native `vfio` and
+`hugepages-control` connections must already be available for DPDK preflight.
 
 | Key | Meaning |
 | --- | --- |
 | `backend` | `af_packet` or `dpdk`. |
-| `interface` | AF_PACKET: the discovered physical/bond provider link, not a VLAN subinterface. DPDK: full PCI BDF of a dedicated operator-prepared NIC/VF. |
-| `cpus` | Distinct nonnegative CPU IDs, exactly three per process: master, receive, traffic. |
+| `interface` | AF_PACKET: defaults to the healthy discovered provider link; an override must match it. DPDK: required full PCI BDF of a dedicated operator-prepared NIC/VF. |
+| `cpus` | Optional ordered IDs (master, receive, traffic per process). Automatic selection does not reserve exclusive cores. |
 
-Focus defaults do not apply in this mode; remove `focus_host` and `focus_percent`
-from a copied default configuration. DPDK requires `processes: 1`; AF_PACKET supports
-multiple processes. `placement.exclude_hosts` excludes sources too.
-Receiver VMs need at least 2 vCPUs, 4 GiB RAM and 20 GB disk regardless of source
-process count. Source-only hosts use no VM capacity or guest image. Sources need
-amd64. The network must have a discovered VLAN ID in 1–4094 and a valid known MTU.
+Omit `focus_host` and `focus_percent`. Choose amd64 sources and a provider VLAN
+with a known MTU. Receivers need at least 2 vCPUs, 4 GiB RAM and 20 GB disk.
+Native DPDK requires one process and a dedicated, operator-prepared VFIO NIC/VF
+with at least 512 MiB of unreserved hugepages. See the snap's
+[native device requirements](https://github.com/Deezzir/trex-snap/blob/main/docs/native.md).
 
 ```yaml
 duration: 2m
@@ -164,16 +162,7 @@ workloads:
     host_senders:
       node-a:
         backend: af_packet
-        interface: bond0
-        cpus: [4, 5, 6]
-    profiles:
-      - pps_per_sender: 100000
 ```
-
-For native DPDK, use `backend: dpdk` and a PCI BDF such as
-`interface: "0000:41:00.1"`. See [host preparation](campaigns.md#host-preparation).
-Source MAC/IP identities are reserved from the data network, separate from host
-management addresses.
 
 ## `workloads.fio`
 
@@ -201,7 +190,7 @@ The default profiles are 4k random read and random write at queue depth 4, and
 Each workload divides `duration` equally among its own profiles, in order.
 When the duration does not divide evenly, earlier profiles get one second
 more. Every profile window must be at least 10 seconds. The 10-second warm-up
-is not part of `duration`; see [Timeline](campaigns.md#timeline).
+is not part of `duration`; see [workloads and timing](campaigns.md#workloads-and-timing).
 
 ## Resource overrides
 

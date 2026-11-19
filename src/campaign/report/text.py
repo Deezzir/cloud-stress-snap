@@ -48,6 +48,14 @@ def _window(item: Row) -> str:
     return f"{_fmt(item.get('start_s'))}-{_fmt(item.get('end_s'))}s"
 
 
+SOURCE_HEADERS = ["Source", "Host", "Backend", "Interface", "Source IP", "Source MAC"]
+
+
+def _source_rows(fleet: Row) -> list[list[object]]:
+    fields = ("name", "host", "backend", "interface", "address", "mac")
+    return [[s.get(k) for k in fields] for s in _list(fleet.get("host_senders"))]
+
+
 def _fleet_lines(result: Row) -> list[str]:
     """Hosts, VM counts and roles."""
     fleet = _dict(result.get("fleet"))
@@ -63,37 +71,8 @@ def _fleet_lines(result: Row) -> list[str]:
         name = f"{host.get('name')}{' (focus)' if host.get('focus') else ''}"
         rows.append([name, host.get("architecture"), len(placed), ", ".join(roles)])
     lines = ["", "Fleet:", *_table(rows)] if len(rows) > 1 else []
-    if sources := _list(fleet.get("host_senders")):
-        lines += [
-            "",
-            "Host sources:",
-            *_table(
-                [
-                    [
-                        "SOURCE",
-                        "HOST",
-                        "BACKEND",
-                        "INTERFACE",
-                        "SOURCE IP",
-                        "SOURCE MAC",
-                    ],
-                    *[
-                        [
-                            s.get(k)
-                            for k in (
-                                "name",
-                                "host",
-                                "backend",
-                                "interface",
-                                "address",
-                                "mac",
-                            )
-                        ]
-                        for s in sources
-                    ],
-                ]
-            ),
-        ]
+    if sources := _source_rows(fleet):
+        lines += ["", "Host sources:", *_table([list(SOURCE_HEADERS), *sources])]
     resources = [
         ["TRex network", fleet.get("network")],
         ["Management", fleet.get("mgmt_network")],
@@ -169,49 +148,58 @@ def _network_lines(result: Row) -> list[str]:
     ]
 
 
-def _storage_lines(result: Row) -> list[str]:
-    """Per-job fio results per profile, as a range over jobs."""
-    storage = _dict(result.get("storage"))
-    profiles = _list(storage.get("profiles"))
-    if not profiles:
-        return []
-    rows: list[list[object]] = [
-        [
-            "PROFILE",
-            "DIR",
-            "JOBS",
-            "IOPS MIN/MED/MAX",
-            "MIB/S MIN/MED/MAX",
-            "P99 MS MIN/MED/MAX",
-        ]
-    ]
+def _spread(value: object, scale: float = 1.0) -> str | None:
+    """A range of per-VM or per-job values, never a fleet total."""
+    values = _dict(value)
+    if not values:
+        return None
+    return " / ".join(
+        _fmt(v * scale) if isinstance(v := values.get(k), int | float) else "—"
+        for k in ("min", "median", "max")
+    )
 
-    def spread(value: object, scale: float = 1.0) -> str:
-        found = _dict(value)
-        return "/".join(
-            _fmt(v * scale if isinstance(v := found.get(k), int | float) else None)
-            for k in ("min", "median", "max")
-        )
 
-    for item in profiles:
-        for d in ("read", "write"):
-            values = _dict(item.get(d))
-            if not values:
-                continue
+STORAGE_HEADERS = [
+    "Profile",
+    "Window",
+    "Direction",
+    "Jobs",
+    "IOPS",
+    "MiB/s",
+    "p99 (ms)",
+]
+
+
+def _storage_rows(storage: Row) -> list[list[object]]:
+    """Per-job fio summaries shared by the terminal and HTML reports."""
+    rows: list[list[object]] = []
+    for item in _list(storage.get("profiles")):
+        directions = [d for d in ("read", "write") if _dict(item.get(d))]
+        for direction in directions or ["unavailable"]:
+            values = _dict(item.get(direction))
             rows.append(
                 [
                     item.get("name"),
-                    d,
-                    f"{_fmt(values.get('jobs'))}/{_fmt(item.get('jobs_expected'))}",
-                    spread(values.get("iops")),
-                    spread(values.get("bw_kib_s"), 1 / 1024),
-                    spread(values.get("p99_ms")),
+                    _window(item),
+                    direction,
+                    f"{values.get('jobs', 0)}/{_fmt(item.get('jobs_expected'))}",
+                    _spread(values.get("iops")),
+                    _spread(values.get("bw_kib_s"), 1 / 1024),
+                    _spread(values.get("p99_ms")),
                 ]
             )
+    return rows
+
+
+def _storage_lines(result: Row) -> list[str]:
+    storage = _dict(result.get("storage"))
+    rows = _storage_rows(storage)
+    if not rows:
+        return []
     return [
         "",
-        f"fio (jobs per VM: {storage.get('numjobs')}; per-job results):",
-        *_table(rows),
+        f"fio ({storage.get('numjobs')} jobs per VM; min / median / max):",
+        *_table([list(STORAGE_HEADERS), *rows]),
     ]
 
 
@@ -237,14 +225,17 @@ def summary_text(result: Row, full: bool = False) -> str:
         lines += ["", "Errors:", *[f"  {e}" for e in dict.fromkeys(errors)]]
     cleanup = _list(result.get("cleanup"))
     if cleanup:
+        retained = run.get("finalization") == "retained"
         lines += [
             "",
-            "Cleanup pending:",
+            "Resources retained:" if retained else "Cleanup pending:",
             *[
                 f"  {r.get('kind')} {r.get('name')} ({r.get('action')})"
                 for r in cleanup
             ],
-            f"Retry: cloud-stress run stop {run.get('id')}",
+            f"Clean up: cloud-stress run stop --clean {run.get('id')}"
+            if retained
+            else f"Retry: cloud-stress run stop {run.get('id')}",
         ]
     if full:
         workloads = ", ".join(

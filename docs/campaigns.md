@@ -11,14 +11,16 @@ cp /snap/cloud-stress/current/share/cloud-stress/config.yaml ~/stress.yaml
 cloud-stress run start --config ~/stress.yaml
 ```
 
-`check` reports readiness and resource choices; `--full` adds inventories and
+`check` reports readiness for each workload and the resource choices for the
+first ready workload (TRex, then fio); `--full` adds inventories and
 `--json` returns structured output. `run start --full` expands the fleet and
 schedule details. Use `--verbose` (`-v`) for debug logs on `check`, `run start`,
 `run status` and `run stop`.
 
 See [configuration](configuration.md) for placement, profiles and resource
 overrides. VM counts are fleet totals; placement on each hypervisor is verified.
-Guests need an Ubuntu package mirror; VM TRex senders also need Snap Store access.
+Guests need an Ubuntu package mirror. VM TRex senders and host sources without
+`trex-generator` also need Snap Store access.
 
 ## Workloads and timing
 
@@ -37,30 +39,6 @@ Guests need an Ubuntu package mirror; VM TRex senders also need Snap Store acces
   cleanup are excluded from measured time. Workloads share a timeline but change
   profiles independently.
 - **Failure:** an early workload or receiver-counter stop fails the run.
-
-## Host preparation
-
-Host sources require an operator-installed `trex-generator` snap and nftables.
-Connect the four TRex plugs listed in [permissions](security-reference.md#juju-access).
-Selected CPUs must be online and available to the Juju-launched process, and kept
-out of VM and other workload allocations. Preflight detects pinned overlaps but
-does not configure scheduler isolation. The campaign checks this preparation without
-changing host snap installation, permissions, NIC bindings or hugepage allocation.
-
-- **AF_PACKET** (`trex-generator.t-rex-64`): use an up physical or bond interface
-  on the provider's live OVN bridge. Existing uplinks are supported.
-- **Native DPDK** (`trex-generator.native`): dedicate a NIC/VF bound to `vfio-pci`
-  with a working IOMMU and a viable VFIO group. Supply and connect a
-  group-specific custom-device slot to `trex-generator:vfio`
-  (`custom-device: trex-vfio`), and connect `hugepages-control` plus the plugs
-  above. Mount hugetlbfs at `/dev/hugepages`, with at least 512 MiB of unreserved
-  hugepages. mlx5, unsafe no-IOMMU and shared-uplink native use are unsupported.
-  Allow the reserved source MAC/IP and VLAN on the NIC/VF and upstream switch.
-
-Preflight rejects unavailable CPUs, overlapping pinned userspace threads, occupied
-RPC/publisher ports and open VFIO groups. Control ports are restricted to loopback;
-see [security](security-reference.md#juju-access). Configure sources using the
-[host-to-VM example](configuration.md#direct-host-sources).
 
 ## List and inspect
 
@@ -121,13 +99,7 @@ run.
 
 An unsuccessful stop or evidence retrieval stays incomplete and retryable,
 including when `--retain` was requested.
-
-Host floods stop first, including exact run-owned processes outside systemd's
-cgroup. The RPC guard remains while any host sender process is not confirmed
-stopped; `--abandon-evidence` cannot bypass this. Host cleanup removes only the
-run's `/var/snap/trex-generator/common/cloud-stress-<run-id>` directory, its own
-RPC table and run-owned collector/access files. Operator snap/device preparation
-remains in place.
+Cleanup preserves host directories without a matching run-ownership marker.
 
 Exit codes: `0` completed, `20` failed, interrupted or not cleaned up, `30`
 cancelled.

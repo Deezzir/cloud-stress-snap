@@ -8,6 +8,7 @@ added up across VMs.
 
 import json
 from pathlib import Path
+from statistics import median
 from typing import NamedTuple, cast
 
 from campaign.model.state import RunState, events, now, outstanding, run_dir
@@ -21,7 +22,6 @@ from constants import (
     MAX_REPORT_FILE_BYTES,
     SAMPLE_INTERVAL_S,
 )
-from probe.models import Workload
 
 Row = dict[str, object]
 Samples = list[tuple[float, float]]
@@ -75,34 +75,22 @@ def _samples(rows: list[Row], key: str) -> Samples:
     )
 
 
-def _windows(state: RunState, start: float, workload: Workload) -> list[Row]:
-    """Planned measured windows of one workload as absolute times."""
-    schedule = getattr(state.schedule, workload)
-    return [
-        {
-            "profile": w.profile,
-            "start": start + w.start_s,
-            "end": start + w.start_s + w.length_s,
-        }
-        for w in schedule
-    ]
-
-
 def _timeline(evts: list[Row]) -> tuple[float, float, float] | None:
     """Warm-up start, measured start and end, if the run reached measurement."""
     item = next((e for e in evts if e.get("event") == "timeline"), None)
     if not item:
         return None
-    values = [
+    warm, start, end = (
         _num(item.get(k)) for k in ("warmup_start", "measured_start", "measured_end")
-    ]
-    if any(v is None for v in values):
+    )
+    if warm is None or start is None or end is None:
         return None
-    warm, start, end = (float(v or 0) for v in values)
     return warm, start, end
 
 
-def _rate_inside(samples: Samples, a: float, b: float) -> Row | None:
+def _rate_inside(
+    samples: Samples, a: float, b: float, resets: set[float] | None = None
+) -> Row | None:
     """Rate of a counter between its first and last sample inside [a, b].
 
     None when there are fewer than two samples or the counter went backwards.
@@ -113,24 +101,26 @@ def _rate_inside(samples: Samples, a: float, b: float) -> Row | None:
     if any(c1 < c0 for (_, c0), (_, c1) in zip(inside, inside[1:], strict=False)):
         return None
     (t0, c0), (t1, c1) = inside[0], inside[-1]
+    if resets and any(t0 < t <= t1 for t in resets):
+        return None
     return {"rate": (c1 - c0) / (t1 - t0), "from": t0, "to": t1}
 
 
 def _spread(rates: dict[str, Row | None], start: float, key: str = "vms") -> Row:
     """Per-participant rates and their range, each over its own sample span."""
-    found = {vm: r for vm, r in rates.items() if r}
-    values = sorted(float(str(r["rate"])) for r in found.values())
+    found = {vm: cast(dict[str, float], r) for vm, r in rates.items() if r}
+    values = sorted(r["rate"] for r in found.values())
     return {
         "reporting": len(found),
         "of": len(rates),
         "pps_min": round(values[0], 1) if values else None,
-        "pps_median": round(values[len(values) // 2], 1) if values else None,
+        "pps_median": round(median(values), 1) if values else None,
         "pps_max": round(values[-1], 1) if values else None,
         key: {
             vm: {
-                "pps": round(float(str(r["rate"])), 1),
-                "from_s": round(float(str(r["from"])) - start, 3),
-                "to_s": round(float(str(r["to"])) - start, 3),
+                "pps": round(r["rate"], 1),
+                "from_s": round(r["from"] - start, 3),
+                "to_s": round(r["to"] - start, 3),
             }
             for vm, r in found.items()
         },
@@ -142,6 +132,7 @@ def _network(
     bundle: Path,
     start: float,
     evts: list[Row],
+    receiver_rows: dict[str, list[Row]],
     gaps: list[str],
     metrics: dict[str, list[Row]],
 ) -> Row:
@@ -156,6 +147,7 @@ def _network(
     connections = state.plan.connections
     sent: dict[str, Samples] = {}
     received: dict[str, Samples] = {}
+    rx_resets: dict[str, set[float]] = {}
     step_starts: dict[int, list[float]] = {}
     for vm in senders:
         rows = _jsonl(bundle, f"raw/{vm.name}/trex/flood.jsonl", gaps)
@@ -164,36 +156,46 @@ def _network(
         stats = [r for r in rows if "event" not in r]
         sent[vm.name] = _samples(stats, "opackets")
         for row in rows:
-            if row.get("event") == "step" and isinstance(row.get("step"), int):
-                t = _num(row.get("t"))
-                if t is not None:
-                    step_starts.setdefault(int(str(row["step"])), []).append(t)
+            step, t = row.get("step"), _num(row.get("t"))
+            if row.get("event") == "step" and isinstance(step, int) and t is not None:
+                step_starts.setdefault(step, []).append(t)
         metrics[f"network-{vm.name}"] = _counter_rows(
             vm.name, sent[vm.name], _samples(stats, "obytes"), "tx", start, gaps
         )
     for vm in receivers:
-        rows = _jsonl(bundle, f"raw/{vm.name}/sampler/samples.jsonl", gaps)
+        rows = receiver_rows.pop(vm.name, [])
         mine = [c.sender for c in connections if c.receiver == vm.name]
-        keys = [f"nft.from_{s}.{k}" for s in mine for k in ("packets", "bytes")]
-        complete = [r for r in rows if all(_num(r.get(k)) is not None for k in keys)]
+        keys = ["t", *(f"nft.from_{s}.{k}" for s in mine for k in ("packets", "bytes"))]
+        complete = sorted(
+            (r for r in rows if all(_num(r.get(k)) is not None for k in keys)),
+            key=lambda r: cast(float, r["t"]),
+        )
         if len(complete) < len(rows):
             gaps.append(
                 f"{vm.name}: {len(rows) - len(complete)} of {len(rows)} samples "
                 "without every receive counter"
             )
-        totals = [
-            {
-                "t": r["t"],
-                "packets": sum(float(str(r[f"nft.from_{s}.packets"])) for s in mine),
-                "bytes": sum(float(str(r[f"nft.from_{s}.bytes"])) for s in mine),
-            }
-            for r in complete
-        ]
-        if not totals:
+        if not complete:
             gaps.append(f"{vm.name}: no receive counter samples")
-        received[vm.name] = _samples(totals, "packets")
+        # An increasing fleet total can hide a reset in one sender's counter.
+        rx_resets[vm.name] = {
+            cast(float, row["t"])
+            for prev, row in zip(complete, complete[1:], strict=False)
+            if any(cast(float, row[k]) < cast(float, prev[k]) for k in keys[1:])
+        }
+        packets, octets = (
+            [
+                (
+                    cast(float, r["t"]),
+                    sum(cast(float, r[f"nft.from_{s}.{unit}"]) for s in mine),
+                )
+                for r in complete
+            ]
+            for unit in ("packets", "bytes")
+        )
+        received[vm.name] = packets
         rows = _counter_rows(
-            vm.name, received[vm.name], _samples(totals, "bytes"), "rx", start, gaps
+            vm.name, packets, octets, "rx", start, gaps, rx_resets[vm.name]
         )
         metrics[f"network-{vm.name}"] = sorted(
             metrics.get(f"network-{vm.name}", []) + rows,
@@ -201,23 +203,25 @@ def _network(
         )
 
     profiles = []
-    for window in _windows(state, start, "trex"):
-        a, b = float(str(window["start"])), float(str(window["end"]))
+    for window in state.schedule.trex:
+        a = start + window.start_s
+        b = a + window.length_s
         profiles.append(
             {
-                "profile": window["profile"],
-                "pps_per_sender": trex.profiles[
-                    int(str(window["profile"]))
-                ].pps_per_sender,
-                "start_s": round(a - start),
-                "end_s": round(b - start),
+                "profile": window.profile,
+                "pps_per_sender": trex.profiles[window.profile].pps_per_sender,
+                "start_s": window.start_s,
+                "end_s": window.start_s + window.length_s,
                 "tx": _spread(
                     {s.name: _rate_inside(sent[s.name], a, b) for s in senders},
                     start,
                     "sources" if state.host_senders else "vms",
                 ),
                 "rx": _spread(
-                    {r.name: _rate_inside(received[r.name], a, b) for r in receivers},
+                    {
+                        r.name: _rate_inside(received[r.name], a, b, rx_resets[r.name])
+                        for r in receivers
+                    },
                     start,
                 ),
             }
@@ -271,6 +275,7 @@ def _counter_rows(
     side: str,
     start: float,
     gaps: list[str],
+    reset_times: set[float] | None = None,
 ) -> list[Row]:
     """Packet counts and packet and byte rates from one VM's counter samples.
 
@@ -286,9 +291,10 @@ def _counter_rows(
     for (t0, c0), (t1, c1) in zip(packets, packets[1:], strict=False):
         if t1 <= t0:
             continue
-        if c1 < c0:
+        if c1 < c0 or (reset_times and t1 in reset_times):
             resets += 1
-            baseline = None
+            if baseline and t1 > baseline[0]:
+                baseline = None
             continue
         row: Row = {
             "t": round(t1 - start, 3),
@@ -397,7 +403,7 @@ def _range(values: list[float | None]) -> Row | None:
         return None
     return {
         "min": round(found[0], 3),
-        "median": round(found[len(found) // 2], 3),
+        "median": round(median(found), 3),
         "max": round(found[-1], 3),
     }
 
@@ -443,8 +449,8 @@ def _storage(
     numjobs = config.numjobs
     vms = [t.name for t in state.targets]
     profiles = []
-    for window in _windows(state, start, "fio"):
-        index = int(str(window["profile"]))
+    for window in state.schedule.fio:
+        index = window.profile
         profile = config.profiles[index]
         run = f"{index + 1:02d}-{profile.name}"
         per_vm, jobs = [], []
@@ -456,8 +462,8 @@ def _storage(
             "profile": index,
             "name": profile.name,
             "settings": profile.model_dump(exclude_none=True),
-            "start_s": round(float(str(window["start"])) - start),
-            "end_s": round(float(str(window["end"])) - start),
+            "start_s": window.start_s,
+            "end_s": window.start_s + window.length_s,
             "jobs_expected": len(jobs),
             "vms": per_vm,
         }
@@ -526,8 +532,14 @@ def _collectors(
     evts: list[Row],
     gaps: list[str],
     metrics: dict[str, list[Row]],
-) -> None:
+) -> dict[str, list[Row]]:
     """Normalize host, Ceph and guest samples; list their coverage problems."""
+    receivers = {
+        f"guest-{t.name}": t.name
+        for t in state.targets
+        if t.role in ("receiver", "peer")
+    }
+    receiver_rows = {}
     sources = {f"host-{h.name}": f"raw/host-{h.name}.jsonl" for h in state.plan.hosts}
     if state.config.workloads.fio and state.plan.ceph_mon:
         sources["ceph"] = "raw/ceph.jsonl"
@@ -538,6 +550,8 @@ def _collectors(
         if start is None and not (bundle / rel).is_file():
             continue
         raw = _jsonl(bundle, rel, gaps)
+        if name in receivers and start is not None:
+            receiver_rows[receivers[name]] = raw
         try:
             rows = collect.normalize(raw)
         except (KeyError, TypeError) as error:
@@ -578,6 +592,7 @@ def _collectors(
             if offset is not None and abs(offset) - uncertainty > MAX_CLOCK_OFFSET_S:
                 who = item.get("name") or item.get("vm")
                 gaps.append(f"{who}: clock differs by {offset:.1f}s")
+    return receiver_rows
 
 
 def _run(state: RunState, finished: str) -> Row:
@@ -622,7 +637,7 @@ def build(state: RunState) -> tuple[Row, dict[str, list[Row]]]:
     metrics: dict[str, list[Row]] = {}
     timeline = _timeline(evts)
     start = timeline[1] if timeline else None
-    _collectors(
+    receiver_rows = _collectors(
         state, bundle, start, timeline[2] if timeline else None, evts, gaps, metrics
     )
     result: Row = {
@@ -652,7 +667,9 @@ def build(state: RunState) -> tuple[Row, dict[str, list[Row]]]:
             "fio": [w.model_dump() for w in state.schedule.fio],
         }
         if state.config.workloads.trex:
-            result["network"] = _network(state, bundle, start_t, evts, gaps, metrics)
+            result["network"] = _network(
+                state, bundle, start_t, evts, receiver_rows, gaps, metrics
+            )
         if state.config.workloads.fio:
             result["storage"] = _storage(state, bundle, start_t, gaps, metrics)
     result |= {

@@ -1,9 +1,16 @@
 """Run resources, fleet placement and workload readiness from discovery results."""
 
+import re
+from collections import Counter
 from math import ceil
 from typing import Literal, NamedTuple
 
-from campaign.model.profiles import Placement, RunConfig, normalize_arch
+from campaign.model.profiles import (
+    HOST_LINK_PATTERN,
+    Placement,
+    RunConfig,
+    normalize_arch,
+)
 from campaign.workloads.trex import ip_packet_bytes
 from constants import TREX_ARCHITECTURES, TREX_MIN_VCPUS
 from probe.discover import short_name
@@ -24,7 +31,6 @@ NEEDS: dict[Workload, tuple[str, ...]] = {
     "trex": ("network", "mgmt_network", "image", "flavor", "placement"),
     "fio": ("mgmt_network", "image", "flavor", "volume_type", "placement"),
 }
-HEALTH_NEEDS: dict[Workload, tuple[str, ...]] = {"trex": (), "fio": ("ceph",)}
 
 
 class Candidate(NamedTuple):
@@ -189,6 +195,7 @@ def _candidates(
         if machine.hypervisor_id and machine.parent_id is None
     }
     flavor = next((f for f in result.openstack.flavors if f.id == plan.flavor_id), None)
+    aliases = Counter(short_name(h.hostname or h.id) for h in result.openstack.hosts)
     found = []
     for host in result.openstack.hosts:
         probe = probes.get(host.id)
@@ -217,11 +224,13 @@ def _candidates(
                 if fits
                 else 0
             )
+        hostname = host.hostname or host.id
+        alias = short_name(hostname)
         found.append(
             Candidate(
                 HostPlan(
-                    name=short_name(host.hostname or host.id),
-                    hypervisor=host.hostname or host.id,
+                    name=alias if aliases[alias] == 1 else hostname,
+                    hypervisor=hostname,
                     machine=machine,
                     architecture=arch or "unknown",
                     vms=0,
@@ -329,6 +338,10 @@ def _place(config: RunConfig, candidates: list[Candidate], plan: RunPlan) -> str
     }
     by_name = {c.host.name: c for c in candidates}
     by_name |= {c.host.hypervisor: c for c in candidates}
+    for c in candidates:
+        alias = short_name(c.host.hypervisor)
+        if alias != c.host.name and alias in placement.exclude_hosts:
+            return f"ambiguous excluded host {alias}; use its full hostname"
     eligible = [c for c in candidates if reasons[c.host.name] is None]
     focus: Candidate | None = None
 
@@ -349,17 +362,26 @@ def _place(config: RunConfig, candidates: list[Candidate], plan: RunPlan) -> str
                 return f"source {name} is excluded by placement.exclude_hosts"
             if host.architecture not in TREX_ARCHITECTURES:
                 return f"source {name}: TRex does not support {host.architecture}"
-            if source.backend == "af_packet" and (
-                source.interface != host.link
-                or not candidate.health
-                or not candidate.health[0]
-            ):
-                return (
-                    f"source {name}: AF_PACKET interface must be the healthy "
-                    f"provider link {host.link}"
-                )
+            interface = source.interface
+            if source.backend == "af_packet":
+                interface = interface or host.link
+                if (
+                    not re.fullmatch(HOST_LINK_PATTERN, interface or "")
+                    or interface != host.link
+                    or not candidate.health
+                    or not candidate.health[0]
+                ):
+                    return (
+                        f"source {name}: AF_PACKET interface must be the healthy "
+                        f"provider link {host.link}"
+                    )
+            assert interface is not None
             selected[host.name] = HostSenderPlan(
-                name=f"hv{len(selected) + 1:03d}", host=host.name, **source.model_dump()
+                name=f"hv{len(selected) + 1:03d}",
+                host=host.name,
+                backend=source.backend,
+                interface=interface,
+                cpus=source.cpus or [],
             )
         plan.host_senders = [
             sender.model_copy(update={"name": f"hv{index:03d}"})
@@ -379,6 +401,8 @@ def _place(config: RunConfig, candidates: list[Candidate], plan: RunPlan) -> str
             found = by_name.get(name)
             if found is None:
                 return f"{name} is not a usable hypervisor"
+            if found.host.name in counts:
+                return f"{name} names the same hypervisor twice"
             if reasons[found.host.name]:
                 return f"{name} cannot be used: {reasons[found.host.name]}"
             if found.capacity is not None and count > found.capacity:
@@ -625,7 +649,7 @@ def workload_readiness(
     missing: dict[Workload, dict[str, str]],
     force: bool,
 ) -> list[WorkloadReadiness]:
-    """Gate each workload on its resources and, unless forced, its HEALTH_NEEDS."""
+    """Check the planned resources and, for fio, Ceph health."""
     ceph = result.ceph
     ceph_blockers = []
     checks = {check.split(":")[0] for check in ceph.health_checks}
@@ -638,18 +662,16 @@ def workload_readiness(
         ceph_blockers.append(f"{down} OSDs down")
     if "SLOW_OPS" in checks:
         ceph_blockers.append("Ceph has slow operations")
-    unclean = sum(
-        count for state, count in ceph.pg_states.items() if state != "active+clean"
-    )
-    if unclean:
+    unclean = ceph.unclean_pgs
+    if unclean is None and ceph.health is not None:
+        ceph_blockers.append("Ceph placement group states are unknown")
+    elif unclean:
         ceph_blockers.append(f"{unclean} PGs not active+clean")
-    health = {"ceph": ceph_blockers}
     readiness = []
     for workload, found in missing.items():
         blockers = [found[need] for need in NEEDS[workload] if need in found]
-        if not force:
-            for dependency in HEALTH_NEEDS[workload]:
-                blockers += health[dependency]
+        if workload == "fio" and not force:
+            blockers += ceph_blockers
         readiness.append(
             WorkloadReadiness(workload=workload, ready=not blockers, blockers=blockers)
         )

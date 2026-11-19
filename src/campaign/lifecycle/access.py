@@ -19,6 +19,8 @@ from openstack.config.cloud_region import CloudRegion
 from openstack.connection import Connection
 from pydantic import BaseModel, ConfigDict
 
+from probe.openstack_probe import require_auth_tls
+
 MAX_FILE = 1024 * 1024
 JUJU_FILES = ("controllers.yaml", "accounts.yaml", "models.yaml")
 CLOUD_KEYS = (
@@ -58,7 +60,7 @@ def _read(path: Path) -> str:
 def collect(cloud: CloudRegion) -> Access:
     """Gather what the worker needs from the operator's resolved access."""
     config = {key: cloud.config[key] for key in CLOUD_KEYS if key in cloud.config}
-    cacert = cloud.config.get("cacert")
+    verify, _ = cloud.get_requests_verify_args()
     data = juju_data()
     files = {name: _read(data / name) for name in JUJU_FILES if (data / name).is_file()}
     cookies = data / "cookies"
@@ -69,7 +71,7 @@ def collect(cloud: CloudRegion) -> Access:
         raise ValueError(f"no Juju client state in {data}; log in to Juju first")
     return Access(
         cloud=config,
-        cacert_pem=_read(Path(cacert)) if cacert else None,
+        cacert_pem=_read(Path(verify)) if isinstance(verify, str) else None,
         juju_files=files,
     )
 
@@ -126,6 +128,9 @@ def install(access: Access, directory: Path) -> None:
 def connect(directory: Path) -> Connection:
     """Connect to OpenStack with a run's access copy."""
     config = json.loads((directory / "cloud.json").read_text())
+    if config.keys() - CLOUD_KEYS:
+        raise ValueError("unexpected OpenStack access settings")
+    require_auth_tls(config.get("auth", {}))
     cacert = directory / "ca.pem"
     return openstack.connect(
         cacert=str(cacert) if cacert.is_file() else None,

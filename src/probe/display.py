@@ -56,8 +56,8 @@ def print_readiness(
         status = "ready" if item.ready else "blocked: " + ", ".join(item.blockers)
         rows.append([item.workload, status])
     print_table(rows)
-    if any(item.ready for item in readiness):
-        click.echo("\nResources:")
+    if ready := next((item for item in readiness if item.ready), None):
+        click.echo(f"\nResources ({ready.workload}):")
         print_resources(plan, full)
 
 
@@ -110,7 +110,13 @@ def print_fleet(plan: RunPlan, full: bool = True) -> None:
             [
                 ["SOURCE", "HOST", "BACKEND", "INTERFACE", "CPUS"],
                 *[
-                    [s.name, s.host, s.backend, s.interface, ",".join(map(str, s.cpus))]
+                    [
+                        s.name,
+                        s.host,
+                        s.backend,
+                        s.interface,
+                        ",".join(map(str, s.cpus)) or "auto",
+                    ]
                     for s in plan.host_senders
                 ],
             ]
@@ -268,8 +274,9 @@ def print_ceph(ceph: CephResult, full: bool = True) -> None:
     if ceph.health is None and not ceph.osds and not ceph.pools:
         return
     pgs = sum(ceph.pg_states.values())
-    clean = ceph.pg_states.get("active+clean", 0)
-    click.echo(f"\nCeph: {ceph.health or '?'}, {clean}/{pgs} PGs active+clean")
+    unclean = ceph.unclean_pgs
+    clean = f"{pgs - unclean}/{pgs}" if unclean is not None else "?"
+    click.echo(f"\nCeph: {ceph.health or '?'}, {clean} PGs active+clean")
     if not full:
         return
     click.echo(f"  Quorum: {', '.join(ceph.quorum) or '?'}")

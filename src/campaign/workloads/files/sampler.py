@@ -86,9 +86,12 @@ def ceph():
     found = {
         "ceph.health": status.get("health", {}).get("status"),
         "ceph.slow_ops": int(m[1]) if (m := re.match(r"(\d+)", slow)) else 0,
-        "ceph.pgs_unclean": sum(s["count"] for s in pgmap.get("pgs_by_state", [])
-                                if s["state_name"] != "active+clean"),
     }
+    # Scrubbing and other flags do not make an active+clean PG unclean.
+    if pgmap.get("pgs_by_state"):
+        found["ceph.pgs_unclean"] = sum(
+            s["count"] for s in pgmap["pgs_by_state"]
+            if not {"active", "clean"} <= set(s["state_name"].split("+")))
     for key, name in (("read_op_per_sec", "read_ops"), ("write_op_per_sec", "write_ops")):
         if key in pgmap:
             found[f"ceph.{name}"] = pgmap[key]

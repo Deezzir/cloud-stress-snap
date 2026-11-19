@@ -51,8 +51,8 @@ Host commands run through `juju exec` (as `ubuntu`); `run` uses `sudo`:
 | --- | --- | --- |
 | `check` | `ceph-mon`, `ovn-chassis`, hypervisors | Read-only Ceph actions, `ceph`, `ovs-vsctl` and hardware reads. |
 | `run` | Hypervisors in the fleet and `ceph-mon` | Starts run-owned transient units and files under `/var/lib/cloud-stress/<run-id>`. |
-| `run` | Hypervisors in the fleet | Hold the run's guest key and run SSH to their guests from the management network's OVN metadata namespace. |
-| `run` with host sources | Selected source hypervisors | Starts the existing operator-installed TRex snap using reserved source MAC/IP identities and explicit CPUs. Writes only run-owned workload files under `/var/snap/trex-generator/common/cloud-stress-<run-id>`. |
+| `run` | Hypervisors hosting guests | Generate a run-specific SSH key locally and reach their own guests from the management network's OVN metadata namespace. The private key stays on that hypervisor. |
+| `run` with host sources | Selected source hypervisors | Reuses TRex or installs it with the four connections below. Cleanup purges only a verified run-owned installation after workloads stop and evidence is retrieved or abandoned. Workload files live under `/var/snap/trex-generator/common/cloud-stress-<run-id>`. |
 
 In TRex sender guests, `run` installs the `trex-generator` snap from the Snap
 Store with these connections:
@@ -64,24 +64,18 @@ Store with these connections:
 | `process-control` | Its own core dump filter. |
 | `system-observe` | Other running processes. |
 
-Host TRex control ports are unauthenticated upstream. After checking port
-availability and before starting servers, the campaign adds a run-owned
-nftables table dropping non-loopback TCP to its RPC/publisher ports. The table
-stays until all source processes are confirmed stopped. Host setup is described
-in [host preparation](campaigns.md#host-preparation).
+Host TRex control ports are unauthenticated. The campaign blocks non-loopback
+TCP access to them until all source processes are confirmed stopped.
 
 ## OpenStack resources
 
-`run` creates a key pair, a security group and, for each VM, a server, its ports
+`run` creates a security group and, for each VM, a server, its ports
 and, with fio, a volume in your project, and deletes them during finalization.
 Guests accept SSH only from the management network's metadata address, with a
 key generated for the run, and TRex traffic only from the run's own ports.
 
-Host sources reserve additional **unattached** Neutron data ports, with port
-security enabled. Receiver ingress also permits the chosen UDP destination port
-from each reserved source `/32` or `/128`, because an unbound port may not belong
-to Neutron's remote security-group address set. Reservations follow the normal
-journaled port cleanup lifecycle.
+Host sources reserve unattached Neutron data ports with port security enabled.
+Receiver ingress permits the configured UDP port from each reserved `/32` or `/128`.
 
 ## Sharing output
 

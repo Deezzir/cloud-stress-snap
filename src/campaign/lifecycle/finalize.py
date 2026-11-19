@@ -22,21 +22,21 @@ from campaign.model import state as run_state
 from campaign.model.state import ResourceEntry, RunState
 from campaign.report import build as report
 from campaign.transport import remote
-from campaign.transport.guest import Guest, guest_for
+from campaign.transport.guest import guest_for
 
 
 def _short(error: BaseException) -> str:
     return " ".join(str(getattr(error, "stderr", "") or error).split())[:300]
 
 
-def _needs_login(error: BaseException) -> bool:
-    text = _short(error).lower()
-    return any(word in text for word in ("login", "macaroon", "discharge", "401"))
-
-
 def _failed(state: RunState, entry: ResourceEntry, error: BaseException) -> None:
-    action: run_state.Action = "requires-login" if _needs_login(error) else "failed"
-    run_state.transition(state.id, entry, action, _short(error))
+    detail = _short(error)
+    login = any(
+        word in detail.lower() for word in ("login", "macaroon", "discharge", "401")
+    )
+    run_state.transition(
+        state.id, entry, "requires-login" if login else "failed", detail
+    )
 
 
 def finalize(
@@ -58,8 +58,12 @@ def finalize(
 
     # 1. Stop: floods first so no load outlives the run.
     not_stopped: set[tuple[str | None, str]] = set()
-    entries = run_state.outstanding(state.id)
-    for entry in sorted(entries, key=lambda e: "flood" not in e.name):
+    units = [
+        e
+        for e in run_state.outstanding(state.id)
+        if e.kind in ("unit", "guest-unit", "host-workload")
+    ]
+    for entry in sorted(units, key=lambda e: "flood" not in e.name):
         try:
             if entry.kind == "unit":
                 run_dir = entry.id.rsplit("/", 1)[0] if entry.id else None
@@ -85,8 +89,7 @@ def finalize(
                     juju, sender.machine, entry.name, None, process_path=path
                 )
         except Exception as error:  # noqa: BLE001 - keep finalizing the rest
-            if entry.kind in ("unit", "guest-unit", "host-workload"):
-                not_stopped.add((entry.where, entry.name))
+            not_stopped.add((entry.where, entry.name))
             _failed(state, entry, error)
 
     # 2. Retrieve evidence. A unit is done once it is stopped and its output is
@@ -94,11 +97,8 @@ def finalize(
     # deleting its server, which needs abandon_evidence.
     _progress(state, "retrieving evidence")
     pending_where: set[str] = set()
-    guest_pending = False
-    host_pending = False
-    for entry in run_state.outstanding(state.id):
-        if entry.kind not in ("unit", "guest-unit", "host-workload"):
-            continue
+    keep_cloud = False
+    for entry in units:
         stopped = (entry.where, entry.name) not in not_stopped
         try:
             if entry.kind == "unit":
@@ -106,29 +106,23 @@ def finalize(
                     text = remote.fetch(juju, entry.where or "", entry.id)
                     if text is not None:
                         (raw / entry.id.rsplit("/", 1)[-1]).write_text(text)
-            elif entry.kind == "host-workload":
-                sender = senders.get(entry.where or "")
-                if sender is None:
-                    raise RuntimeError(f"the host sender {entry.where} is not known")
-                if any(where == entry.where for where, _ in not_stopped):
-                    raise RuntimeError(
-                        f"{sender.name}: evidence is still held by running workloads"
-                    )
-                if entry.id:
-                    name = entry.name.removeprefix(prefix)
-                    data = remote.sh(
-                        juju,
-                        sender.machine,
-                        f"set -o pipefail; tar -C {shlex.quote(entry.id)} "
-                        "-czf - . | base64 -w0",
-                        wait=300,
-                    )
-                    _extract(data, raw / sender.name / name)
-            elif entry.id and entry.where in guests:
-                name = entry.name.removeprefix(prefix)
-                _fetch_guest(guests[entry.where], entry.id, raw / entry.where / name)
+            elif entry.kind == "host-workload" and any(
+                w == entry.where for w, _ in not_stopped
+            ):
+                raise RuntimeError(f"{entry.where}: workloads still hold evidence")
             elif entry.id:
-                raise RuntimeError(f"the guest {entry.where} is not known")
+                where = entry.where or ""
+                archive = f"tar -C {shlex.quote(entry.id)} -czf - ."
+                cmd = f"set -o pipefail; {archive} | base64 -w0"
+                data = (
+                    remote.sh(juju, senders[where].machine, cmd, wait=300)
+                    if entry.kind == "host-workload"
+                    else guests[where].run(cmd, timeout=300)
+                )
+                target = raw / where / entry.name.removeprefix(prefix)
+                if not target.resolve().is_relative_to(raw.resolve()):
+                    raise ValueError("evidence destination is outside the run")
+                _extract(data, target)
             evidence = True
         except Exception as error:  # noqa: BLE001
             evidence = False
@@ -145,14 +139,14 @@ def finalize(
             pending_where.add(entry.where or "")
         elif entry.kind == "host-workload":
             # A source that is still running also holds its Neutron identity.
-            host_pending = True
+            keep_cloud = True
             sender = senders.get(entry.where or "")
             if sender:
                 pending_where.add(sender.machine)
             else:
                 pending_where.update(h.machine for h in state.plan.hosts)
         elif not abandon_evidence:
-            guest_pending = True
+            keep_cloud = True
             if entry.where in guests:
                 pending_where.add(guests[entry.where].machine)
 
@@ -172,15 +166,15 @@ def finalize(
                 continue
             try:
                 if entry.kind == "snap":
-                    remote.remove_snap(juju, entry.where or "", entry.name)
+                    _cleanup_snap(state, juju, entry)
                 elif entry.kind == "rpc-guard":
                     remote.remove_rpc_guard(juju, entry.where or "", entry.name)
                 else:
-                    remote.remove_dir(juju, entry.where or "", entry.name)
+                    remote.remove_dir(juju, entry.where or "", entry.name, state.id)
                 run_state.transition(state.id, entry, "deleted")
             except Exception as error:  # noqa: BLE001
                 _failed(state, entry, error)
-        if not guest_pending and not host_pending:
+        if not keep_cloud:
             if conn is None:
                 for entry in run_state.outstanding(state.id):
                     if entry.where == "openstack" and entry.action != "requires-login":
@@ -197,26 +191,27 @@ def finalize(
     _progress(state, "writing the result")
     left = run_state.outstanding(state.id)
     retained = (
-        retain
-        and bool(left)
-        and not (not_stopped or pending_where or guest_pending or host_pending)
+        retain and bool(left) and not (not_stopped or pending_where or keep_cloud)
     )
     state.finalization = (
         "retained" if retained else "incomplete" if left else "complete"
     )
-    state.causes = [c for c in state.causes if not c.startswith("cleanup:")]
+    state.causes = [
+        c for c in state.causes if not c.startswith(("cleanup:", "result:"))
+    ]
     if not retained:
         state.causes += [
-            f"cleanup: {e.kind} {e.name} on {e.where}: {e.action}" for e in left
+            f"cleanup: {e.kind} {e.name} on {e.where}: {e.action}"
+            + (f" ({e.detail})" if e.kind == "snap" and e.detail else "")
+            for e in left
         ]
     try:
         result, metrics = report.build(state)
         state.code = report.exit_code(state)
         report.write(state, result, metrics)
-    except Exception as error:  # noqa: BLE001 - a missing result is incomplete
-        state.finalization = "incomplete"
+    except Exception as error:  # noqa: BLE001 - report errors do not change ownership
         state.causes.append(f"result: {_short(error)}")
-        state.code = report.exit_code(state)
+        state.code = 20
     # A run with resources left stays unfinished, so `run stop` can retry it.
     # A retained run is finished; its keys stay for inspection and `--clean`.
     pending = bool(left) and not retained
@@ -228,6 +223,29 @@ def finalize(
     run_state.event(
         state.id, "finalized", finalization=state.finalization, code=state.code
     )
+
+
+def _cleanup_snap(state: RunState, juju: jubilant.Juju, entry: ResourceEntry) -> None:
+    if not entry.where or not entry.where.isdecimal():
+        raise ValueError("invalid snap machine")
+    if state.plan.hosts and entry.where not in {h.machine for h in state.plan.hosts}:
+        raise RuntimeError("snap journal target is not a planned host")
+    # A retry's latest action is "failed" or "requires-login". Recover the
+    # original install window, never borrowing ownership from a previous intent.
+    intent = created = None
+    identity = None
+    key = ("snap", entry.where, entry.name)
+    for record in run_state.resources(state.id):
+        if (record.kind, record.where, record.name) != key:
+            continue
+        if record.action in ("intent", "deleted", "rejected"):
+            intent = record.at if record.action == "intent" else None
+            created = None
+            identity = None
+        elif record.action == "created":
+            created = record.at
+            identity = record.id
+    remote.remove_owned_snap(juju, entry.where, entry.name, intent, created, identity)
 
 
 def _settle_guest_units(state: RunState) -> None:
@@ -245,15 +263,6 @@ def _settle_guest_units(state: RunState) -> None:
 def _progress(state: RunState, detail: str) -> None:
     state.detail = detail
     run_state.save(state)
-
-
-def _fetch_guest(guest: Guest, path: str, target: Path) -> None:
-    """Copy a run-owned guest directory into the bundle."""
-    data = guest.run(
-        f"set -o pipefail; tar -C {shlex.quote(path)} -czf - . | base64 -w0",
-        timeout=300,
-    )
-    _extract(data, target)
 
 
 def _extract(data: str, target: Path) -> None:

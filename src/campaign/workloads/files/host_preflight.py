@@ -22,27 +22,17 @@ def command(*args):
     return subprocess.check_output(args, text=True, stderr=subprocess.STDOUT, timeout=30).strip()
 
 
-def check(args):
-    backend, interface, cpus = args["backend"], args["interface"], args["cpus"]
-    app = "native" if backend == "dpdk" else "t-rex-64"
-    require(Path(f"/snap/bin/trex-generator.{app}").exists(),
-            f"operator must install trex-generator with the {app} app")
-    command("nft", "--version")
-    connections = command("snap", "connections", "trex-generator")
-    plugs = ["network-control", "hardware-observe", "process-control", "system-observe"]
-    if backend == "dpdk":
-        plugs += ["vfio", "hugepages-control"]
-    for plug in plugs:
-        require(any(len(parts := line.split()) >= 3
-                    and parts[1] == f"trex-generator:{plug}" and parts[2] != "-"
-                    for line in connections.splitlines()),
-                f"operator must connect trex-generator:{plug}")
+def select_cpus(cpus, processes, device):
     available = os.sched_getaffinity(0)
+    candidates = available.copy()
+    if device is None:
+        # TRex v3.08 indexes a 120-entry platform table with all three role IDs.
+        # Native low_end mode ignores the platform section.
+        platform_ids = range(120)
+        invalid = [cpu for cpu in cpus if cpu not in platform_ids]
+        require(not invalid, f"AF_PACKET TRex CPU IDs must be 0-119; invalid: {invalid}")
+        candidates.intersection_update(platform_ids)
     require(set(cpus) <= available, f"selected CPUs must be online and available: {cpus}")
-    nodes = []
-    for cpu in cpus[2::3]:
-        paths = glob.glob(f"/sys/devices/system/cpu/cpu{cpu}/node[0-9]*")
-        nodes.append(int(Path(paths[0]).name[4:]) if paths else 0)
     # Unrestricted scheduler affinity is normal host work. Explicitly pinned
     # userspace threads on these cores indicate that they are already assigned.
     for process in Path("/proc").glob("[0-9]*"):
@@ -50,27 +40,78 @@ def check(args):
             if not (process / "cmdline").read_bytes() or int(process.name) == os.getpid():
                 continue
             for thread in (process / "task").iterdir():
-                affinity = os.sched_getaffinity(int(thread.name))
-                require(not (affinity < available and affinity.intersection(cpus)),
-                        f"CPU overlap with pinned thread {thread.name}; choose unused CPU IDs")
+                try:
+                    affinity = os.sched_getaffinity(int(thread.name))
+                except ProcessLookupError:
+                    continue
+                if not affinity >= available:
+                    candidates.difference_update(affinity)
         except (FileNotFoundError, ProcessLookupError):
             continue
-    sockets = []
-    try:
-        # Both AFs are checked: the upstream server binds wildcard TCP listeners.
-        for port in range(args["rpc_port"] - 1, args["rpc_port"] + 2 * args["processes"] - 1):
-            for family, address in ((socket.AF_INET, "0.0.0.0"), (socket.AF_INET6, "::")):
-                sock = socket.socket(family, socket.SOCK_STREAM)
-                sockets.append(sock)
+    if cpus:
+        require(set(cpus) <= candidates, "selected CPUs overlap a pinned thread")
+    else:
+        if device is not None:
+            node = int(read(device / "numa_node"))
+            if node < 0:
+                system_nodes = glob.glob("/sys/devices/system/node/node[0-9]*")
+                require(len(system_nodes) == 1, "cannot determine device NUMA locality; specify cpus")
+                node = int(Path(system_nodes[0]).name[4:])
+            candidates = {cpu for cpu in candidates
+                          if Path(f"/sys/devices/system/cpu/cpu{cpu}/node{node}").exists()}
+        needed = 3 * processes
+        scope = "in AF_PACKET TRex range 0-119" if device is None else f"on NUMA node {node}"
+        require(len(candidates) >= needed,
+                f"need {needed} available CPUs without pinned users {scope}; found {len(candidates)}")
+        cpus = sorted(candidates)[:needed]
+    nodes = []
+    for cpu in cpus[2::3]:
+        paths = glob.glob(f"/sys/devices/system/cpu/cpu{cpu}/node[0-9]*")
+        nodes.append(int(Path(paths[0]).name[4:]) if paths else 0)
+    return cpus, nodes
+
+
+def installed_package(backend):
+    name = "trex-generator"
+    response = json.loads(command("snap", "debug", "api", f"/v2/snaps/{name}"))
+    require(response.get("type") == "sync" and response.get("status-code") == 200,
+            "cannot inspect installed trex-generator identity")
+    snap = response["result"]
+    require(snap["name"] == name and snap["status"] == "active",
+            "installed trex-generator is not active")
+    app = "native" if backend == "dpdk" else "t-rex-64"
+    missing_apps = [a for a in (app, "python")
+                    if not os.access(f"/snap/bin/{name}.{a}", os.X_OK)]
+    require(not missing_apps,
+            f"{name} revision {snap['revision']} lacks required apps: {', '.join(missing_apps)}")
+    connections = command("snap", "connections", "trex-generator")
+    plugs = ["network-control", "hardware-observe", "process-control", "system-observe"]
+    if backend == "dpdk":
+        plugs += ["vfio", "hugepages-control"]
+    slots = {plug: sorted(parts[2] for line in connections.splitlines()
+                          if len(parts := line.split()) >= 3 and parts[1] == f"{name}:{plug}"
+                          and parts[2] != "-") for plug in plugs}
+    missing = [plug for plug in plugs if not slots[plug]]
+    require(not missing, f"{name} revision {snap['revision']} missing connections: {', '.join(missing)}")
+    return {"snap_id": snap.get("id"), "revision": snap["revision"], "version": snap["version"],
+            "channel": snap.get("tracking-channel"), "slots": slots}
+
+
+def check(args):
+    backend, interface = args["backend"], args["interface"]
+    package = installed_package(backend)
+    device = Path("/sys/bus/pci/devices") / interface if backend == "dpdk" else None
+    cpus, nodes = select_cpus(args["cpus"], args["processes"], device)
+    # The upstream server binds wildcard TCP listeners in both families.
+    for port in range(args["rpc_port"] - 1, args["rpc_port"] + 2 * args["processes"] - 1):
+        for family, address in ((socket.AF_INET, "0.0.0.0"), (socket.AF_INET6, "::")):
+            with socket.socket(family, socket.SOCK_STREAM) as sock:
                 if family == socket.AF_INET6:
                     sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
                 try:
                     sock.bind((address, port))
                 except OSError as error:
                     raise RuntimeError(f"TRex TCP port {port} unavailable; leave existing listeners intact") from error
-    finally:
-        for sock in sockets:
-            sock.close()
     if backend == "af_packet":
         links = json.loads(command("ip", "-d", "-j", "link", "show", "dev", interface))
         link = links[0]
@@ -85,7 +126,6 @@ def check(args):
         require(interface in command("ovs-vsctl", "list-ifaces", bridge).splitlines(),
                 "selected interface is not on the live provider bridge")
     else:
-        device = Path("/sys/bus/pci/devices") / interface
         require(device.exists() and (device / "class").read_text().startswith("0x02"),
                 "PCI BDF must identify an operator-prepared network device")
         require(read(device / "vendor") != "0x15b3", "mlx5 is not supported by this VFIO native path")
@@ -117,11 +157,12 @@ def check(args):
         reserved = int(read(pool / "resv_hugepages"))
         require((free - reserved) * page_size >= 512 * 1024**2,
                 "native TRex needs at least 512 MiB of unreserved hugepages")
-    version = command("snap", "list", "trex-generator").splitlines()[-1].split()
-    return {"sockets": nodes, "version": " ".join(version[1:3])}
+    return {"cpus": cpus, "sockets": nodes, "package": package,
+            "version": f"{package['version']} {package['revision']}"}
 
 
-try:
-    print(json.dumps(check(json.loads(sys.argv[1]))))
-except Exception as error:
-    sys.exit(f"host TRex preflight: {error}")
+if __name__ == "__main__":
+    try:
+        print(json.dumps(check(json.loads(sys.argv[1]))))
+    except Exception as error:
+        sys.exit(f"host TRex preflight: {error}")

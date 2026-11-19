@@ -2,6 +2,7 @@
 
 import logging
 import os
+from collections import Counter
 
 import click
 
@@ -14,6 +15,7 @@ from probe.models import (
     MaasResult,
     OpenstackResult,
     ProbeNotice,
+    Workload,
 )
 from probe.openstack_probe import (
     CACERT_UNREADABLE,
@@ -44,7 +46,9 @@ def get_cloud_name() -> str:
     )
 
 
-def discover_cloud() -> tuple[str, OpenstackResult, list[ProbeNotice]]:
+def discover_cloud(
+    workloads: set[Workload] | None = None,
+) -> tuple[str, OpenstackResult, list[ProbeNotice]]:
     """Resolve the cloud and collect inventory without exposing access details."""
     try:
         cloud = get_cloud_name()
@@ -55,7 +59,7 @@ def discover_cloud() -> tuple[str, OpenstackResult, list[ProbeNotice]]:
             selected.config.get("auth", {}).get("auth_url"),
             selected.region_name or "default",
         )
-        openstack, notices = probe_openstack(selected)
+        openstack, notices = probe_openstack(selected, workloads)
         return cloud, openstack, notices
     except click.ClickException:
         raise
@@ -91,24 +95,28 @@ def link_juju_to_hypervisors(
         if host.host_ip:
             by_ip.setdefault(host.host_ip, []).append(host.id)
         if host.hostname:
-            by_name.setdefault(short_name(host.hostname), []).append(host.id)
+            for name in {host.hostname, short_name(host.hostname)}:
+                by_name.setdefault(name, []).append(host.id)
     records = {record.system_id: record for record in maas.machines}
     for machine in juju.machines:
         if machine.parent_id:
             continue
         record = records.get(machine.instance_id or "")
         addresses = record.ip_addresses if record else machine.ip_addresses
-        hostname = short_name(record.hostname if record else machine.hostname or "")
+        hostname = (record.hostname if record else machine.hostname) or ""
         matches = {
             host_id
             for ip in addresses
             if len(by_ip.get(ip, [])) == 1
             for host_id in by_ip[ip]
         }
-        if not matches and hostname and len(by_name.get(hostname, [])) == 1:
-            matches = set(by_name[hostname])
-        if len(matches) == 1:
-            machine.hypervisor_id = matches.pop()
+        if not matches:
+            matches = set(by_name.get(hostname, by_name.get(short_name(hostname), [])))
+        machine.hypervisor_id = matches.pop() if len(matches) == 1 else None
+    claims = Counter(m.hypervisor_id for m in juju.machines)
+    for machine in juju.machines:
+        if claims[machine.hypervisor_id] > 1:
+            machine.hypervisor_id = None
     compute_machines = {
         unit.parent_machine_id
         for unit in juju.units

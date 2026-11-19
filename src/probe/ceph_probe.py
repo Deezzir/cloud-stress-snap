@@ -134,9 +134,7 @@ def _health_notices(result: CephResult) -> list[ProbeNotice]:
                 message=f"Ceph reports {result.health} ({checks}).",
             )
         )
-    unclean = sum(
-        count for state, count in result.pg_states.items() if state != "active+clean"
-    )
+    unclean = result.unclean_pgs
     if unclean:
         total = sum(result.pg_states.values())
         notices.append(
@@ -164,8 +162,10 @@ def _health_notices(result: CephResult) -> list[ProbeNotice]:
     return notices
 
 
-def probe_ceph(model: str, juju: JujuResult) -> tuple[CephResult, list[ProbeNotice]]:
-    """Read Ceph state with read-only ceph-mon actions and ceph commands."""
+def probe_ceph(
+    model: str, juju: JujuResult, inventory: bool = True
+) -> tuple[CephResult, list[ProbeNotice]]:
+    """Read Ceph status and OSDs, and with inventory also versions and pools."""
     apps = {app.charm: app for app in juju.apps}
     mon = apps.get("ceph-mon")
     if mon is None:
@@ -195,7 +195,7 @@ def probe_ceph(model: str, juju: JujuResult) -> tuple[CephResult, list[ProbeNoti
         task = client.run(unit, name, {"format": "json"}, wait=ACTION_TIMEOUT)
         return str(task.results["message"])
 
-    clients = [app for app in juju.apps if app.charm in POOL_CONFIG]
+    clients = [app for app in juju.apps if inventory and app.charm in POOL_CONFIG]
     with ThreadPoolExecutor(max_workers=8) as pool:
 
         def submit(source: str, description: str, read: Callable[[], Any]) -> Any:
@@ -210,38 +210,42 @@ def probe_ceph(model: str, juju: JujuResult) -> tuple[CephResult, list[ProbeNoti
                 lambda: _status(result, ceph("status", "-f", "json")),
             ),
             submit(
-                "ceph.versions",
-                "Ceph versions",
-                lambda: _versions(ceph("versions", "-f", "json")),
-            ),
-            submit(
                 "ceph.osds",
                 "Ceph OSD tree (show-disk-free)",
                 lambda: _osds(action("show-disk-free")),
             ),
-            submit(
-                "ceph.pools",
-                "Ceph pools (list-pools)",
-                lambda: _pools(action("list-pools")),
-            ),
-            submit(
-                "ceph.crush",
-                "CRUSH rules (list-crush-rules)",
-                lambda: _crush_rules(action("list-crush-rules")),
-            ),
-            *(
-                submit(
-                    f"juju.config:{app.name}",
-                    f"Juju config of {app.name}",
-                    partial(client.config, app.name),
-                )
-                for app in clients
-            ),
         ]
+        if inventory:
+            reads += [
+                submit(
+                    "ceph.versions",
+                    "Ceph versions",
+                    lambda: _versions(ceph("versions", "-f", "json")),
+                ),
+                submit(
+                    "ceph.pools",
+                    "Ceph pools (list-pools)",
+                    lambda: _pools(action("list-pools")),
+                ),
+                submit(
+                    "ceph.crush",
+                    "CRUSH rules (list-crush-rules)",
+                    lambda: _crush_rules(action("list-crush-rules")),
+                ),
+                *(
+                    submit(
+                        f"juju.config:{app.name}",
+                        f"Juju config of {app.name}",
+                        partial(client.config, app.name),
+                    )
+                    for app in clients
+                ),
+            ]
         values = [future.result() for future, _ in reads]
     for _, found in reads:
         notices.extend(found)
-    _, versions, osds, pools_found, rules, *configs = values
+    _, osds, *extra = values
+    versions, pools_found, rules, *configs = extra or [None, None, None]
     result.versions = versions or {}
     result.osds = osds or []
     result.pools = pools_found or []

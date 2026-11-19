@@ -23,7 +23,7 @@ from campaign.model import state as run_state
 from campaign.model.state import RunState
 from campaign.model.target import HostTarget, Target
 from campaign.transport import remote
-from campaign.transport.guest import Guest, guest_for, keygen
+from campaign.transport.guest import Guest, guest_for, guest_keygen, keygen
 from campaign.workloads import collect, fio, trex
 from constants import (
     BOOT_TIMEOUT_S,
@@ -36,6 +36,8 @@ from constants import (
     RECEIPT_PPS,
     RECEIPT_S,
     SAMPLE_INTERVAL_S,
+    TREX_CHANNEL,
+    TREX_PLUGS,
     TREX_RPC_PORT,
     TREX_SNAP,
 )
@@ -143,9 +145,7 @@ class Run:
     def each(self, items: Iterable[T], work: Callable[[T], object]) -> None:
         """Apply work to every item in parallel; raise the first failure."""
         with ThreadPoolExecutor(max_workers=PARALLEL) as pool:
-            futures = [pool.submit(work, item) for item in items]
-        for future in futures:
-            future.result()
+            list(pool.map(work, items))
 
     def targets(self, role: str | None = None) -> list[Target]:
         """The run's VMs, optionally those taking one network role; peers take both."""
@@ -228,15 +228,21 @@ class Run:
             raise PreparationError("; ".join(problems))
 
     def create_fleet(self) -> None:
-        """Create the VMs, then place the access keys on every host."""
-        public_key = keygen(self.private / "id_ed25519")
+        """Create the VMs with the SSH key of their own jump host."""
+        public_keys = {}
+        for host in self.state.plan.hosts:
+            self.own_dir(host.machine, self.host_dir)
+            if host.vms:
+                public_keys[host.name] = guest_keygen(
+                    self.juju, host.machine, self.host_dir
+                )
         host_public = keygen(self.private / "host_ed25519")
         host_private = (self.private / "host_ed25519").read_text()
         try:
             self.state.targets = provision.provision(
                 self.conn,
                 self.state,
-                public_key,
+                public_keys,
                 (host_private, host_public),
                 self.wait,
             )
@@ -247,25 +253,16 @@ class Run:
             self.guests[target.name] = guest_for(self.juju, self.state, target)
         for sender in self.state.host_senders:
             run_state.event(self.state.id, "host-sender", **sender.model_dump())
-        private = (self.private / "id_ed25519").read_text()
-        for host in self.state.plan.hosts:
-            self.own_host_dir(host.machine)
-        first: dict[str, Guest] = {}
-        for guest in self.guests.values():
-            first.setdefault(guest.machine, guest)
-        self.each(first.values(), lambda g: g.install_keys(private, host_public))
-        others = [g for g in self.guests.values() if g not in first.values()]
-        self.each(others, lambda g: g.install_keys(None, host_public))
+        self.each(self.guests.values(), lambda g: g.pin_host_key(host_public))
 
     def ready_guest(self, target: Target) -> None:
         """Wait for SSH and cloud-init; find the data interface and volume."""
         guest = self.guests[target.name]
         self.wait_for(
-            guest.namespace_ready,
+            guest.reachable,
             BOOT_TIMEOUT_S,
-            f"the {guest.namespace} namespace on {target.host}",
+            f"SSH to {target.name} via {guest.namespace}",
         )
-        self.wait_for(guest.reachable, BOOT_TIMEOUT_S, f"SSH to {target.name}")
         status = guest.run("cloud-init status --wait >/dev/null; echo $?", timeout=900)
         if status.strip() not in ("0", "2"):
             detail = guest.run("cloud-init status --long 2>&1; true")
@@ -295,8 +292,9 @@ class Run:
             if not link:
                 raise PreparationError(f"{target.name} has no interface {target.mac}")
             self.links[target.name] = link
-            guest.run(f"ip link set {link} up")
-            mtu = int(guest.run(f"cat /sys/class/net/{link}/mtu"))
+            mtu = int(
+                guest.run(f"ip link set {link} up && cat /sys/class/net/{link}/mtu")
+            )
             trex_config = self.state.config.workloads.trex
             assert trex_config
             size = trex.ip_packet_bytes(trex_config, self.state.plan.ip_version)
@@ -306,13 +304,10 @@ class Run:
                     f"{mtu}-byte MTU of {link} in {target.name}"
                 )
         if target.role in ("receiver", "peer"):
-            version = guest.run("nft --version || true").strip()
-            if not version.startswith("nftables"):
-                raise PreparationError(f"nftables is not available in {target.name}")
-            self.tool(target.name, "nftables", version)
+            self.tool(target.name, "nftables", guest.run("nft --version").strip())
         fio_config = self.state.config.workloads.fio
         if fio_config:
-            version = guest.run("fio --version || true").strip()
+            version = guest.run("fio --version").strip()
             if not version.startswith("fio-"):
                 raise PreparationError(f"fio is not available in {target.name}")
             self.tool(target.name, "fio", version)
@@ -331,6 +326,38 @@ class Run:
             version=version,
         )
 
+    def prepare_host_snap(self, target: HostTarget) -> None:
+        """Reuse an existing installation; journal only our own install attempt."""
+        inspect = f"snap debug api /v2/snaps/{TREX_SNAP}"
+        if remote.trex_install_date(self.command(target, inspect)) is not None:
+            return
+        args = (self.state.id, "snap", TREX_SNAP)
+        run_state.record(*args, "intent", where=target.machine)
+        before = run_state.now()
+        output = self.command(
+            target,
+            f"LC_ALL=C snap install {TREX_SNAP} --channel={TREX_CHANNEL} 2>&1",
+            timeout=900,
+        )
+        if f'snap "{TREX_SNAP}" is already installed' in output:
+            run_state.record(*args, "rejected", where=target.machine)
+            return
+        if not re.search(rf"^{TREX_SNAP} .+ installed$", output, re.MULTILINE):
+            raise PreparationError(f"{target.name}: no confirmed {TREX_SNAP} install")
+        # Finish documenting a successful install even if cancellation arrived
+        # while snapd was working; the next preparation command honors it.
+        installed = remote.trex_install_date(
+            remote.sh(self.juju, target.machine, inspect)
+        )
+        if installed is None or not before <= installed <= run_state.now():
+            raise PreparationError(f"{target.name}: cannot verify {TREX_SNAP} install")
+        run_state.record(
+            *args, "created", id=installed.isoformat(), where=target.machine
+        )
+        self.command(
+            target, " && ".join(f"snap connect {TREX_SNAP}:{p}" for p in TREX_PLUGS)
+        )
+
     def start_trex(self, target: Target | HostTarget) -> None:
         """Prepare a sender and start its servers without changing host devices."""
         trex_config = self.state.config.workloads.trex
@@ -339,6 +366,7 @@ class Run:
         rpc_port = TREX_RPC_PORT
         root = self.sender_dir(target)
         if isinstance(target, HostTarget):
+            self.prepare_host_snap(target)
             rpc_port = trex.host_rpc_port(self.state.id)
             preflight = trex.host_preflight_command(
                 target, self.state.plan, rpc_port, trex_config.processes
@@ -348,6 +376,13 @@ class Run:
             except RuntimeError as error:
                 raise PreparationError(str(error)) from None
             details = json.loads(out)
+            run_state.event(
+                self.state.id,
+                "host-package",
+                where=target.machine,
+                **details["package"],
+            )
+            target.cpus = details["cpus"]
             sockets, version = details["sockets"], details["version"]
             table = trex.rpc_table(self.state.id)
             tables = self.command(target, "nft list tables").splitlines()
@@ -362,12 +397,7 @@ class Run:
             run_state.record(
                 self.state.id, "rpc-guard", table, "created", where=target.machine
             )
-            run_state.record(self.state.id, "dir", root, "intent", where=target.machine)
-            # Claim a fresh directory, never overwrite a previous run's files.
-            self.command(target, f"mkdir -m 0700 {shlex.quote(root)}")
-            run_state.record(
-                self.state.id, "dir", root, "created", where=target.machine
-            )
+            self.own_dir(target.machine, root)
         else:
             install = trex.install_command()
             run_state.event(
@@ -589,7 +619,13 @@ class Run:
         def start(target: Target) -> None:
             job = fio.prefill_job(self.devices[target.name], size)
             command = fio.prefill_command(job, f"{self.guest_dir}/prefill")
-            self.start_guest_unit(self.guests[target.name], "prefill", budget, command)
+            self.start_workload(target, "prefill", budget, command)
+
+        def verify(target: Target) -> None:
+            self.check_exit(target, "prefill")
+            text = self.command(target, f"cat {self.guest_dir}/prefill/prefill.json")
+            if not fio.prefill_complete(text, size):
+                raise PreparationError(f"the {target.name} prefill did not complete")
 
         self.each(self.targets(), start)
         deadline = time.monotonic() + budget + 60
@@ -599,18 +635,11 @@ class Run:
                 raise PreparationError(f"the prefill took longer than {budget}s")
             self.wait(30)
             running = self.running([(t, "prefill") for t in pending])
+            self.each(
+                (t for t in pending if (t.name, "prefill") not in running), verify
+            )
             pending = [t for t in pending if (t.name, "prefill") in running]
             self.note(f"prefilling the data volumes, {len(pending)} running")
-
-        def verify(target: Target) -> None:
-            self.wait_workload(target, "prefill")
-            text = self.guests[target.name].run(
-                f"cat {self.guest_dir}/prefill/prefill.json 2>/dev/null || true"
-            )
-            if not text.strip() or not fio.prefill_complete(text, size):
-                raise PreparationError(f"the {target.name} prefill did not complete")
-
-        self.each(self.targets(), verify)
 
     def measure(self) -> None:
         """Start every workload on the shared timeline and watch it to the end."""
@@ -667,9 +696,7 @@ class Run:
                     )
                 command = fio.run_command(jobs, f"{self.guest_dir}/fio")
                 lifetime = int(end - time.time()) + 300
-                self.start_guest_unit(
-                    self.guests[target.name], "fio", lifetime, command
-                )
+                self.start_workload(target, "fio", lifetime, command)
 
             self.each(self.targets(), start_fio)
             units += [(t, "fio") for t in self.targets()]
@@ -692,9 +719,7 @@ class Run:
     def check_receivers(self) -> None:
         """Require every receiver to be counting; its sampler stops on a failed read."""
         if self.state.config.workloads.trex:
-            receivers = self.targets("receiver")
-            self.check_running([(t, "sampler") for t in receivers])
-            self.each(receivers, self.check_counters)
+            self.each(self.targets("receiver"), self.check_counters)
 
     def running(
         self, units: list[tuple[Target | HostTarget, str]]
@@ -705,14 +730,10 @@ class Run:
         def check(unit: tuple[Target | HostTarget, str]) -> None:
             target, name = unit
             unit_name = f"cloud-stress-{self.short}-{name}"
-            if isinstance(target, HostTarget):
-                out = self.command(
-                    target, f"systemctl is-active {unit_name}.service || true"
-                )
-                active = out.strip() in ("active", "activating", "deactivating")
-            else:
-                active = self.guests[target.name].unit_active(unit_name)
-            if active:
+            out = self.command(
+                target, f"systemctl is-active {unit_name}.service || true"
+            )
+            if out.strip() in ("active", "activating", "deactivating"):
                 found.add((target.name, name))
 
         self.each(units, check)
@@ -722,12 +743,12 @@ class Run:
         self,
         units: list[tuple[Target | HostTarget, str]],
         *,
-        deadline: float | None = None,
+        deadline: float,
     ) -> None:
         """Fail for stopped units unless their scheduled deadline has passed."""
         running = self.running(units)
         # Remote status queries may finish after the workload's scheduled end.
-        if deadline is not None and time.time() >= deadline:
+        if time.time() >= deadline:
             return
         stopped = [f"{n} in {t.name}" for t, n in units if (t.name, n) not in running]
         if stopped:
@@ -738,7 +759,8 @@ class Run:
     def check_counters(self, target: Target) -> None:
         """Fail the run when a receiver's latest sample lacks fresh counters."""
         out = self.guests[target.name].run(
-            f"date +%s.%N; tail -n 1 {self.guest_dir}/sampler/samples.jsonl"
+            f"systemctl is-active --quiet cloud-stress-{self.short}-sampler.service && "
+            f"date +%s.%N && tail -n 1 {self.guest_dir}/sampler/samples.jsonl"
         )
         now, _, line = out.strip().partition("\n")
         try:
@@ -756,9 +778,23 @@ class Run:
                 + str(sample.get("nft.error") or f"latest sample {age:.0f}s old")
             )
 
-    def own_host_dir(self, where: str) -> None:
-        """Journal the run's directory on a machine or unit before writing it."""
-        run_state.record(self.state.id, "dir", self.host_dir, "created", where=where)
+    def own_dir(self, where: str, path: str) -> None:
+        """Claim a new directory or reuse one already marked by this run."""
+        run_id = self.state.id
+        run_state.record(run_id, "dir", path, "intent", where=where)
+        outcome = remote.sh(
+            self.juju,
+            where,
+            f"mkdir -p {path.rsplit('/', 1)[0]} && "
+            f"if mkdir -m 0700 {path} 2>/dev/null; then echo {run_id} > {path}/.owner; "
+            f"elif ! test -d {path}; then exit 1; "
+            f'elif test "$(cat {path}/.owner 2>/dev/null)" != {run_id}; '
+            "then echo occupied; fi",
+        )
+        if outcome.strip() == "occupied":
+            run_state.record(run_id, "dir", path, "rejected", where=where)
+            raise PreparationError(f"{path} on {where} is not owned by this run")
+        run_state.record(run_id, "dir", path, "created", where=where)
 
     def start_host_unit(
         self, where: str, unit: str, lifetime: int, command: str, output: str
@@ -768,37 +804,8 @@ class Run:
         run_state.event(
             self.state.id, "command", unit=unit, where=where, command=command
         )
-        remote.start_unit(self.juju, where, unit, lifetime, command)
+        remote.sh(self.juju, where, remote.unit_command(unit, lifetime, command))
         run_state.record(self.state.id, "unit", unit, "created", id=output, where=where)
-
-    def start_guest_unit(
-        self,
-        guest: Guest,
-        name: str,
-        lifetime: int,
-        command: str,
-        evidence: str | None = "",
-    ) -> None:
-        """Start a guest transient unit, journaled with the directory it writes.
-
-        By default the unit writes its own directory under the run's guest
-        directory; evidence names another directory, or None for none.
-        """
-        unit = f"cloud-stress-{self.short}-{name}"
-        out = f"{self.guest_dir}/{name}"
-        evidence = out if evidence == "" else evidence
-        record = {"id": evidence, "where": guest.name}
-        run_state.record(self.state.id, "guest-unit", unit, "intent", **record)
-        run_state.event(
-            self.state.id, "command", unit=unit, where=guest.name, command=command
-        )
-        guest.start_unit(
-            unit,
-            lifetime,
-            f"mkdir -p {shlex.quote(out)} && {command}",
-            f"{out}.rc",
-        )
-        run_state.record(self.state.id, "guest-unit", unit, "created", **record)
 
     def start_workload(
         self,
@@ -806,29 +813,26 @@ class Run:
         name: str,
         lifetime: int,
         command: str,
-        evidence: str | None,
+        evidence: str | None = "",
     ) -> None:
-        """Start a sender workload, with its directory evidence and exit status."""
-        if isinstance(target, Target):
-            self.start_guest_unit(
-                self.guests[target.name], name, lifetime, command, evidence
-            )
-            return
+        """Start a unit and journal where to retrieve its evidence."""
+        if isinstance(target, HostTarget):
+            kind, root = "host-workload", self.sender_dir(target)
+        else:
+            kind, root = "guest-unit", self.guest_dir
+            out = f"{root}/{name}"
+            command = f"mkdir -p {shlex.quote(out)} && {command}"
+            if evidence == "":
+                evidence = out
         unit = f"cloud-stress-{self.short}-{name}"
         record = {"id": evidence, "where": target.name}
-        run_state.record(self.state.id, "host-workload", unit, "intent", **record)
+        run_state.record(self.state.id, kind, unit, "intent", **record)
         run_state.event(
             self.state.id, "command", unit=unit, where=target.name, command=command
         )
-        remote.start_unit(
-            self.juju,
-            target.machine,
-            unit,
-            lifetime,
-            command,
-            rc_path=f"{self.sender_dir(target)}/{name}.rc",
-        )
-        run_state.record(self.state.id, "host-workload", unit, "created", **record)
+        rc_path = f"{root}/{name}.rc"
+        self.command(target, remote.unit_command(unit, lifetime, command, rc_path))
+        run_state.record(self.state.id, kind, unit, "created", **record)
 
     def wait_workload(
         self, target: Target | HostTarget, name: str, timeout: int = 120
@@ -839,14 +843,17 @@ class Run:
             timeout,
             f"{name} in {target.name}",
         )
-        if isinstance(target, HostTarget):
-            out = self.command(
-                target, f"cat {self.sender_dir(target)}/{name}.rc 2>/dev/null || true"
-            ).strip()
-            code = int(out) if out else None
-        else:
-            code = self.guests[target.name].exit_code(f"{self.guest_dir}/{name}.rc")
-        if code != 0:
+        self.check_exit(target, name)
+
+    def check_exit(self, target: Target | HostTarget, name: str) -> None:
+        """Read the exit status recorded by the stopped unit."""
+        root = (
+            self.sender_dir(target)
+            if isinstance(target, HostTarget)
+            else self.guest_dir
+        )
+        code = self.command(target, f"cat {root}/{name}.rc").strip()
+        if code != "0":
             raise RuntimeError(f"{name} in {target.name} exited with {code}")
 
     def start_collectors(self) -> None:
@@ -867,7 +874,8 @@ class Run:
         for name, mode, where, args in sources:
             output = f"{self.host_dir}/{name}.jsonl"
             try:
-                self.own_host_dir(where)
+                if mode == "ceph":
+                    self.own_dir(where, self.host_dir)
                 remote.push(
                     self.juju, where, f"{self.host_dir}/sampler.py", collect.SAMPLER
                 )
@@ -917,8 +925,8 @@ class Run:
                 self.links.get(target.name),
                 nft=table if target.role in ("receiver", "peer") else None,
             )
-            self.start_guest_unit(
-                guest,
+            self.start_workload(
+                target,
                 "sampler",
                 lifetime,
                 f"exec python3 {path} guest {self.guest_dir}/sampler/samples.jsonl "

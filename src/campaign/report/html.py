@@ -13,7 +13,19 @@ from campaign.model.profiles import format_duration
 from campaign.model.state import run_dir
 from campaign.report import plots
 from campaign.report.build import _jsonl
-from campaign.report.text import _dict, _fleet_lines, _fmt, _list, _timeline_lines
+from campaign.report.text import (
+    SOURCE_HEADERS,
+    STORAGE_HEADERS,
+    _dict,
+    _fleet_lines,
+    _fmt,
+    _list,
+    _source_rows,
+    _spread,
+    _storage_rows,
+    _timeline_lines,
+    _window,
+)
 
 Row = dict[str, object]
 
@@ -180,21 +192,6 @@ def _placement(fleet: Row) -> str:
     )
 
 
-def _spread(value: object, scale: float = 1.0) -> str | None:
-    """A range of per-VM or per-job values, never a fleet total."""
-    values = _dict(value)
-    if not values:
-        return None
-    return " / ".join(
-        _fmt(v * scale) if isinstance(v := values.get(k), int | float) else "—"
-        for k in ("min", "median", "max")
-    )
-
-
-def _window(item: Row) -> str:
-    return f"{_fmt(item.get('start_s'))}–{_fmt(item.get('end_s'))} s"
-
-
 def _network(result: Row) -> str:
     network = _dict(result.get("network"))
     unit = "participant" if network.get("mode") == "host-to-vm" else "VM"
@@ -231,28 +228,11 @@ def _network(result: Row) -> str:
 
 
 def _storage(result: Row) -> str:
-    storage = _dict(result.get("storage"))
-    rows: list[list[object]] = []
-    for item in _list(storage.get("profiles")):
-        directions = [d for d in ("read", "write") if _dict(item.get(d))]
-        for direction in directions or ["unavailable"]:
-            values = _dict(item.get(direction))
-            rows.append(
-                [
-                    item.get("name"),
-                    _window(item),
-                    direction,
-                    f"{values.get('jobs', 0)}/{_fmt(item.get('jobs_expected'))}",
-                    _spread(values.get("iops")),
-                    _spread(values.get("bw_kib_s"), 1 / 1024),
-                    _spread(values.get("p99_ms")),
-                ]
-            )
     return (
         _table(
             "Per-job fio results",
-            ["Profile", "Window", "Direction", "Jobs", "IOPS", "MiB/s", "p99 (ms)"],
-            rows,
+            STORAGE_HEADERS,
+            _storage_rows(_dict(result.get("storage"))),
         )
         + '<p class="note">Values: minimum / median / maximum across jobs, '
         "each over its own runtime. Jobs: reporting / expected. "
@@ -278,24 +258,19 @@ def _figures(result: Row, bundle: Path, group: str, charts: dict[str, str]) -> s
             image = f'<img alt="{title}" src="data:image/png;base64,{data}">'
         else:
             image = f'<p class="note">{title}: graph file unavailable.</p>'
-        if name in charts:
-            figures.append(
-                f'<figure class="interactive-figure" aria-label="{title}">'
-                f"<figcaption><h3>{title}</h3></figcaption>"
-                '<div class="plot-controls">'
-                '<label>Filter series <input type="search" '
-                'placeholder="e.g. vm001, vm002" aria-label="Filter series"></label>'
-                '<button type="button" data-action="show">Show all</button>'
-                '<button type="button" data-action="hide">Hide all</button>'
-                '<span class="plot-count" role="status"></span></div>'
-                + charts[name]
-                + f"<noscript>{image}</noscript></figure>"
-            )
-        else:
-            figures.append(
-                f'<figure tabindex="0" aria-label="{title}">'
-                f"<figcaption><h3>{title}</h3></figcaption>{image}</figure>"
-            )
+        caption = f"<figcaption><h3>{title}</h3></figcaption>"
+        figures.append(
+            f'<figure class="interactive-figure" aria-label="{title}">{caption}'
+            '<div class="plot-controls">'
+            '<label>Filter series <input type="search" '
+            'placeholder="e.g. vm001, vm002" aria-label="Filter series"></label>'
+            '<button type="button" data-action="show">Show all</button>'
+            '<button type="button" data-action="hide">Hide all</button>'
+            '<span class="plot-count" role="status"></span></div>'
+            f"{charts[name]}<noscript>{image}</noscript></figure>"
+            if name in charts
+            else f'<figure tabindex="0" aria-label="{title}">{caption}{image}</figure>'
+        )
     return "".join(figures) or '<p class="note">No time-series graphs available.</p>'
 
 
@@ -384,40 +359,11 @@ def render_html(run_id: str) -> str | None:
         )
     )
     sections.append(("placement", "VM placement", _placement(fleet)))
-    if sources := _list(fleet.get("host_senders")):
-        sections.append(
-            (
-                "host-sources",
-                "Host sources",
-                _table(
-                    "Host source identities",
-                    [
-                        "Source",
-                        "Host",
-                        "Backend",
-                        "Interface",
-                        "Source IP",
-                        "Source MAC",
-                    ],
-                    [
-                        [
-                            s.get(k)
-                            for k in (
-                                "name",
-                                "host",
-                                "backend",
-                                "interface",
-                                "address",
-                                "mac",
-                            )
-                        ]
-                        for s in sources
-                    ],
-                    caption=False,
-                    wrap=True,
-                ),
-            )
+    if sources := _source_rows(fleet):
+        table = _table(
+            "Host source identities", SOURCE_HEADERS, sources, caption=False, wrap=True
         )
+        sections.append(("host-sources", "Host sources", table))
     notices = ""
     if errors:
         notices += (
@@ -427,13 +373,17 @@ def render_html(run_id: str) -> str | None:
         )
     cleanup = _list(result.get("cleanup"))
     if cleanup:
-        notices += "<h3>Cleanup pending</h3>" + _table(
+        retained = run.get("finalization") == "retained"
+        notices += (
+            "<h3>Resources retained</h3>" if retained else "<h3>Cleanup pending</h3>"
+        ) + _table(
             "Outstanding resources",
             ["Kind", "Name", "Action", "Location"],
             [[r.get(k) for k in ("kind", "name", "action", "where")] for r in cleanup],
         )
         notices += (
-            '<p class="note">Retry cleanup: <code>cloud-stress run stop '
+            '<p class="note">Clean up: <code>cloud-stress run stop '
+            f"{'--clean ' if retained else ''}"
             f"{_e(run.get('id'))}</code></p>"
         )
     if gaps:

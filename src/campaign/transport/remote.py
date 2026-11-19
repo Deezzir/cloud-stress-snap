@@ -2,12 +2,14 @@
 
 import base64
 import gzip
+import json
 import re
 import shlex
+from datetime import datetime
 
 import jubilant
 
-from constants import EXEC_TIMEOUT_S, MAX_FETCH_BYTES
+from constants import EXEC_TIMEOUT_S, MAX_FETCH_BYTES, TREX_SNAP
 
 
 def sh(juju: jubilant.Juju, where: str, script: str, wait: int = EXEC_TIMEOUT_S) -> str:
@@ -33,26 +35,28 @@ def push(juju: jubilant.Juju, where: str, path: str, content: str) -> None:
 def fetch(juju: jubilant.Juju, where: str, path: str) -> str | None:
     """Read a remote file, or None when it does not exist."""
     quoted = shlex.quote(path)
-    size = sh(juju, where, f"stat -c %s {quoted} 2>/dev/null || true").strip()
-    if not size:
-        return None
-    if int(size) > MAX_FETCH_BYTES:
-        raise ValueError(
-            f"{path} is {size} bytes, over the {MAX_FETCH_BYTES} byte limit"
-        )
-    out = sh(juju, where, f"gzip -c {quoted} | base64 -w0", wait=300).strip()
-    return gzip.decompress(base64.b64decode(out)).decode(errors="replace")
+    out = sh(
+        juju,
+        where,
+        f"set -eo pipefail; cd {shlex.quote(path.rsplit('/', 1)[0])}; "
+        f"test -e {quoted} || exit 0; size=$(stat -c %s {quoted}); "
+        f'test "$size" -le {MAX_FETCH_BYTES} || '
+        '{ echo "evidence too large" >&2; exit 1; }; '
+        f"gzip -c {quoted} | base64 -w0",
+        wait=300,
+    ).strip()
+    return (
+        gzip.decompress(base64.b64decode(out)).decode(errors="replace") if out else None
+    )
 
 
-def start_unit(
-    juju: jubilant.Juju,
-    where: str,
+def unit_command(
     unit: str,
     max_runtime_s: int,
     command: str,
     rc_path: str | None = None,
-) -> None:
-    """Start a transient systemd unit that stops itself after max_runtime_s.
+) -> str:
+    """Build a transient systemd unit command bounded by max_runtime_s.
 
     snapd moves a snap app into its own cgroup scope, out of the unit's reach, so
     `timeout` bounds the command too and forwards the unit's stop signal to it.
@@ -63,21 +67,22 @@ def start_unit(
         record = f"echo $? > {shlex.quote(rc_path)}"
         script = f"trap {shlex.quote(record)} EXIT; trap 'exit 143' TERM; {script}"
     script = script.replace("$", "$$")
-    sh(
-        juju,
-        where,
+    return (
         f"systemd-run --unit {shlex.quote(unit)} --collect "
         f"--property RuntimeMaxSec={max_runtime_s + 30} "
         f"--property KillMode=control-group "
-        f"bash -c {shlex.quote(script)}",
+        f"bash -c {shlex.quote(script)}"
     )
 
 
 STOP = """\
-if systemctl list-units --all --plain --no-legend {unit}.service | grep -q .; then
-  systemctl stop {unit}.service
+units=$(systemctl list-units --all --plain --no-legend {unit}.service) || exit 1
+if [ -n "$units" ]; then
+  systemctl stop {unit}.service || exit 1
+  active=$(systemctl list-units --state=active,activating,reloading,deactivating \
+--plain --no-legend {unit}.service) || exit 1
+  test -z "$active" || exit 1
 fi
-if systemctl is-active --quiet {unit}.service; then exit 1; fi
 """
 
 
@@ -121,16 +126,19 @@ def stop_unit(
     sh(juju, where, script)
 
 
-def remove_dir(juju: jubilant.Juju, where: str, path: str) -> None:
+def remove_dir(juju: jubilant.Juju, where: str, path: str, run_id: str) -> None:
     """Remove only an exact run-owned directory."""
-    run_id = r"(?:[0-9a-f]{8}|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})"
-    if not re.fullmatch(
-        rf"(?:/var/lib/cloud-stress/|/var/snap/trex-generator/common/cloud-stress-){run_id}",
-        path,
-    ):
+    if path not in (
+        f"/var/lib/cloud-stress/{run_id}",
+        f"/var/snap/{TREX_SNAP}/common/cloud-stress-{run_id}",
+    ) or not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", run_id):
         raise ValueError(f"refusing to remove {path}")
-    quoted = shlex.quote(path)
-    sh(juju, where, f"rm -rf {quoted} && test ! -e {quoted}")
+    sh(
+        juju,
+        where,
+        f'test ! -e {path} || {{ test "$(cat {path}/.owner)" = {run_id} '
+        f"&& rm -rf {path}; }}",
+    )
 
 
 def remove_rpc_guard(juju: jubilant.Juju, where: str, table: str) -> None:
@@ -142,12 +150,44 @@ def remove_rpc_guard(juju: jubilant.Juju, where: str, table: str) -> None:
         sh(juju, where, f"nft delete table inet {table}")
 
 
-def remove_snap(juju: jubilant.Juju, where: str, name: str) -> None:
-    """Purge a run-owned snap; a snap that is already gone counts as removed."""
-    quoted = shlex.quote(name)
-    sh(
-        juju,
-        where,
-        f"snap remove --purge {quoted} || ! snap list {quoted} >/dev/null 2>&1",
-        wait=300,
-    )
+def trex_install_date(response: str) -> datetime | None:
+    """Distinguish a confirmed absence from an unknown installation identity."""
+    name = TREX_SNAP
+    result = json.loads(response)
+    if (
+        result.get("status-code") == 404
+        and result.get("type") == "error"
+        and result["result"].get("kind") == "snap-not-found"
+        and result["result"].get("value") == name
+    ):
+        return None
+    if result.get("status-code") != 200 or result.get("type") != "sync":
+        raise RuntimeError(f"cannot inspect {name}: snapd lookup failed")
+    snap = result["result"]
+    installed_at = snap.get("install-date")
+    if snap.get("name") != name or not installed_at:
+        raise RuntimeError(f"preserved {name}: cannot verify install ownership")
+    return datetime.fromisoformat(installed_at)
+
+
+def remove_owned_snap(
+    juju: jubilant.Juju,
+    where: str,
+    name: str,
+    intent: datetime | None,
+    created: datetime | None,
+    identity: str | None,
+) -> None:
+    """Purge only the installation observed in the producer's install window."""
+    if name != TREX_SNAP:
+        raise ValueError(f"unexpected snap: {name}")
+    installed = trex_install_date(sh(juju, where, f"snap debug api /v2/snaps/{name}"))
+    if installed is None:
+        return
+    if not intent or not created:
+        raise RuntimeError(f"preserved {name}: cannot verify install ownership")
+    if identity is not None and identity != installed.isoformat():
+        raise RuntimeError(f"preserved {name}: installation identity changed")
+    if not intent <= installed <= created:
+        raise RuntimeError(f"preserved {name}: install date outside run install window")
+    sh(juju, where, f"snap remove --purge {name}", wait=300)
