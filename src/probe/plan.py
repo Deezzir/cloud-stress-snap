@@ -640,6 +640,7 @@ def _pick_volume_type(
         plan.volume_type = volume_type.name
     elif backends == {"cinder-ceph"}:
         plan.volume_type = "default"
+        plan.volume_type_implicit = True
     else:
         missing["volume_type"] = "no Ceph volume type"
 

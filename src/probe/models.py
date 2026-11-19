@@ -413,6 +413,7 @@ class RunPlan(Record):
     flavor: str | None = None
     flavor_id: str | None = None
     volume_type: str | None = None
+    volume_type_implicit: bool = False
     ceph_mon: str | None = None
     focus: str | None = None
     hosts: list[HostPlan] = Field(default_factory=list)

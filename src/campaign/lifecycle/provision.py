@@ -134,9 +134,8 @@ def provision(
     plan, config = state.plan, state.config
     trex, fio = config.workloads.trex, config.workloads.fio
     source = metadata_address(conn, plan.mgmt_network_id or "")
-    volume_type = plan.volume_type
-    if fio and volume_type == "default" and not conn.block_storage.find_type("default"):
-        volume_type = None
+    volume_type = None if plan.volume_type_implicit else plan.volume_type
+    volume_args = {"volume_type": volume_type} if volume_type else {}
     group = _create(
         state,
         "security-group",
@@ -250,7 +249,7 @@ def provision(
                 state,
                 "volume",
                 lambda n: conn.block_storage.create_volume(
-                    name=n, size=fio.volume_size_gib, volume_type=volume_type
+                    name=n, size=fio.volume_size_gib, **volume_args
                 ),
                 vm.name,
             ).id
