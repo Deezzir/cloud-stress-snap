@@ -143,7 +143,7 @@ If absent, it installs `latest/edge` and connects the four standard
 | --- | --- |
 | `backend` | `af_packet` or `dpdk`. |
 | `interface` | AF_PACKET: defaults to the healthy discovered provider link; an override must match it. DPDK: required full PCI BDF of a dedicated operator-prepared NIC/VF. |
-| `cpus` | Optional ordered IDs (master, receive, traffic per process). Automatic selection does not reserve exclusive cores. |
+| `cpus` | Optional ordered IDs (master, receive, traffic per process). AF_PACKET defaults to the least-busy allowed IDs in `0–119`, sampled over one second; ties use the lowest ID. Selection does not reserve exclusive cores. |
 
 Omit `focus_host` and `focus_percent`. Choose amd64 sources and a provider VLAN
 with a known MTU. Receivers need at least 2 vCPUs, 4 GiB RAM and 20 GB disk.

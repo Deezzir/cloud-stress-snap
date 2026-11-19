@@ -41,6 +41,7 @@ from constants import (
     TREX_RPC_PORT,
     TREX_SNAP,
 )
+from probe.models import HostPlan
 
 T = TypeVar("T")
 
@@ -230,12 +231,20 @@ class Run:
     def create_fleet(self) -> None:
         """Create the VMs with the SSH key of their own jump host."""
         public_keys = {}
+        machines: dict[str, list[HostPlan]] = {}
         for host in self.state.plan.hosts:
-            self.own_dir(host.machine, self.host_dir)
-            if host.vms:
-                public_keys[host.name] = guest_keygen(
-                    self.juju, host.machine, self.host_dir
-                )
+            machines.setdefault(host.machine, []).append(host)
+
+        def prepare_machine(hosts: list[HostPlan]) -> None:
+            # Hosts on one machine share its directory, so they stay serial.
+            for host in hosts:
+                self.own_dir(host.machine, self.host_dir)
+                if host.vms:
+                    public_keys[host.name] = guest_keygen(
+                        self.juju, host.machine, self.host_dir
+                    )
+
+        self.each(machines.values(), prepare_machine)
         host_public = keygen(self.private / "host_ed25519")
         host_private = (self.private / "host_ed25519").read_text()
         try:
@@ -871,47 +880,57 @@ class Run:
             sources.append((f"host-{host.name}", "host", host.machine, args))
         if self.state.config.workloads.fio and plan.ceph_mon:
             sources.append(("ceph", "ceph", plan.ceph_mon, collect.start_args(None)))
-        for name, mode, where, args in sources:
-            output = f"{self.host_dir}/{name}.jsonl"
-            try:
-                if mode == "ceph":
-                    self.own_dir(where, self.host_dir)
-                remote.push(
-                    self.juju, where, f"{self.host_dir}/sampler.py", collect.SAMPLER
-                )
-                before = time.time()
-                remote_now = float(remote.sh(self.juju, where, "date +%s.%N"))
-                after = time.time()
-                self.start_host_unit(
-                    where,
-                    f"cloud-stress-{self.short}-{name}",
-                    lifetime,
-                    f"exec python3 {self.host_dir}/sampler.py {mode} {output} "
-                    f"{SAMPLE_INTERVAL_S[mode]} {shlex.quote(args)}",
-                    output,
-                )
-                run_state.event(
-                    self.state.id,
-                    "collector",
-                    name=name,
-                    where=where,
-                    clock_offset_s=round(remote_now - (before + after) / 2, 3),
-                    uncertainty_s=round((after - before) / 2, 3),
-                )
-            except (
-                jubilant.CLIError,
-                jubilant.TaskError,
-                TimeoutError,
-                ValueError,
-            ) as error:
-                message = " ".join(str(getattr(error, "stderr", "") or error).split())
-                run_state.event(
-                    self.state.id,
-                    "collector-failed",
-                    name=name,
-                    where=where,
-                    message=message[:300],
-                )
+        by_where: dict[str, list[tuple[str, str, str, str]]] = {}
+        for source in sources:
+            by_where.setdefault(source[2], []).append(source)
+
+        def host_samplers(group: list[tuple[str, str, str, str]]) -> None:
+            # Sources on one machine share its directory and sampler.py.
+            for name, mode, where, args in group:
+                output = f"{self.host_dir}/{name}.jsonl"
+                try:
+                    if mode == "ceph":
+                        self.own_dir(where, self.host_dir)
+                    remote.push(
+                        self.juju, where, f"{self.host_dir}/sampler.py", collect.SAMPLER
+                    )
+                    before = time.time()
+                    remote_now = float(remote.sh(self.juju, where, "date +%s.%N"))
+                    after = time.time()
+                    self.start_host_unit(
+                        where,
+                        f"cloud-stress-{self.short}-{name}",
+                        lifetime,
+                        f"exec python3 {self.host_dir}/sampler.py {mode} {output} "
+                        f"{SAMPLE_INTERVAL_S[mode]} {shlex.quote(args)}",
+                        output,
+                    )
+                    run_state.event(
+                        self.state.id,
+                        "collector",
+                        name=name,
+                        where=where,
+                        clock_offset_s=round(remote_now - (before + after) / 2, 3),
+                        uncertainty_s=round((after - before) / 2, 3),
+                    )
+                except (
+                    jubilant.CLIError,
+                    jubilant.TaskError,
+                    TimeoutError,
+                    ValueError,
+                ) as error:
+                    message = " ".join(
+                        str(getattr(error, "stderr", "") or error).split()
+                    )
+                    run_state.event(
+                        self.state.id,
+                        "collector-failed",
+                        name=name,
+                        where=where,
+                        message=message[:300],
+                    )
+
+        self.each(by_where.values(), host_samplers)
         table = trex.counter_table(self.state.id)
 
         def guest_sampler(target: Target) -> None:

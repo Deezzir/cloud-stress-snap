@@ -12,6 +12,8 @@ import io
 import shlex
 import shutil
 import tarfile
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import jubilant
@@ -23,6 +25,7 @@ from campaign.model.state import ResourceEntry, RunState
 from campaign.report import build as report
 from campaign.transport import remote
 from campaign.transport.guest import guest_for
+from constants import PARALLEL
 
 
 def _short(error: BaseException) -> str:
@@ -63,7 +66,16 @@ def finalize(
         for e in run_state.outstanding(state.id)
         if e.kind in ("unit", "guest-unit", "host-workload")
     ]
-    for entry in sorted(units, key=lambda e: "flood" not in e.name):
+
+    def place(entry: ResourceEntry) -> str:
+        """The machine or guest an entry runs on; one place is handled serially."""
+        if entry.kind == "guest-unit":
+            return f"guest:{entry.where}"
+        if entry.kind == "host-workload" and entry.where in senders:
+            return senders[entry.where].machine
+        return entry.where or ""
+
+    def stop(entry: ResourceEntry) -> None:
         try:
             if entry.kind == "unit":
                 run_dir = entry.id.rsplit("/", 1)[0] if entry.id else None
@@ -92,13 +104,19 @@ def finalize(
             not_stopped.add((entry.where, entry.name))
             _failed(state, entry, error)
 
+    floods = [e for e in units if "flood" in e.name]
+    _each_place(floods, place, stop)
+    _each_place([e for e in units if "flood" not in e.name], place, stop)
+
     # 2. Retrieve evidence. A unit is done once it is stopped and its output is
     # in the bundle or abandoned. A guest unit that did not stop is stopped by
     # deleting its server, which needs abandon_evidence.
     _progress(state, "retrieving evidence")
     pending_where: set[str] = set()
     keep_cloud = False
-    for entry in units:
+    retrieved: set[tuple[str | None, str]] = set()
+
+    def retrieve(entry: ResourceEntry) -> None:
         stopped = (entry.where, entry.name) not in not_stopped
         try:
             if entry.kind == "unit":
@@ -123,15 +141,19 @@ def finalize(
                 if not target.resolve().is_relative_to(raw.resolve()):
                     raise ValueError("evidence destination is outside the run")
                 _extract(data, target)
-            evidence = True
+            retrieved.add((entry.where, entry.name))
         except Exception as error:  # noqa: BLE001
-            evidence = False
             if abandon_evidence:
                 run_state.event(
                     state.id, "evidence-lost", name=entry.name, message=_short(error)
                 )
             elif stopped:
                 _failed(state, entry, error)
+
+    _each_place(units, place, retrieve)
+    for entry in units:
+        stopped = (entry.where, entry.name) not in not_stopped
+        evidence = (entry.where, entry.name) in retrieved
         if stopped and (evidence or abandon_evidence):
             detail = None if evidence else "evidence abandoned"
             run_state.transition(state.id, entry, "deleted", detail)
@@ -269,3 +291,21 @@ def _extract(data: str, target: Path) -> None:
     """Extract workload directory evidence into the bundle."""
     with tarfile.open(fileobj=io.BytesIO(base64.b64decode(data)), mode="r:gz") as tar:
         tar.extractall(target, filter="data")
+
+
+def _each_place(
+    entries: list[ResourceEntry],
+    place: Callable[[ResourceEntry], str],
+    work: Callable[[ResourceEntry], None],
+) -> None:
+    """Apply work in parallel across places, in journal order within each place."""
+    groups: dict[str, list[ResourceEntry]] = {}
+    for entry in entries:
+        groups.setdefault(place(entry), []).append(entry)
+
+    def serial(group: list[ResourceEntry]) -> None:
+        for entry in group:
+            work(entry)
+
+    with ThreadPoolExecutor(max_workers=PARALLEL) as pool:
+        list(pool.map(serial, groups.values()))

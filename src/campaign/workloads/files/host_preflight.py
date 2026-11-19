@@ -6,6 +6,7 @@ import os
 import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
@@ -22,17 +23,31 @@ def command(*args):
     return subprocess.check_output(args, text=True, stderr=subprocess.STDOUT, timeout=30).strip()
 
 
-def select_cpus(cpus, processes, device):
-    available = os.sched_getaffinity(0)
+def cpu_ticks():
+    ticks = {}
+    for line in read("/proc/stat").splitlines():
+        name, *fields = line.split()
+        if name.startswith("cpu") and name[3:].isdigit():
+            # Guest ticks are already included in user/nice; iowait is not idle.
+            ticks[int(name[3:])] = (sum(map(int, fields[:8])), int(fields[3]))
+    return ticks
+
+
+def least_busy_cpus(candidates, needed):
+    before = cpu_ticks()
+    time.sleep(1)
+    after = cpu_ticks()
+    scores = {}
+    for cpu in candidates & before.keys() & after.keys():
+        total = after[cpu][0] - before[cpu][0]
+        idle = after[cpu][1] - before[cpu][1]
+        scores[cpu] = idle / total if total > 0 else 0
+    require(len(scores) >= needed, "too few eligible CPUs remained online during sampling")
+    return sorted(scores, key=lambda cpu: (-scores[cpu], cpu))[:needed]
+
+
+def native_candidates(available):
     candidates = available.copy()
-    if device is None:
-        # TRex v3.08 indexes a 120-entry platform table with all three role IDs.
-        # Native low_end mode ignores the platform section.
-        platform_ids = range(120)
-        invalid = [cpu for cpu in cpus if cpu not in platform_ids]
-        require(not invalid, f"AF_PACKET TRex CPU IDs must be 0-119; invalid: {invalid}")
-        candidates.intersection_update(platform_ids)
-    require(set(cpus) <= available, f"selected CPUs must be online and available: {cpus}")
     # Unrestricted scheduler affinity is normal host work. Explicitly pinned
     # userspace threads on these cores indicate that they are already assigned.
     for process in Path("/proc").glob("[0-9]*"):
@@ -48,10 +63,27 @@ def select_cpus(cpus, processes, device):
                     candidates.difference_update(affinity)
         except (FileNotFoundError, ProcessLookupError):
             continue
-    if cpus:
-        require(set(cpus) <= candidates, "selected CPUs overlap a pinned thread")
+    return candidates
+
+
+def select_cpus(cpus, processes, device):
+    available = os.sched_getaffinity(0)
+    needed = 3 * processes
+    require(set(cpus) <= available, f"selected CPUs must be online and available: {cpus}")
+    if device is None:
+        # TRex v3.08 indexes a 120-entry platform table with all three role IDs.
+        candidates = available.intersection(range(120))
+        invalid = [cpu for cpu in cpus if cpu not in candidates]
+        require(not invalid, f"AF_PACKET TRex CPU IDs must be 0-119; invalid: {invalid}")
+        if not cpus:
+            require(len(candidates) >= needed,
+                    f"need {needed} available CPUs in AF_PACKET TRex range 0-119; found {len(candidates)}")
+            cpus = least_busy_cpus(candidates, needed)
     else:
-        if device is not None:
+        candidates = native_candidates(available)
+        if cpus:
+            require(set(cpus) <= candidates, "selected CPUs overlap a pinned thread")
+        else:
             node = int(read(device / "numa_node"))
             if node < 0:
                 system_nodes = glob.glob("/sys/devices/system/node/node[0-9]*")
@@ -59,11 +91,9 @@ def select_cpus(cpus, processes, device):
                 node = int(Path(system_nodes[0]).name[4:])
             candidates = {cpu for cpu in candidates
                           if Path(f"/sys/devices/system/cpu/cpu{cpu}/node{node}").exists()}
-        needed = 3 * processes
-        scope = "in AF_PACKET TRex range 0-119" if device is None else f"on NUMA node {node}"
-        require(len(candidates) >= needed,
-                f"need {needed} available CPUs without pinned users {scope}; found {len(candidates)}")
-        cpus = sorted(candidates)[:needed]
+            require(len(candidates) >= needed,
+                    f"need {needed} available CPUs without pinned users on NUMA node {node}; found {len(candidates)}")
+            cpus = sorted(candidates)[:needed]
     nodes = []
     for cpu in cpus[2::3]:
         paths = glob.glob(f"/sys/devices/system/cpu/cpu{cpu}/node[0-9]*")
