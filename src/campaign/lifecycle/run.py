@@ -376,9 +376,11 @@ class Run:
         root = self.sender_dir(target)
         if isinstance(target, HostTarget):
             self.prepare_host_snap(target)
-            rpc_port = trex.host_rpc_port(self.state.id)
             preflight = trex.host_preflight_command(
-                target, self.state.plan, rpc_port, trex_config.processes
+                target,
+                self.state.plan,
+                trex.host_rpc_ports(self.state.id),
+                trex_config.processes,
             )
             try:
                 out = self.command(target, preflight, timeout=180)
@@ -392,6 +394,7 @@ class Run:
                 **details["package"],
             )
             target.cpus = details["cpus"]
+            target.rpc_port = rpc_port = details["rpc_port"]
             sockets, version = details["sockets"], details["version"]
             table = trex.rpc_table(self.state.id)
             tables = self.command(target, "nft list tables").splitlines()
@@ -556,6 +559,10 @@ class Run:
             for c in self.state.plan.connections
             if c.sender == target.name
         ]
+        rpc_port = TREX_RPC_PORT
+        if isinstance(target, HostTarget):
+            assert target.rpc_port, "host TRex RPC port is selected at preflight"
+            rpc_port = target.rpc_port
         command = trex.flood_command(
             self.sender_dir(target),
             trex_config,
@@ -565,9 +572,7 @@ class Run:
             end,
             name,
             vlan=self.state.plan.vlan if isinstance(target, HostTarget) else None,
-            rpc_port=trex.host_rpc_port(self.state.id)
-            if isinstance(target, HostTarget)
-            else TREX_RPC_PORT,
+            rpc_port=rpc_port,
         )
         lifetime = int(end - time.time()) + 120
         self.start_workload(target, name, lifetime, command, evidence=None)

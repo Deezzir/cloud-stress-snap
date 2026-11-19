@@ -37,3 +37,4 @@ class HostTarget(HostSenderPlan):
     port_id: str
     mac: str
     address: str
+    rpc_port: int | None = None

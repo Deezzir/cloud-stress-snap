@@ -85,15 +85,16 @@ def host_config(
     return str(yaml.safe_dump([item], sort_keys=False))
 
 
-def host_rpc_port(run_id: str) -> int:
-    """Run-specific TCP range, checked for collisions before use."""
-    return 20001 + 128 * (int(run_id.replace("-", "")[:8], 16) % 300)
+def host_rpc_ports(run_id: str, count: int = 8) -> list[int]:
+    """Run-specific TCP range first, then the next slots; the host picks a free one."""
+    slot = int(run_id.replace("-", "")[:8], 16)
+    return [20001 + 128 * ((slot + offset) % 300) for offset in range(count)]
 
 
 def host_preflight_command(
     sender: HostTarget,
     plan: RunPlan,
-    rpc_port: int,
+    rpc_ports: list[int],
     processes: int,
 ) -> str:
     """Read-only checks of operator preparation; never bind devices or take ports."""
@@ -101,7 +102,7 @@ def host_preflight_command(
         **sender.model_dump(),
         "mtu": plan.mtu,
         "physnet": plan.physical_network,
-        "rpc_port": rpc_port,
+        "rpc_ports": rpc_ports,
         "processes": processes,
     }
     script = (FILES / "host_preflight.py").read_text()

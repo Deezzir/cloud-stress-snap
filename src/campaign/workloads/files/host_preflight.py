@@ -1,5 +1,6 @@
 """Read-only host TRex prerequisites, run using the host's Python standard library."""
 
+import errno
 import glob
 import json
 import os
@@ -127,13 +128,9 @@ def installed_package(backend):
             "channel": snap.get("tracking-channel"), "slots": slots}
 
 
-def check(args):
-    backend, interface = args["backend"], args["interface"]
-    package = installed_package(backend)
-    device = Path("/sys/bus/pci/devices") / interface if backend == "dpdk" else None
-    cpus, nodes = select_cpus(args["cpus"], args["processes"], device)
+def range_free(rpc_port, processes):
     # The upstream server binds wildcard TCP listeners in both families.
-    for port in range(args["rpc_port"] - 1, args["rpc_port"] + 2 * args["processes"] - 1):
+    for port in range(rpc_port - 1, rpc_port + 2 * processes - 1):
         for family, address in ((socket.AF_INET, "0.0.0.0"), (socket.AF_INET6, "::")):
             with socket.socket(family, socket.SOCK_STREAM) as sock:
                 if family == socket.AF_INET6:
@@ -141,7 +138,25 @@ def check(args):
                 try:
                     sock.bind((address, port))
                 except OSError as error:
-                    raise RuntimeError(f"TRex TCP port {port} unavailable; leave existing listeners intact") from error
+                    if error.errno != errno.EADDRINUSE:
+                        raise
+                    return False
+    return True
+
+
+def free_rpc_port(candidates, processes):
+    for rpc_port in candidates:
+        if range_free(rpc_port, processes):
+            return rpc_port
+    raise RuntimeError(f"no free TRex TCP range at bases {candidates}; leave existing listeners intact")
+
+
+def check(args):
+    backend, interface = args["backend"], args["interface"]
+    package = installed_package(backend)
+    device = Path("/sys/bus/pci/devices") / interface if backend == "dpdk" else None
+    cpus, nodes = select_cpus(args["cpus"], args["processes"], device)
+    rpc_port = free_rpc_port(args["rpc_ports"], args["processes"])
     if backend == "af_packet":
         links = json.loads(command("ip", "-d", "-j", "link", "show", "dev", interface))
         link = links[0]
@@ -187,7 +202,7 @@ def check(args):
         reserved = int(read(pool / "resv_hugepages"))
         require((free - reserved) * page_size >= 512 * 1024**2,
                 "native TRex needs at least 512 MiB of unreserved hugepages")
-    return {"cpus": cpus, "sockets": nodes, "package": package,
+    return {"cpus": cpus, "sockets": nodes, "package": package, "rpc_port": rpc_port,
             "version": f"{package['version']} {package['revision']}"}
 
 
