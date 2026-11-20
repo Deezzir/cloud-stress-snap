@@ -101,5 +101,14 @@ An unsuccessful stop or evidence retrieval stays incomplete and retryable,
 including when `--retain` was requested.
 Cleanup preserves host directories without a matching run-ownership marker.
 
+```bash
+cloud-stress run delete <run-id>
+```
+
+`run delete` removes one run's local bundle (`runs/<run-id>/`) to reclaim disk.
+It requires the full ID and a finished run whose cleanup is `complete`; active,
+unfinished, retained, incomplete or unreadable runs are refused. Only the run's
+owner or root can delete it; cloud resources are not touched.
+
 Exit codes: `0` completed, `20` failed, interrupted or not cleaned up, `30`
 cancelled.

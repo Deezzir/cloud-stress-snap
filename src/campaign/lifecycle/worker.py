@@ -73,6 +73,8 @@ class Worker:
                     return self.start(request, peer_uid(conn))
                 if request.get("op") == "stop":
                     return self.stop(request, peer_uid(conn))
+                if request.get("op") == "delete":
+                    return self.delete(request, peer_uid(conn))
                 return {"ok": False, "error": "unknown request"}
         except run_state.RunActiveError as error:
             return {"ok": False, "error": str(error)}
@@ -218,6 +220,33 @@ class Worker:
         attempt = pending.finalize_attempts + 1
         self.thread.start()
         return {"ok": True, "run_id": pending.id, "attempt": attempt}
+
+    def delete(self, request: dict[str, object], uid: int) -> dict[str, object]:
+        """Delete the local bundle of one finished run whose cleanup is complete."""
+        run_id = str(request.get("run_id"))
+        if self.busy():
+            raise run_state.RunActiveError("A run is active.")
+        with run_state.lock():
+            try:
+                found = run_state.load(run_id)
+            except FileNotFoundError:
+                return {"ok": False, "error": f"run {run_id} not found"}
+            if found.id != run_id:
+                return {"ok": False, "error": f"run {run_id} does not match its state"}
+            if found.phase != "finished" or found.finalization != "complete":
+                return {
+                    "ok": False,
+                    "error": f"run {run_id} is not finished with cleanup complete",
+                }
+            if run_state.outstanding(run_id):
+                return {"ok": False, "error": f"run {run_id} still owns resources"}
+            if uid not in (0, found.owner_uid):
+                return {
+                    "ok": False,
+                    "error": "only the run's owner or root can delete it",
+                }
+            shutil.rmtree(run_state.run_dir(run_id))
+        return {"ok": True, "run_id": run_id}
 
     def cleanup(
         self, stack: ExitStack, pending: run_state.RunState, abandon: bool

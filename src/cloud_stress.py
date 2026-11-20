@@ -507,6 +507,14 @@ def stop(run_id: str | None, abandon_evidence: bool, clean: bool, full: bool) ->
 
 
 @run.command()
+@click.argument("run_id")
+def delete(run_id: str) -> None:
+    """Delete the local bundle of a finished run whose cleanup is complete."""
+    reply = request({"op": "delete", "run_id": run_id})
+    click.echo(f"Deleted run {reply['run_id']}.")
+
+
+@run.command()
 @click.argument("run_id", required=False)
 @output_options
 @click.option("--json", "as_json", is_flag=True, help="Print the run result as JSON.")
